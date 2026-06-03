@@ -1219,6 +1219,8 @@ class EmulatorMenu:
         pygame.init()
         self.screen = pygame.display.set_mode((MENU_W, MENU_H))
         pygame.display.set_caption("Python GBC Emulator")
+        self.logo = None
+        self._load_logo()
         self._scan_roms()
 
     def _scan_roms(self):
@@ -1300,6 +1302,34 @@ class EmulatorMenu:
                 self._centre_text(self.status_line, MENU_H - 28, MENU_DIM, 18)
             pygame.display.flip()
             clock.tick(60)
+
+    def _load_logo(self):
+        here = os.path.dirname(os.path.abspath(__file__))
+        for candidate in ("gbclogo.png", os.path.join(here, "gbclogo.png")):
+            if os.path.isfile(candidate):
+                try:
+                    raw = pygame.image.load(candidate).convert()
+                except (OSError, pygame.error):
+                    continue
+                scaled = pygame.transform.smoothscale(raw, (160, 160))
+                try:
+                    import numpy as np
+                    arr = pygame.surfarray.array3d(scaled).transpose(1, 0, 2)
+                    mask = (arr[:, :, 0] > 220) & (arr[:, :, 1] > 220) & (arr[:, :, 2] > 220)
+                    arr[mask] = MENU_BG
+                    new_surf = pygame.surfarray.make_surface(arr.transpose(1, 0, 2))
+                except ImportError:
+                    new_surf = scaled
+                block = pygame.Surface((180, 180))
+                block.fill(MENU_BG)
+                block.blit(new_surf, (10, 10))
+                self.logo = block
+                try:
+                    pygame.display.set_icon(pygame.transform.smoothscale(raw, (32, 32)))
+                except pygame.error:
+                    pass
+                return
+        self.logo = None
 
     def _handle(self, page):
         for event in pygame.event.get():
@@ -1384,10 +1414,21 @@ class EmulatorMenu:
         return page
 
     def _render_main(self):
-        self._centre_text("Python GBC Emulator", 60, MENU_HI, 48)
-        self._centre_text("v1.0", 105, MENU_DIM, 20)
-        self._draw_menu(self.main_items, self.selected, 200, 50)
-        self._centre_text("Arrow Keys: Navigate  |  Enter: Select  |  Esc: Quit", MENU_H - 50, MENU_DIM, 18)
+        if self.logo is not None:
+            lx = (MENU_W - self.logo.get_width()) // 2
+            self.screen.blit(self.logo, (lx, 20))
+            title_y = 200
+            subtitle_y = 235
+            menu_y = 290
+        else:
+            self._centre_text("Python GBC Emulator", 60, MENU_HI, 48)
+            title_y = 105
+            subtitle_y = 130
+            menu_y = 200
+        self._centre_text("Python GBC Emulator", title_y, MENU_HI, 44)
+        self._centre_text("v1.0", subtitle_y, MENU_DIM, 20)
+        self._draw_menu(self.main_items, self.selected, menu_y, 50)
+        self._centre_text("Arrow Keys: Navigate  |  Enter: Select  |  Esc: Quit", MENU_H - 30, MENU_DIM, 18)
 
     def _render_load_rom(self):
         self._centre_text("Select ROM", 40, MENU_HI, 36)
