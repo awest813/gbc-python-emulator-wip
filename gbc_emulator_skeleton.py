@@ -1150,7 +1150,6 @@ class PPU:
                 palette = obp1 if (flags & 0x10) else obp0
                 shade = (palette >> (color_idx * 2)) & 0x03
                 self.framebuffer[ly * SCREEN_WIDTH + pixel_x] = self._SHADES[shade]
-                break
 
 
 class Timers:
