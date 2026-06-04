@@ -1,6 +1,38 @@
+# Python
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+ENV/
+
+# ROMs and saves
 roms/
+*.gb
+*.gbc
+*.sav
+*.sram
+
+# Screenshots / images
 *.png
 !gbclogo.png
-*.sav
+
+# Logs
+*.log
+logs/
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+*.swp
+*.swo
+*~

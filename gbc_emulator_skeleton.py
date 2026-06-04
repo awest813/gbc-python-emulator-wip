@@ -1,15 +1,20 @@
 """
 Game Boy / Game Boy Color emulator written in Python.
 
-Supports MBC1/MBC5 cartridges, BG/Window/Sprite rendering, and includes a
-built-in menu with ROM browser. Performance-tuned to ~60-90 fps on
-SUPERBAJTEK via precomputed tile/palette LUTs, unrolled scanline writers,
+Supports MBC1/MBC5 cartridges, BG / Window / Sprite rendering, and includes
+a built-in menu with ROM browser. Performance-tuned to ~60-90 fps on
+SUPERBAJTEK via precomputed tile / palette LUTs, unrolled scanline writers,
 and a combined per-opcode dispatcher.
 
-Requires: pygame, numpy  (pip install pygame numpy)
+Usage:
+    python gbc_emulator_skeleton.py                # launch the menu
+    python gbc_emulator_skeleton.py rom.gb --nomenu  # boot a ROM directly
 
-License: MIT. See the project LICENSE file for the full text.
-Copyright (c) 2026 awest813.
+Requires: pygame >= 2.0, numpy >= 1.20
+          (pip install pygame numpy)
+
+SPDX-License-Identifier: MIT
+Copyright (c) 2026 awest813
 """
 import sys
 import os
