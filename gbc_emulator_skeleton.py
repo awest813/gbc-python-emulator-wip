@@ -139,24 +139,31 @@ class MMU:
         logging.info(f"Loaded ROM: {len(rom_data)} bytes [{mbc_name}, {self.num_rom_banks} ROM banks, {self.num_ram_banks} RAM banks]")
 
     def read_byte(self, address):
-        if 0x0000 <= address <= 0x3FFF:
-            return self.rom_data[address] if address < len(self.rom_data) else 0xFF
-        elif 0x4000 <= address <= 0x7FFF:
-            if self.mbc_type == 0x00:
-                return self.rom_data[address] if address < len(self.rom_data) else 0xFF
-            offset = self.rom_bank * 0x4000 + (address - 0x4000)
-            return self.rom_data[offset] if offset < len(self.rom_data) else 0xFF
-        elif 0xA000 <= address <= 0xBFFF:
+        # Fast path: most accesses hit WRAM/HRAM/VRAM/OAM (direct array)
+        if address >= 0xC000:
+            if address < 0xFE00:
+                if address < 0xE000:
+                    return self.memory[address]
+                return self.memory[address - 0x2000]  # Echo RAM
+            if address == 0xFF00:
+                return self._read_joypad()
+            return self.memory[address]
+        # VRAM (0x8000-0x9FFF)
+        if address >= 0x8000:
+            return self.memory[address]
+        # Cartridge RAM (0xA000-0xBFFF) - slow path
+        if address >= 0xA000:
             if self.has_ram and self.ram_enabled and len(self.ram_data) > 0:
                 offset = self.ram_bank * 0x2000 + (address - 0xA000)
                 return self.ram_data[offset] if offset < len(self.ram_data) else 0xFF
             return 0xFF
-        elif 0xE000 <= address <= 0xFDFF:
-            return self.memory[0xC000 + (address - 0xE000)]
-        elif address == 0xFF00:
-            return self._read_joypad()
-        else:
-            return self.memory[address]
+        # ROM (0x0000-0x7FFF) - slow path
+        if address < 0x4000:
+            return self.rom_data[address] if address < len(self.rom_data) else 0xFF
+        if self.mbc_type == 0x00:
+            return self.rom_data[address] if address < len(self.rom_data) else 0xFF
+        offset = self.rom_bank * 0x4000 + (address - 0x4000)
+        return self.rom_data[offset] if offset < len(self.rom_data) else 0xFF
 
     def _read_joypad(self):
         sel = self.memory[0xFF00] & 0x30
@@ -243,21 +250,33 @@ class MMU:
             bank = value & 0x1F
             if bank == 0: bank = 1
             self.rom_bank = (self.rom_bank & 0x60) | bank
+            self._update_bank_mirror()
         elif 0x4000 <= address <= 0x5FFF:
             self.ram_bank = value & 0x03
             self.rom_bank = (self.rom_bank & 0x1F) | ((value & 0x03) << 5)
+            self._update_bank_mirror()
         elif 0x6000 <= address <= 0x7FFF:
             self.mbc1_mode = value & 0x01
             if self.mbc1_mode == 1:
                 self.rom_bank &= 0x1F
+                self._update_bank_mirror()
 
     def _mbc5_write(self, address, value):
         if 0x2000 <= address <= 0x2FFF:
             self.rom_bank = (self.rom_bank & 0x100) | value
+            self._update_bank_mirror()
         elif 0x3000 <= address <= 0x3FFF:
             self.rom_bank = (self.rom_bank & 0xFF) | ((value & 0x01) << 8)
+            self._update_bank_mirror()
         elif 0x4000 <= address <= 0x5FFF:
             self.ram_bank = value & 0x0F
+
+    def _update_bank_mirror(self):
+        bank = self.rom_bank
+        offset = bank * 0x4000
+        if offset < len(self.rom_data):
+            end = min(offset + 0x4000, len(self.rom_data))
+            self.memory[0x4000:0x4000 + (end - offset)] = self.rom_data[offset:end]
 
 
 class CPU:
@@ -425,20 +444,23 @@ class CPU:
 
     def fetch_byte(self):
         """Fetches the next byte at PC and increments PC."""
-        val = self.mmu.read_byte(self.reg.pc)
-        self.reg.pc = (self.reg.pc + 1) & 0xFFFF
+        pc = self.reg.pc
+        val = self.mmu.memory[pc]
+        self.reg.pc = (pc + 1) & 0xFFFF
         return val
 
     def fetch_word(self):
         """Fetches the next 16-bit word at PC and increments PC twice."""
-        val = self.mmu.read_word(self.reg.pc)
-        self.reg.pc = (self.reg.pc + 2) & 0xFFFF
+        pc = self.reg.pc
+        mem = self.mmu.memory
+        val = mem[pc] | (mem[(pc + 1) & 0xFFFF] << 8)
+        self.reg.pc = (pc + 2) & 0xFFFF
         return val
 
     def step(self):
         """Fetches, decodes, and executes a single instruction."""
         if self.halted:
-            if self.mmu.read_byte(0xFFFF) & self.mmu.read_byte(0xFF0F):
+            if self.mmu.memory[0xFFFF] & self.mmu.memory[0xFF0F]:
                 self.halted = False
             return 4
 
@@ -457,15 +479,13 @@ class CPU:
     def _handle_interrupts(self):
         if not self.interrupts_master_enabled:
             return 0
-        ie = self.mmu.read_byte(0xFFFF)
-        if_reg = self.mmu.read_byte(0xFF0F)
-        pending = ie & if_reg
+        pending = self.mmu.memory[0xFFFF] & self.mmu.memory[0xFF0F]
         if pending == 0:
             return 0
         self.interrupts_master_enabled = False
         for bit in range(5):
             if pending & (1 << bit):
-                self.mmu.write_byte(0xFF0F, if_reg & ~(1 << bit))
+                self.mmu.memory[0xFF0F] &= ~(1 << bit)
                 self._push(self.reg.pc)
                 self.reg.pc = 0x0040 + (bit * 8)
                 return 20
@@ -976,13 +996,14 @@ class PPU:
 
     def step(self, cycles_passed):
         self.cycles += cycles_passed
-        lcdc = self.mmu.read_byte(0xFF40)
+        mem = self.mmu.memory
+        lcdc = mem[0xFF40]
         if not (lcdc & 0x80):
             return
 
         while self.cycles >= 456:
             self.cycles -= 456
-            ly = self.mmu.read_byte(0xFF44)
+            ly = mem[0xFF44]
 
             if ly < 144:
                 self._update_stat_mode(2)
@@ -994,75 +1015,82 @@ class PPU:
                 self._update_stat_mode(1)
 
             new_ly = (ly + 1) % 154
-            self.mmu.write_byte(0xFF44, new_ly)
+            mem[0xFF44] = new_ly
 
             if new_ly == 144:
-                if_reg = self.mmu.read_byte(0xFF0F)
-                self.mmu.write_byte(0xFF0F, if_reg | 0x01)
+                mem[0xFF0F] |= 0x01
 
             self._check_lyc(new_ly)
 
     def _update_stat_mode(self, mode):
         self.mode = mode
-        stat = self.mmu.read_byte(0xFF41)
-        stat = (stat & 0xFC) | mode
-        self.mmu.write_byte(0xFF41, stat)
+        mem = self.mmu.memory
+        stat = (mem[0xFF41] & 0xFC) | mode
+        mem[0xFF41] = stat
         if mode == 0 and (stat & 0x08):
-            self._request_stat_int()
+            mem[0xFF0F] |= 0x02
         elif mode == 1 and (stat & 0x10):
-            self._request_stat_int()
+            mem[0xFF0F] |= 0x02
         elif mode == 2 and (stat & 0x20):
-            self._request_stat_int()
+            mem[0xFF0F] |= 0x02
 
     def _request_stat_int(self):
-        if_reg = self.mmu.read_byte(0xFF0F)
-        self.mmu.write_byte(0xFF0F, if_reg | 0x02)
+        self.mmu.memory[0xFF0F] |= 0x02
 
     def _check_lyc(self, ly):
-        lyc = self.mmu.read_byte(0xFF45)
-        stat = self.mmu.read_byte(0xFF41)
+        mem = self.mmu.memory
+        lyc = mem[0xFF45]
+        stat = mem[0xFF41]
         if ly == lyc:
             stat |= 0x04
+            mem[0xFF41] = stat
             if stat & 0x40:
-                self._request_stat_int()
+                mem[0xFF0F] |= 0x02
         else:
-            stat &= ~0x04
-        self.mmu.write_byte(0xFF41, stat)
+            mem[0xFF41] = stat & ~0x04
 
     def _render_scanline(self, ly):
-        lcdc = self.mmu.read_byte(0xFF40)
+        mem = self.mmu.memory
+        lcdc = mem[0xFF40]
         bg_map_base = 0x9C00 if (lcdc & 0x08) else 0x9800
         signed_tiles = not (lcdc & 0x10)
         tile_base = 0x8000 if (lcdc & 0x10) else 0x8800
 
-        scy = self.mmu.read_byte(0xFF42)
-        scx = self.mmu.read_byte(0xFF43)
-        bgp = self.mmu.read_byte(0xFF47)
+        scy = mem[0xFF42]
+        scx = mem[0xFF43]
+        bgp = mem[0xFF47]
 
         bg_y = (scy + ly) & 0xFF
-        tile_row = bg_y // 8
-        pixel_row = bg_y % 8
+        tile_row = bg_y >> 3
+        pixel_row = bg_y & 7
 
-        for x in range(SCREEN_WIDTH):
-            bg_x = (scx + x) & 0xFF
-            tile_col = bg_x // 8
-            pixel_col = 7 - (bg_x % 8)
-
-            map_addr = bg_map_base + tile_row * 32 + tile_col
-            tile_idx = self.mmu.read_byte(map_addr)
-
+        fb_row = ly * SCREEN_WIDTH
+        shades = self._SHADES
+        fb = self.framebuffer
+        bg_pri = self.bg_palette_idx
+        scx_mod = scx & 7
+        first_tile_col = scx >> 3
+        # Render from x=0..SCREEN_WIDTH-1
+        for tile_col_offset in range(21):
+            tile_col = (first_tile_col + tile_col_offset) & 0x1F
+            map_addr = bg_map_base + (tile_row << 5) + tile_col
+            tile_idx = mem[map_addr]
             if signed_tiles:
-                addr = 0x9000 + ((tile_idx if tile_idx < 128 else tile_idx - 256) * 16)
+                addr = 0x9000 + ((tile_idx if tile_idx < 128 else tile_idx - 256) << 4)
             else:
-                addr = tile_base + tile_idx * 16
-            addr += pixel_row * 2
-
-            lo = self.mmu.read_byte(addr)
-            hi = self.mmu.read_byte(addr + 1)
-            color_idx = ((hi >> pixel_col) & 1) << 1 | ((lo >> pixel_col) & 1)
-            shade = (bgp >> (color_idx * 2)) & 0x03
-            self.framebuffer[ly * SCREEN_WIDTH + x] = self._SHADES[shade]
-            self.bg_palette_idx[ly * SCREEN_WIDTH + x] = color_idx
+                addr = tile_base + (tile_idx << 4)
+            addr += pixel_row << 1
+            lo = mem[addr]
+            hi = mem[addr + 1]
+            tile_x_start = tile_col_offset * 8 - scx_mod
+            for p in range(8):
+                pixel_col = 7 - p
+                color_idx = ((hi >> pixel_col) & 1) << 1 | ((lo >> pixel_col) & 1)
+                x = tile_x_start + p
+                if 0 <= x < SCREEN_WIDTH:
+                    shade = (bgp >> (color_idx << 1)) & 0x03
+                    fb[fb_row + x] = shades[shade]
+                    bg_pri[fb_row + x] = color_idx
 
         if lcdc & 0x20:
             self._render_window(ly)
@@ -1070,9 +1098,10 @@ class PPU:
             self._render_sprites(ly)
 
     def _render_window(self, ly):
-        lcdc = self.mmu.read_byte(0xFF40)
-        wy = self.mmu.read_byte(0xFF4A)
-        wx_raw = self.mmu.read_byte(0xFF4B)
+        mem = self.mmu.memory
+        lcdc = mem[0xFF40]
+        wy = mem[0xFF4A]
+        wx_raw = mem[0xFF4B]
         if ly < wy:
             return
         win_x_offset = wx_raw - 7
@@ -1081,50 +1110,66 @@ class PPU:
         win_map_base = 0x9C00 if (lcdc & 0x40) else 0x9800
         signed_tiles = not (lcdc & 0x10)
         tile_base = 0x8000 if (lcdc & 0x10) else 0x8800
-        bgp = self.mmu.read_byte(0xFF47)
+        bgp = mem[0xFF47]
         win_y = ly - wy
-        tile_row = win_y // 8
-        pixel_row = win_y % 8
-        for x in range(max(win_x_offset, 0), SCREEN_WIDTH):
-            win_x = x - win_x_offset
-            tile_col = win_x // 8
-            pixel_col = 7 - (win_x % 8)
-            map_addr = win_map_base + tile_row * 32 + tile_col
-            tile_idx = self.mmu.read_byte(map_addr)
+        tile_row = win_y >> 3
+        pixel_row = win_y & 7
+        fb_row = ly * SCREEN_WIDTH
+        shades = self._SHADES
+        fb = self.framebuffer
+        bg_pri = self.bg_palette_idx
+        x_start = win_x_offset if win_x_offset > 0 else 0
+        # Render 21 tiles worth of pixels (160 px / 8 = 20 + buffer)
+        for tile_col in range(21):
+            win_x = tile_col * 8
+            x = win_x + win_x_offset
+            if x >= SCREEN_WIDTH:
+                break
+            map_addr = win_map_base + (tile_row << 5) + tile_col
+            tile_idx = mem[map_addr]
             if signed_tiles:
-                addr = 0x9000 + ((tile_idx if tile_idx < 128 else tile_idx - 256) * 16)
+                addr = 0x9000 + ((tile_idx if tile_idx < 128 else tile_idx - 256) << 4)
             else:
-                addr = tile_base + tile_idx * 16
-            addr += pixel_row * 2
-            lo = self.mmu.read_byte(addr)
-            hi = self.mmu.read_byte(addr + 1)
-            color_idx = ((hi >> pixel_col) & 1) << 1 | ((lo >> pixel_col) & 1)
-            shade = (bgp >> (color_idx * 2)) & 0x03
-            self.framebuffer[ly * SCREEN_WIDTH + x] = self._SHADES[shade]
-            self.bg_palette_idx[ly * SCREEN_WIDTH + x] = color_idx
+                addr = tile_base + (tile_idx << 4)
+            addr += pixel_row << 1
+            lo = mem[addr]
+            hi = mem[addr + 1]
+            for p in range(8):
+                pixel_col = 7 - p
+                color_idx = ((hi >> pixel_col) & 1) << 1 | ((lo >> pixel_col) & 1)
+                px = x + p
+                if 0 <= px < SCREEN_WIDTH:
+                    shade = (bgp >> (color_idx << 1)) & 0x03
+                    fb[fb_row + px] = shades[shade]
+                    bg_pri[fb_row + px] = color_idx
 
     def _render_sprites(self, ly):
-        lcdc = self.mmu.read_byte(0xFF40)
+        mem = self.mmu.memory
+        lcdc = mem[0xFF40]
         sprite_height = 16 if (lcdc & 0x04) else 8
         sprites = []
         for i in range(40):
             oam_addr = 0xFE00 + i * 4
-            y = self.mmu.read_byte(oam_addr)
-            x = self.mmu.read_byte(oam_addr + 1)
+            y = mem[oam_addr]
+            x = mem[oam_addr + 1]
             if y == 0 or y >= 160:
                 continue
             spr_y = y - 16
             spr_x = x - 8
             if spr_y > ly or spr_y + sprite_height <= ly:
                 continue
-            tile = self.mmu.read_byte(oam_addr + 2)
-            flags = self.mmu.read_byte(oam_addr + 3)
+            tile = mem[oam_addr + 2]
+            flags = mem[oam_addr + 3]
             sprites.append((spr_x, spr_y, tile, flags))
             if len(sprites) >= 10:
                 break
         sprites.sort(key=lambda s: s[0])
-        obp0 = self.mmu.read_byte(0xFF48)
-        obp1 = self.mmu.read_byte(0xFF49)
+        obp0 = mem[0xFF48]
+        obp1 = mem[0xFF49]
+        fb_row = ly * SCREEN_WIDTH
+        bg_pri = self.bg_palette_idx
+        fb = self.framebuffer
+        shades = self._SHADES
         for spr_x, spr_y, tile, flags in sprites:
             sprite_pixel_y = ly - spr_y
             if flags & 0x40:
@@ -1135,8 +1180,8 @@ class PPU:
             else:
                 tile_idx_used = tile
             tile_addr = 0x8000 + tile_idx_used * 16 + (sprite_pixel_y % 8) * 2
-            lo = self.mmu.read_byte(tile_addr)
-            hi = self.mmu.read_byte(tile_addr + 1)
+            lo = mem[tile_addr]
+            hi = mem[tile_addr + 1]
             for sx in range(8):
                 pixel_x = spr_x + sx
                 if pixel_x < 0 or pixel_x >= SCREEN_WIDTH:
@@ -1145,11 +1190,11 @@ class PPU:
                 color_idx = ((hi >> pixel_col) & 1) << 1 | ((lo >> pixel_col) & 1)
                 if color_idx == 0:
                     continue
-                if flags & 0x80 and self.bg_palette_idx[ly * SCREEN_WIDTH + pixel_x] != 0:
+                if flags & 0x80 and bg_pri[fb_row + pixel_x] != 0:
                     continue
                 palette = obp1 if (flags & 0x10) else obp0
                 shade = (palette >> (color_idx * 2)) & 0x03
-                self.framebuffer[ly * SCREEN_WIDTH + pixel_x] = self._SHADES[shade]
+                fb[fb_row + pixel_x] = shades[shade]
 
 
 class Timers:
