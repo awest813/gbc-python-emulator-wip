@@ -13,11 +13,20 @@ menu system, ROM browser, and MBC1/MBC5 cartridge support.
 - **CPU** — Complete LR35902 instruction set (standard + CB-prefixed),
   interrupt handling, HALT / wait states.
 - **PPU** — Background, window, and 8×8 / 8×16 sprite rendering with
-  DMG-style 4-shade palette, X/Y flip, and sprite-over-BG priority.
+  DMG 4-shade palette and CGB 8-palette × 4-color BG/OBJ palettes,
+  tile-level attributes from VRAM bank 1, X/Y flip, and sprite-over-BG
+  priority.
+- **APU** — All four DMG sound channels (two squares with envelope,
+  sweep on channel 1, 32-step wave channel, LFSR noise channel),
+  frame sequencer for length / envelope / sweep, master volume and
+  per-channel stereo panning, streamed to the host at 44.1 kHz.
+- **Serial port** — FF01/FF02 register support with serial interrupt
+  generation (link cable TCP client/server planned).
 - **Timers** — DIV, TIMA, TMA, TAC with all four programmable rates and
   correct overflow → interrupt signalling.
-- **Cartridge** — MBC1 and MBC5 (ROM / RAM banking, battery-backed RAM,
-  rumble flag detection).
+- **Cartridge** — MBC1 and MBC5 (ROM / RAM banking, battery-backed RAM
+  with automatic `.sav` file load on boot and save on exit). CGB mode
+  auto-detected from header byte 0x0143.
 - **Menu system** — ROM browser, window-scale selector, keyboard controls,
   project logo.
 - **Input** — D-pad, A / B, Start, Select via the standard joypad register
@@ -59,6 +68,22 @@ python gbc_emulator_skeleton.py
 python gbc_emulator_skeleton.py path/to/rom.gb --nomenu
 ```
 
+### Chromebook (Crostini Linux)
+
+1. Enable Linux in Chrome OS Settings > Developers > Linux development environment
+2. Open the Terminal app and run:
+   ```bash
+   sudo apt update && sudo apt install python3 python3-pip libsdl2-2.0-0
+   pip3 install pygame numpy
+   ```
+3. Launch the emulator:
+   ```bash
+   python3 gbc_emulator_skeleton.py
+   ```
+   The `run.sh` launcher automatically sets `SDL_AUDIODRIVER=alsa` on ChromeOS. If
+   audio doesn't work, try `SDL_AUDIODRIVER=dummy python3 gbc_emulator_skeleton.py`
+   to run silently.
+
 ## Controls
 
 | Key            | GB Button     |
@@ -75,7 +100,13 @@ python gbc_emulator_skeleton.py path/to/rom.gb --nomenu
 
 - **Load ROM** — Browse and select a `.gb` or `.gbc` file. Press **F5**
   to refresh the list.
-- **Settings** — Cycle the window scale between 2× and 5×.
+- **Settings** — Tweak the following options (press **Enter** to cycle each):
+  - *Window Scale* — 2× … 5×
+  - *Frame Rate* — 59.7 fps / 60 fps / Unlimited
+  - *Volume* — Mute / Low / Medium / High / Max
+  - *Palette* — DMG Green / Grayscale / Amber / Blue / Brown / Pastel
+  - *Filter* — Nearest (pixel-sharp) / Smooth (bilinear)
+  - *Shader* — Off / LCD Ghost / CRT Scanlines / Gamma Warm / Pixel Bloom / Pocket Green
 - **Exit to OS** — Quit the emulator.
 
 Place ROM files in a `roms/` folder next to the emulator script, or
@@ -91,7 +122,10 @@ is:
 2. `CPU.step` → `execute` (hot path: NOP / LD r,r / ALU A,r) → `_exec_low`
    / `_exec_high` (less common opcodes).
 3. `PPU.step` accumulates cycles and renders scanlines on the
-   456-cycle boundary; `Timers.step` advances DIV / TIMA.
+   456-cycle boundary; `Timers.step` advances DIV / TIMA;
+   `APU.step` clocks the frame sequencer, channel waveforms, and
+   emits 44.1 kHz PCM into a buffer that the run loop drains to
+   SDL's audio queue after each frame.
 
 Performance-critical helpers:
 
@@ -115,6 +149,7 @@ gbclogo.png                Branding logo (used in menu + window icon)
 roms/                      Drop ROMs here (auto-created on first run)
 LICENSE                    MIT License
 .gitattributes             Enforces LF line endings on shell / source files
+*.sav                      Battery-backed cartridge save files (auto-created next to ROM)
 ```
 
 ## Status
@@ -127,9 +162,7 @@ interpreter on modest hardware.
 
 ### Known Limitations
 
-- No APU (audio output is silent).
-- No CGB color palettes — DMG 4-shade palette only.
-- No battery save file persistence (`*.sav` is not written).
+- CGB double-speed mode not yet implemented.
 - STAT blocking mode is not emulated per-cycle.
 - Unimplemented opcodes halt the CPU silently (logged as an error).
 - No save-state support.

@@ -41,6 +41,12 @@ if ! "$PY" -c "import pygame; import numpy" >/dev/null 2>&1; then
 fi
 
 echo
+# --- Chromebook / Crostini detection -----------------------------------------
+if grep -qi "chromeos" /etc/os-release 2>/dev/null; then
+    export SDL_AUDIODRIVER="${SDL_AUDIODRIVER:-alsa}"
+    echo "[Crostini] ChromeOS detected — using SDL audio driver: ${SDL_AUDIODRIVER}"
+fi
+
 echo "Starting emulator..."
 echo
 echo "  Controls:"
