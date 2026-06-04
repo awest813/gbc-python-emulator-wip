@@ -1,6 +1,9 @@
 """
-Game Boy / Game Boy Color Emulator Architecture Skeleton
-Requires: pygame (pip install pygame)
+Game Boy / Game Boy Color emulator written in Python.
+Supports MBC1/MBC5 cartridges, BG/Window/Sprite rendering, and
+includes a built-in menu with ROM browser.
+
+Requires: pygame, numpy  (pip install pygame numpy)
 """
 import sys
 import os
@@ -9,9 +12,15 @@ import logging
 import argparse
 
 try:
+    import numpy as np
+except ImportError:
+    print("Warning: numpy not installed. Run 'pip install numpy' for faster rendering.")
+    np = None
+
+try:
     import pygame
 except ImportError:
-    print("Warning: Pygame not installed. Run 'pip install pygame' for display support.")
+    print("Warning: pygame not installed. Run 'pip install pygame' for display support.")
     pygame = None
 
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
@@ -27,6 +36,18 @@ FLAG_Z = 7  # Zero flag
 FLAG_N = 6  # Subtract flag
 FLAG_H = 5  # Half Carry flag
 FLAG_C = 4  # Carry flag
+
+# Key bindings: pygame key -> joypad bit (matches set_joypad_button bit order)
+KEY_TO_JOYPAD_BIT = {
+    pygame.K_RIGHT:  0,  # Right
+    pygame.K_LEFT:   1,  # Left
+    pygame.K_UP:     2,  # Up
+    pygame.K_DOWN:   3,  # Down
+    pygame.K_z:      4,  # A
+    pygame.K_x:      5,  # B
+    pygame.K_RSHIFT: 6,  # Select
+    pygame.K_RETURN: 7,  # Start
+} if pygame else {}
 
 
 class Registers:
@@ -95,7 +116,6 @@ class MMU:
     """Memory Management Unit handling the 64KB address space with MBC1/MBC5."""
     def __init__(self):
         self.memory = bytearray(0x10000)
-        self.in_bios = False
         self.rom_data = bytearray()
         self.ram_data = bytearray()
         self.mbc_type = 0x00
@@ -108,7 +128,6 @@ class MMU:
         self.num_rom_banks = 2
         self.num_ram_banks = 0
         self.joypad_buttons = 0xFF
-        self.joypad_callback = None
         self.div_reset_callback = None
 
     def load_rom(self, rom_data):
@@ -284,7 +303,6 @@ class CPU:
     def __init__(self, mmu):
         self.mmu = mmu
         self.reg = Registers()
-        self.cycles = 0
         self.halted = False
         self.interrupts_master_enabled = False
         self.trace_enabled = False
@@ -705,7 +723,7 @@ class CPU:
         if opcode == 0xC4:
             addr = self.fetch_word()
             if self._check_cond(0):
-                self._push((self.reg.pc) & 0xFFFF)
+                self._push(self.reg.pc)
                 self.reg.pc = addr; return 24
             return 12
         if opcode == 0xC5:
@@ -713,7 +731,7 @@ class CPU:
         if opcode == 0xC6:
             self._alu_a_op(0, self.fetch_byte()); return 8
         if opcode == 0xC7:
-            self._push((self.reg.pc) & 0xFFFF); self.reg.pc = 0x00; return 16
+            self._push(self.reg.pc); self.reg.pc = 0x00; return 16
         if opcode == 0xC8:
             if self._check_cond(1):
                 self.reg.pc = self._pop(); return 20
@@ -730,17 +748,17 @@ class CPU:
         if opcode == 0xCC:
             addr = self.fetch_word()
             if self._check_cond(1):
-                self._push((self.reg.pc) & 0xFFFF)
+                self._push(self.reg.pc)
                 self.reg.pc = addr; return 24
             return 12
         if opcode == 0xCD:
             addr = self.fetch_word()
-            self._push((self.reg.pc) & 0xFFFF)
+            self._push(self.reg.pc)
             self.reg.pc = addr; return 24
         if opcode == 0xCE:
             self._alu_a_op(1, self.fetch_byte()); return 8
         if opcode == 0xCF:
-            self._push((self.reg.pc) & 0xFFFF); self.reg.pc = 0x08; return 16
+            self._push(self.reg.pc); self.reg.pc = 0x08; return 16
 
         # --- 0xD0-0xDF ---
         if opcode == 0xD0:
@@ -757,7 +775,7 @@ class CPU:
         if opcode == 0xD4:
             addr = self.fetch_word()
             if self._check_cond(2):
-                self._push((self.reg.pc) & 0xFFFF)
+                self._push(self.reg.pc)
                 self.reg.pc = addr; return 24
             return 12
         if opcode == 0xD5:
@@ -765,7 +783,7 @@ class CPU:
         if opcode == 0xD6:
             self._alu_a_op(2, self.fetch_byte()); return 8
         if opcode == 0xD7:
-            self._push((self.reg.pc) & 0xFFFF); self.reg.pc = 0x10; return 16
+            self._push(self.reg.pc); self.reg.pc = 0x10; return 16
         if opcode == 0xD8:
             if self._check_cond(3):
                 self.reg.pc = self._pop(); return 20
@@ -781,13 +799,13 @@ class CPU:
         if opcode == 0xDC:
             addr = self.fetch_word()
             if self._check_cond(3):
-                self._push((self.reg.pc) & 0xFFFF)
+                self._push(self.reg.pc)
                 self.reg.pc = addr; return 24
             return 12
         if opcode == 0xDE:
             self._alu_a_op(3, self.fetch_byte()); return 8
         if opcode == 0xDF:
-            self._push((self.reg.pc) & 0xFFFF); self.reg.pc = 0x18; return 16
+            self._push(self.reg.pc); self.reg.pc = 0x18; return 16
 
         # --- 0xE0-0xEF ---
         if opcode == 0xE0:
@@ -801,7 +819,7 @@ class CPU:
         if opcode == 0xE6:
             self._alu_a_op(4, self.fetch_byte()); return 8
         if opcode == 0xE7:
-            self._push((self.reg.pc) & 0xFFFF); self.reg.pc = 0x20; return 16
+            self._push(self.reg.pc); self.reg.pc = 0x20; return 16
         if opcode == 0xE8:
             offset = self.fetch_byte()
             if offset & 0x80: offset -= 256
@@ -817,7 +835,7 @@ class CPU:
         if opcode == 0xEE:
             self._alu_a_op(5, self.fetch_byte()); return 8
         if opcode == 0xEF:
-            self._push((self.reg.pc) & 0xFFFF); self.reg.pc = 0x28; return 16
+            self._push(self.reg.pc); self.reg.pc = 0x28; return 16
 
         # --- 0xF0-0xFF ---
         if opcode == 0xF0:
@@ -834,7 +852,7 @@ class CPU:
         if opcode == 0xF6:
             self._alu_a_op(6, self.fetch_byte()); return 8
         if opcode == 0xF7:
-            self._push((self.reg.pc) & 0xFFFF); self.reg.pc = 0x30; return 16
+            self._push(self.reg.pc); self.reg.pc = 0x30; return 16
         if opcode == 0xF8:
             offset = self.fetch_byte()
             if offset & 0x80: offset -= 256
@@ -852,7 +870,7 @@ class CPU:
         if opcode == 0xFE:
             self._alu_a_op(7, self.fetch_byte()); return 8
         if opcode == 0xFF:
-            self._push((self.reg.pc) & 0xFFFF); self.reg.pc = 0x38; return 16
+            self._push(self.reg.pc); self.reg.pc = 0x38; return 16
 
         # Unimplemented fallback
         logging.error(f"Unimplemented Opcode: {hex(opcode)} at PC: {hex(self.reg.pc - 1)}")
@@ -950,26 +968,27 @@ class CPU:
         op_group = (cb_opcode >> 6) & 0x3
 
         # Determine operand (read from register or (HL), with cycle info)
+        # BIT takes 12 cycles for (HL), 8 for r. Other CB ops take 16 for (HL), 8 for r.
         if reg_idx == 6:
             val = self.mmu.read_byte(self.reg.hl)
-            cycles = 16 if op_group == 1 else 16
             is_hl = True
         else:
             val = self._get_r8(reg_idx)
-            cycles = 8
             is_hl = False
 
         if op_group == 0:
             ops = [_rlc, _rrc, _rl, _rr, _sla, _sra, _swap, _srl]
             result = ops[bit_pos](val)
+            cycles = 16 if is_hl else 8
         elif op_group == 1:
             _bit(val, bit_pos)
-            cycles = 12 if is_hl else 8
-            return cycles
+            return 12 if is_hl else 8
         elif op_group == 2:
             result = _res(val, bit_pos)
+            cycles = 16 if is_hl else 8
         else:
             result = _set(val, bit_pos)
+            cycles = 16 if is_hl else 8
 
         if is_hl:
             self.mmu.write_byte(self.reg.hl, result)
@@ -1034,9 +1053,6 @@ class PPU:
         elif mode == 2 and (stat & 0x20):
             mem[0xFF0F] |= 0x02
 
-    def _request_stat_int(self):
-        self.mmu.memory[0xFF0F] |= 0x02
-
     def _check_lyc(self, ly):
         mem = self.mmu.memory
         lyc = mem[0xFF45]
@@ -1070,7 +1086,7 @@ class PPU:
         bg_pri = self.bg_palette_idx
         scx_mod = scx & 7
         first_tile_col = scx >> 3
-        # Render from x=0..SCREEN_WIDTH-1
+        # 160 px / 8 = 20 full tiles; render 21 with bounds check for partial last column.
         for tile_col_offset in range(21):
             tile_col = (first_tile_col + tile_col_offset) & 0x1F
             map_addr = bg_map_base + (tile_row << 5) + tile_col
@@ -1084,13 +1100,14 @@ class PPU:
             hi = mem[addr + 1]
             tile_x_start = tile_col_offset * 8 - scx_mod
             for p in range(8):
+                x = tile_x_start + p
+                if x < 0 or x >= SCREEN_WIDTH:
+                    continue
                 pixel_col = 7 - p
                 color_idx = ((hi >> pixel_col) & 1) << 1 | ((lo >> pixel_col) & 1)
-                x = tile_x_start + p
-                if 0 <= x < SCREEN_WIDTH:
-                    shade = (bgp >> (color_idx << 1)) & 0x03
-                    fb[fb_row + x] = shades[shade]
-                    bg_pri[fb_row + x] = color_idx
+                shade = (bgp >> (color_idx << 1)) & 0x03
+                fb[fb_row + x] = shades[shade]
+                bg_pri[fb_row + x] = color_idx
 
         if lcdc & 0x20:
             self._render_window(ly)
@@ -1118,13 +1135,12 @@ class PPU:
         shades = self._SHADES
         fb = self.framebuffer
         bg_pri = self.bg_palette_idx
-        x_start = win_x_offset if win_x_offset > 0 else 0
-        # Render 21 tiles worth of pixels (160 px / 8 = 20 + buffer)
         for tile_col in range(21):
-            win_x = tile_col * 8
-            x = win_x + win_x_offset
+            x = tile_col * 8 + win_x_offset
             if x >= SCREEN_WIDTH:
                 break
+            if x + 8 <= 0:
+                continue
             map_addr = win_map_base + (tile_row << 5) + tile_col
             tile_idx = mem[map_addr]
             if signed_tiles:
@@ -1135,13 +1151,14 @@ class PPU:
             lo = mem[addr]
             hi = mem[addr + 1]
             for p in range(8):
+                px = x + p
+                if px < 0 or px >= SCREEN_WIDTH:
+                    continue
                 pixel_col = 7 - p
                 color_idx = ((hi >> pixel_col) & 1) << 1 | ((lo >> pixel_col) & 1)
-                px = x + p
-                if 0 <= px < SCREEN_WIDTH:
-                    shade = (bgp >> (color_idx << 1)) & 0x03
-                    fb[fb_row + px] = shades[shade]
-                    bg_pri[fb_row + px] = color_idx
+                shade = (bgp >> (color_idx << 1)) & 0x03
+                fb[fb_row + px] = shades[shade]
+                bg_pri[fb_row + px] = color_idx
 
     def _render_sprites(self, ly):
         mem = self.mmu.memory
@@ -1357,13 +1374,12 @@ class EmulatorMenu:
                 except (OSError, pygame.error):
                     continue
                 scaled = pygame.transform.smoothscale(raw, (160, 160))
-                try:
-                    import numpy as np
+                if np is not None:
                     arr = pygame.surfarray.array3d(scaled).transpose(1, 0, 2)
                     mask = (arr[:, :, 0] > 220) & (arr[:, :, 1] > 220) & (arr[:, :, 2] > 220)
                     arr[mask] = MENU_BG
                     new_surf = pygame.surfarray.make_surface(arr.transpose(1, 0, 2))
-                except ImportError:
+                else:
                     new_surf = scaled
                 block = pygame.Surface((180, 180))
                 block.fill(MENU_BG)
@@ -1562,36 +1578,25 @@ class GameBoy:
 
     def handle_events(self):
         """Process window events and Joypad inputs."""
-        _BUTTON_MAP = {
-            pygame.K_RIGHT: 0,
-            pygame.K_LEFT: 1,
-            pygame.K_UP: 2,
-            pygame.K_DOWN: 3,
-            pygame.K_z: 4,
-            pygame.K_x: 5,
-            pygame.K_RSHIFT: 6,
-            pygame.K_RETURN: 7,
-        }
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 self.running = False
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_ESCAPE:
                     self.running = False
-                elif event.key in _BUTTON_MAP:
-                    self.mmu.set_joypad_button(_BUTTON_MAP[event.key], True)
+                elif event.key in KEY_TO_JOYPAD_BIT:
+                    self.mmu.set_joypad_button(KEY_TO_JOYPAD_BIT[event.key], True)
             elif event.type == pygame.KEYUP:
-                if event.key in _BUTTON_MAP:
-                    self.mmu.set_joypad_button(_BUTTON_MAP[event.key], False)
+                if event.key in KEY_TO_JOYPAD_BIT:
+                    self.mmu.set_joypad_button(KEY_TO_JOYPAD_BIT[event.key], False)
 
     def render(self):
         """Draws the PPU framebuffer to the Pygame screen."""
-        try:
-            import numpy as np
+        if np is not None:
             arr = np.array(self.ppu.framebuffer, dtype=np.uint8).reshape(SCREEN_HEIGHT, SCREEN_WIDTH, 3)
             arr = np.ascontiguousarray(arr.transpose(1, 0, 2))
             surf = pygame.surfarray.make_surface(arr)
-        except ImportError:
+        else:
             surf = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT))
             pxa = pygame.PixelArray(surf)
             fb = self.ppu.framebuffer
