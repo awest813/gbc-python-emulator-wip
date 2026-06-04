@@ -1,0 +1,8 @@
+# Ensure shell scripts and config files use LF line endings, even on
+# Windows checkouts. Keeps run.sh executable and readable on Linux/macOS.
+*.sh        text eol=lf
+*.py        text eol=lf
+*.md        text eol=lf
+*.txt       text eol=lf
+*.gitignore text eol=lf
+LICENSE     text eol=lf

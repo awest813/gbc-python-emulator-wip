@@ -38,11 +38,19 @@ menu system, ROM browser, and MBC1/MBC5 cartridge support.
 1. Double-click `run.bat` — it will install dependencies and launch the
    emulator with the menu.
 
+### Linux / macOS
+
+1. From a terminal, run `./run.sh` (or `bash run.sh` if it isn't
+   executable). The launcher will install missing dependencies and start
+   the emulator.
+
 ### Manual
 
 ```bash
 pip install -r requirements.txt
-python gbc_emulator_skeleton.py
+python gbc_emulator_skeleton.py        # Linux / macOS
+python gbc_emulator_skeleton.py        # Windows (py launcher)
+py gbc_emulator_skeleton.py            # Windows alternative
 ```
 
 ### Boot a ROM directly (skip the menu)
@@ -79,8 +87,10 @@ filesystem looking for `.gb` / `.gbc` files.
 gbc_emulator_skeleton.py   Single-file emulator (CPU, MMU, PPU, Timers, menu, runner)
 requirements.txt           Pinned dependency list (pygame, numpy)
 run.bat                    Windows launcher (installs deps if missing, then runs)
+run.sh                     Linux / macOS launcher (bash, installs deps if missing)
 gbclogo.png                Branding logo (used in menu + window icon)
 roms/                      Drop ROMs here (auto-created on first run)
+LICENSE                    MIT License
 ```
 
 ## Status
