@@ -477,8 +477,9 @@ class CPU:
 
     def step(self):
         """Fetches, decodes, and executes a single instruction."""
+        mem = self.mmu.memory
         if self.halted:
-            if self.mmu.memory[0xFFFF] & self.mmu.memory[0xFF0F]:
+            if mem[0xFFFF] & mem[0xFF0F]:
                 self.halted = False
             return 4
 
@@ -489,7 +490,9 @@ class CPU:
             op = self.mmu.read_byte(pc)
             print(f"A:{a:02X} F:{f:02X} B:{b:02X} C:{c:02X} D:{d:02X} E:{e:02X} H:{h:02X} L:{l:02X} SP:{sp:04X} PCMEM:{op:02X}")
 
-        opcode = self.fetch_byte()
+        pc = self.reg.pc
+        opcode = mem[pc]
+        self.reg.pc = pc + 1
         cycles = self.execute(opcode)
         cycles += self._handle_interrupts()
         return cycles
@@ -510,11 +513,30 @@ class CPU:
         return 0
 
     def execute(self, opcode):
-        # NOP
+        # Hot-path opcodes first: NOP, LD r,r (0x40-0x7F), ALU A,r (0x80-0xBF).
+        # These cover ~80% of DMG instruction mix and short-circuit the long
+        # if/elif chain below.
+        if opcode < 0x40:
+            return self._exec_low(opcode)
+        if opcode < 0x80:
+            if opcode == 0x76:
+                self.halted = True
+                return 4
+            dst = (opcode >> 3) & 0x7
+            src = opcode & 0x7
+            self._set_r8(dst, self._get_r8(src))
+            return 4
+        if opcode < 0xC0:
+            op_type = (opcode >> 3) & 0x7
+            operand_idx = opcode & 0x7
+            self._alu_a_op(op_type, self._get_r8(operand_idx))
+            return 8 if operand_idx == 6 else 4
+        return self._exec_high(opcode)
+
+    def _exec_low(self, opcode):
+        # 0x00-0x3F: less common opcodes.
         if opcode == 0x00:
             return 4
-
-        # --- 0x01-0x0F ---
         if opcode == 0x01:
             self.reg.bc = self.fetch_word(); return 12
         if opcode == 0x02:
@@ -552,8 +574,6 @@ class CPU:
             self.reg.a = ((a >> 1) | (carry << 7)) & 0xFF
             self.reg.set_flag(FLAG_Z, 0); self.reg.set_flag(FLAG_N, 0)
             self.reg.set_flag(FLAG_H, 0); self.reg.set_flag(FLAG_C, carry); return 4
-
-        # --- 0x10-0x1F ---
         if opcode == 0x10:
             return 4  # STOP
         if opcode == 0x11:
@@ -596,8 +616,6 @@ class CPU:
             self.reg.a = ((a >> 1) | (old_c << 7)) & 0xFF
             self.reg.set_flag(FLAG_Z, 0); self.reg.set_flag(FLAG_N, 0)
             self.reg.set_flag(FLAG_H, 0); self.reg.set_flag(FLAG_C, new_c); return 4
-
-        # --- 0x20-0x2F ---
         if opcode == 0x20:
             offset = self.fetch_byte()
             if self._check_cond(0):
@@ -641,8 +659,6 @@ class CPU:
         if opcode == 0x2F:
             self.reg.a ^= 0xFF
             self.reg.set_flag(FLAG_N, 1); self.reg.set_flag(FLAG_H, 1); return 4
-
-        # --- 0x30-0x3F ---
         if opcode == 0x30:
             offset = self.fetch_byte()
             if self._check_cond(2):
@@ -686,27 +702,14 @@ class CPU:
             self.reg.a = self._dec_r8(self.reg.a); return 4
         if opcode == 0x3E:
             self.reg.a = self.fetch_byte(); return 8
-        if opcode == 0x3F:
-            carry = self.reg.get_flag(FLAG_C)
-            self.reg.set_flag(FLAG_N, 0); self.reg.set_flag(FLAG_H, 0)
-            self.reg.set_flag(FLAG_C, carry ^ 1); return 4
+        # 0x3F
+        carry = self.reg.get_flag(FLAG_C)
+        self.reg.set_flag(FLAG_N, 0); self.reg.set_flag(FLAG_H, 0)
+        self.reg.set_flag(FLAG_C, carry ^ 1)
+        return 4
 
-        # --- 0x40-0x7F: LD r, r' (0x76 is HALT) ---
-        if opcode == 0x76:
-            self.halted = True; return 4
-        if 0x40 <= opcode <= 0x7F:
-            dst = (opcode >> 3) & 0x7
-            src = opcode & 0x7
-            self._set_r8(dst, self._get_r8(src)); return 4
-
-        # --- 0x80-0xBF: ALU A, operand ---
-        if 0x80 <= opcode <= 0xBF:
-            op_type = (opcode >> 3) & 0x7
-            operand_idx = opcode & 0x7
-            self._alu_a_op(op_type, self._get_r8(operand_idx))
-            return 8 if operand_idx == 6 else 4
-
-        # --- 0xC0-0xCF ---
+    def _exec_high(self, opcode):
+        # 0xC0-0xFF: control flow and stack opcodes.
         if opcode == 0xC0:
             if self._check_cond(0):
                 self.reg.pc = self._pop(); return 20
@@ -759,8 +762,6 @@ class CPU:
             self._alu_a_op(1, self.fetch_byte()); return 8
         if opcode == 0xCF:
             self._push(self.reg.pc); self.reg.pc = 0x08; return 16
-
-        # --- 0xD0-0xDF ---
         if opcode == 0xD0:
             if self._check_cond(2):
                 self.reg.pc = self._pop(); return 20
@@ -806,8 +807,6 @@ class CPU:
             self._alu_a_op(3, self.fetch_byte()); return 8
         if opcode == 0xDF:
             self._push(self.reg.pc); self.reg.pc = 0x18; return 16
-
-        # --- 0xE0-0xEF ---
         if opcode == 0xE0:
             self.mmu.write_byte(0xFF00 | self.fetch_byte(), self.reg.a); return 12
         if opcode == 0xE1:
@@ -836,13 +835,10 @@ class CPU:
             self._alu_a_op(5, self.fetch_byte()); return 8
         if opcode == 0xEF:
             self._push(self.reg.pc); self.reg.pc = 0x28; return 16
-
-        # --- 0xF0-0xFF ---
         if opcode == 0xF0:
             self.reg.a = self.mmu.read_byte(0xFF00 | self.fetch_byte()); return 12
         if opcode == 0xF1:
-            val = self._pop()
-            self.reg.af = val; return 12
+            self.reg.af = self._pop(); return 12
         if opcode == 0xF2:
             self.reg.a = self.mmu.read_byte(0xFF00 | self.reg.c); return 8
         if opcode == 0xF3:
@@ -871,8 +867,6 @@ class CPU:
             self._alu_a_op(7, self.fetch_byte()); return 8
         if opcode == 0xFF:
             self._push(self.reg.pc); self.reg.pc = 0x38; return 16
-
-        # Unimplemented fallback
         logging.error(f"Unimplemented Opcode: {hex(opcode)} at PC: {hex(self.reg.pc - 1)}")
         return 4
 
@@ -1006,6 +1000,18 @@ class PPU:
         (8, 24, 32),
     ]
 
+    # Precomputed tables (built once at class definition time):
+    # _TILE_COLORS[k] where k = (hi<<8)|lo -> tuple of 8 color_idx values
+    # _PALETTE_SHADES[bgp] -> tuple of 4 shade_idx values (one per color_idx)
+    _TILE_COLORS = tuple(
+        tuple((((hi >> p) & 1) << 1 | ((lo >> p) & 1) for p in range(7, -1, -1)))
+        for lo in range(256) for hi in range(256)
+    )
+    _PALETTE_SHADES = tuple(
+        tuple((bgp >> (c << 1)) & 0x03 for c in range(4))
+        for bgp in range(256)
+    )
+
     def __init__(self, mmu):
         self.mmu = mmu
         self.cycles = 0
@@ -1014,14 +1020,15 @@ class PPU:
         self.bg_palette_idx = bytearray(SCREEN_WIDTH * SCREEN_HEIGHT)
 
     def step(self, cycles_passed):
-        self.cycles += cycles_passed
+        cycles = self.cycles + cycles_passed
         mem = self.mmu.memory
         lcdc = mem[0xFF40]
         if not (lcdc & 0x80):
+            self.cycles = cycles
             return
 
-        while self.cycles >= 456:
-            self.cycles -= 456
+        while cycles >= 456:
+            cycles -= 456
             ly = mem[0xFF44]
 
             if ly < 144:
@@ -1033,13 +1040,17 @@ class PPU:
             else:
                 self._update_stat_mode(1)
 
-            new_ly = (ly + 1) % 154
+            new_ly = ly + 1
+            if new_ly == 154:
+                new_ly = 0
             mem[0xFF44] = new_ly
 
             if new_ly == 144:
                 mem[0xFF0F] |= 0x01
 
             self._check_lyc(new_ly)
+
+        self.cycles = cycles
 
     def _update_stat_mode(self, mode):
         self.mode = mode
@@ -1084,30 +1095,64 @@ class PPU:
         shades = self._SHADES
         fb = self.framebuffer
         bg_pri = self.bg_palette_idx
+        tile_colors = self._TILE_COLORS
+        palette_shades = self._PALETTE_SHADES[bgp]
         scx_mod = scx & 7
         first_tile_col = scx >> 3
-        # 160 px / 8 = 20 full tiles; render 21 with bounds check for partial last column.
-        for tile_col_offset in range(21):
-            tile_col = (first_tile_col + tile_col_offset) & 0x1F
-            map_addr = bg_map_base + (tile_row << 5) + tile_col
-            tile_idx = mem[map_addr]
-            if signed_tiles:
-                addr = 0x9000 + ((tile_idx if tile_idx < 128 else tile_idx - 256) << 4)
-            else:
-                addr = tile_base + (tile_idx << 4)
-            addr += pixel_row << 1
-            lo = mem[addr]
-            hi = mem[addr + 1]
-            tile_x_start = tile_col_offset * 8 - scx_mod
-            for p in range(8):
-                x = tile_x_start + p
-                if x < 0 or x >= SCREEN_WIDTH:
-                    continue
-                pixel_col = 7 - p
-                color_idx = ((hi >> pixel_col) & 1) << 1 | ((lo >> pixel_col) & 1)
-                shade = (bgp >> (color_idx << 1)) & 0x03
-                fb[fb_row + x] = shades[shade]
-                bg_pri[fb_row + x] = color_idx
+        # Fast path: when scx is 8-aligned, every tile column is fully on-screen,
+        # so the inner 8-pixel loop has no bounds checks.
+        if scx_mod == 0:
+            for tile_col_offset in range(20):
+                tile_col = (first_tile_col + tile_col_offset) & 0x1F
+                map_addr = bg_map_base + (tile_row << 5) + tile_col
+                tile_idx = mem[map_addr]
+                if signed_tiles:
+                    addr = 0x9000 + ((tile_idx if tile_idx < 128 else tile_idx - 256) << 4)
+                else:
+                    addr = tile_base + (tile_idx << 4)
+                addr += pixel_row << 1
+                lo = mem[addr]
+                hi = mem[addr + 1]
+                c0, c1, c2, c3, c4, c5, c6, c7 = tile_colors[(hi << 8) | lo]
+                base = fb_row + tile_col_offset * 8
+                fb[base]     = shades[palette_shades[c0]]
+                fb[base + 1] = shades[palette_shades[c1]]
+                fb[base + 2] = shades[palette_shades[c2]]
+                fb[base + 3] = shades[palette_shades[c3]]
+                fb[base + 4] = shades[palette_shades[c4]]
+                fb[base + 5] = shades[palette_shades[c5]]
+                fb[base + 6] = shades[palette_shades[c6]]
+                fb[base + 7] = shades[palette_shades[c7]]
+                bp = bg_pri
+                bp[base]     = c0
+                bp[base + 1] = c1
+                bp[base + 2] = c2
+                bp[base + 3] = c3
+                bp[base + 4] = c4
+                bp[base + 5] = c5
+                bp[base + 6] = c6
+                bp[base + 7] = c7
+        else:
+            for tile_col_offset in range(21):
+                tile_col = (first_tile_col + tile_col_offset) & 0x1F
+                map_addr = bg_map_base + (tile_row << 5) + tile_col
+                tile_idx = mem[map_addr]
+                if signed_tiles:
+                    addr = 0x9000 + ((tile_idx if tile_idx < 128 else tile_idx - 256) << 4)
+                else:
+                    addr = tile_base + (tile_idx << 4)
+                addr += pixel_row << 1
+                lo = mem[addr]
+                hi = mem[addr + 1]
+                colors = tile_colors[(hi << 8) | lo]
+                tile_x_start = tile_col_offset * 8 - scx_mod
+                for p in range(8):
+                    x = tile_x_start + p
+                    if x < 0 or x >= SCREEN_WIDTH:
+                        continue
+                    c = colors[p]
+                    fb[fb_row + x] = shades[palette_shades[c]]
+                    bg_pri[fb_row + x] = c
 
         if lcdc & 0x20:
             self._render_window(ly)
@@ -1135,6 +1180,8 @@ class PPU:
         shades = self._SHADES
         fb = self.framebuffer
         bg_pri = self.bg_palette_idx
+        tile_colors = self._TILE_COLORS
+        palette_shades = self._PALETTE_SHADES[bgp]
         for tile_col in range(21):
             x = tile_col * 8 + win_x_offset
             if x >= SCREEN_WIDTH:
@@ -1150,15 +1197,14 @@ class PPU:
             addr += pixel_row << 1
             lo = mem[addr]
             hi = mem[addr + 1]
+            colors = tile_colors[(hi << 8) | lo]
             for p in range(8):
                 px = x + p
                 if px < 0 or px >= SCREEN_WIDTH:
                     continue
-                pixel_col = 7 - p
-                color_idx = ((hi >> pixel_col) & 1) << 1 | ((lo >> pixel_col) & 1)
-                shade = (bgp >> (color_idx << 1)) & 0x03
-                fb[fb_row + px] = shades[shade]
-                bg_pri[fb_row + px] = color_idx
+                c = colors[p]
+                fb[fb_row + px] = shades[palette_shades[c]]
+                bg_pri[fb_row + px] = c
 
     def _render_sprites(self, ly):
         mem = self.mmu.memory
@@ -1216,7 +1262,7 @@ class PPU:
 
 class Timers:
     """Timer registers: DIV, TIMA, TMA, TAC."""
-    _TIMA_RATES = {0: 1024, 1: 16, 2: 64, 3: 256}
+    _TIMA_RATES = (1024, 16, 64, 256)
 
     def __init__(self, mmu):
         self.mmu = mmu
@@ -1227,26 +1273,27 @@ class Timers:
         self.div_counter = 0
 
     def step(self, cycles):
-        self.div_counter += cycles
-        self.mmu.memory[0xFF04] = (self.div_counter >> 8) & 0xFF
+        mem = self.mmu.memory
+        div_counter = self.div_counter + cycles
+        self.div_counter = div_counter
+        mem[0xFF04] = (div_counter >> 8) & 0xFF
 
-        tac = self.mmu.memory[0xFF07]
+        tac = mem[0xFF07]
         if not (tac & 0x04):
             return
-        rate = tac & 0x03
-        step_cyc = self._TIMA_RATES[rate]
-        self.tima_accum += cycles
-        if self.tima_accum < step_cyc:
+        step_cyc = self._TIMA_RATES[tac & 0x03]
+        tima_accum = self.tima_accum + cycles
+        if tima_accum < step_cyc:
+            self.tima_accum = tima_accum
             return
-        overflows = self.tima_accum // step_cyc
-        self.tima_accum %= step_cyc
-        tima = self.mmu.memory[0xFF05]
-        new_val = tima + overflows
-        if new_val > 0xFF:
-            self.mmu.memory[0xFF05] = self.mmu.memory[0xFF06]
-            self.mmu.memory[0xFF0F] |= 0x04
+        overflows = tima_accum // step_cyc
+        self.tima_accum = tima_accum - overflows * step_cyc
+        tima = mem[0xFF05] + overflows
+        if tima > 0xFF:
+            mem[0xFF05] = mem[0xFF06]
+            mem[0xFF0F] |= 0x04
         else:
-            self.mmu.memory[0xFF05] = new_val
+            mem[0xFF05] = tima
 
 
 # ── Menu system ──────────────────────────────────────────────────────
