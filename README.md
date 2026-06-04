@@ -12,6 +12,7 @@ A Game Boy / Game Boy Color emulator written in Python, featuring a built-in men
 - **Cartridge**: MBC1 and MBC5 (ROM/RAM banking, battery RAM)
 - **Menu system**: ROM browser, window scale settings, keyboard controls
 - **Input**: Keyboard mapping for D-pad, A/B, Start, Select
+- **Performance**: ~85 fps on SUPERBAJTEK (Python 3.11, M-class hardware)
 
 ## Requirements
 

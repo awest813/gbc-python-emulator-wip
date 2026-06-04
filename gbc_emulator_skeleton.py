@@ -1198,13 +1198,34 @@ class PPU:
             lo = mem[addr]
             hi = mem[addr + 1]
             colors = tile_colors[(hi << 8) | lo]
-            for p in range(8):
-                px = x + p
-                if px < 0 or px >= SCREEN_WIDTH:
-                    continue
-                c = colors[p]
-                fb[fb_row + px] = shades[palette_shades[c]]
-                bg_pri[fb_row + px] = c
+            if x < 0:
+                # Partial overlap on left edge: bounds-check each pixel.
+                for p in range(8):
+                    px = x + p
+                    if 0 <= px < SCREEN_WIDTH:
+                        c = colors[p]
+                        fb[fb_row + px] = shades[palette_shades[c]]
+                        bg_pri[fb_row + px] = c
+            else:
+                c0, c1, c2, c3, c4, c5, c6, c7 = colors
+                base = fb_row + x
+                fb[base]     = shades[palette_shades[c0]]
+                fb[base + 1] = shades[palette_shades[c1]]
+                fb[base + 2] = shades[palette_shades[c2]]
+                fb[base + 3] = shades[palette_shades[c3]]
+                fb[base + 4] = shades[palette_shades[c4]]
+                fb[base + 5] = shades[palette_shades[c5]]
+                fb[base + 6] = shades[palette_shades[c6]]
+                fb[base + 7] = shades[palette_shades[c7]]
+                bp = bg_pri
+                bp[base]     = c0
+                bp[base + 1] = c1
+                bp[base + 2] = c2
+                bp[base + 3] = c3
+                bp[base + 4] = c4
+                bp[base + 5] = c5
+                bp[base + 6] = c6
+                bp[base + 7] = c7
 
     def _render_sprites(self, ly):
         mem = self.mmu.memory
@@ -1233,31 +1254,50 @@ class PPU:
         bg_pri = self.bg_palette_idx
         fb = self.framebuffer
         shades = self._SHADES
+        tile_colors = self._TILE_COLORS
+        obp0_shades = self._PALETTE_SHADES[obp0]
+        obp1_shades = self._PALETTE_SHADES[obp1]
         for spr_x, spr_y, tile, flags in sprites:
             sprite_pixel_y = ly - spr_y
             if flags & 0x40:
                 sprite_pixel_y = sprite_height - 1 - sprite_pixel_y
             if sprite_height == 16:
-                tile_row_offset = sprite_pixel_y // 8
+                tile_row_offset = sprite_pixel_y >> 3
                 tile_idx_used = (tile & 0xFE) + tile_row_offset
             else:
                 tile_idx_used = tile
-            tile_addr = 0x8000 + tile_idx_used * 16 + (sprite_pixel_y % 8) * 2
+            tile_addr = 0x8000 + tile_idx_used * 16 + (sprite_pixel_y & 7) * 2
             lo = mem[tile_addr]
             hi = mem[tile_addr + 1]
-            for sx in range(8):
-                pixel_x = spr_x + sx
-                if pixel_x < 0 or pixel_x >= SCREEN_WIDTH:
-                    continue
-                pixel_col = 7 - sx if not (flags & 0x20) else sx
-                color_idx = ((hi >> pixel_col) & 1) << 1 | ((lo >> pixel_col) & 1)
-                if color_idx == 0:
-                    continue
-                if flags & 0x80 and bg_pri[fb_row + pixel_x] != 0:
-                    continue
-                palette = obp1 if (flags & 0x10) else obp0
-                shade = (palette >> (color_idx * 2)) & 0x03
-                fb[fb_row + pixel_x] = shades[shade]
+            colors = tile_colors[(hi << 8) | lo]
+            x_flip = flags & 0x20
+            use_obp1 = flags & 0x10
+            bg_priority = flags & 0x80
+            palette_shades = obp1_shades if use_obp1 else obp0_shades
+            if x_flip:
+                for sx in range(8):
+                    pixel_x = spr_x + sx
+                    if pixel_x < 0 or pixel_x >= SCREEN_WIDTH:
+                        continue
+                    c = colors[sx]
+                    if c == 0:
+                        continue
+                    idx = fb_row + pixel_x
+                    if bg_priority and bg_pri[idx] != 0:
+                        continue
+                    fb[idx] = shades[palette_shades[c]]
+            else:
+                for sx in range(8):
+                    pixel_x = spr_x + sx
+                    if pixel_x < 0 or pixel_x >= SCREEN_WIDTH:
+                        continue
+                    c = colors[7 - sx]
+                    if c == 0:
+                        continue
+                    idx = fb_row + pixel_x
+                    if bg_priority and bg_pri[idx] != 0:
+                        continue
+                    fb[idx] = shades[palette_shades[c]]
 
 
 class Timers:
@@ -1597,18 +1637,24 @@ class GameBoy:
         elif not rom_path:
             logging.warning("pygame not available — running headless is not useful without a ROM.")
 
+    def step_all(self):
+        """Execute one CPU step and propagate cycles to PPU and timers in a single
+        Python function call.  Avoids two extra function-call dispatches per opcode,
+        which is a measurable win when the per-opcode path is otherwise tight."""
+        cycles = self.cpu.step()
+        self.ppu.step(cycles)
+        self.timers.step(cycles)
+        return cycles
+
     def run(self):
         """Main execution loop.  Returns to caller when user presses Escape or closes window."""
         self.running = True
         clock = time.time()
-        
+
         while self.running:
             cycles_this_frame = 0
             while cycles_this_frame < CYCLES_PER_FRAME:
-                cycles = self.cpu.step()
-                self.ppu.step(cycles)
-                self.timers.step(cycles)
-                cycles_this_frame += cycles
+                cycles_this_frame += self.step_all()
 
             if pygame:
                 self.handle_events()
