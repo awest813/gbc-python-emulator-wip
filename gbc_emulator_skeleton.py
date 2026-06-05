@@ -21,6 +21,7 @@ import os
 import time
 import logging
 import argparse
+from collections import deque
 
 try:
     import numpy as np
@@ -192,15 +193,15 @@ class CPU:
         self.reg = Registers()
         self.halted = False
         self.interrupts_master_enabled = False
+        self.ime_pending = False
+        self.halt_bug_pending = False  # HALT bug: next opcode fetch should not advance PC
         self.trace_enabled = False
-        self.branch_trace = []
+        self.branch_trace = deque(maxlen=8192)
         self.invalid_opcode_count = 0
 
     def trace_branch(self, kind, old_pc, new_pc, opcode):
         if not self.trace_enabled:
             return
-        if len(self.branch_trace) >= 8192:
-            self.branch_trace.pop(0)
         self.branch_trace.append({
             "kind": kind,
             "from": old_pc,
@@ -397,11 +398,22 @@ class CPU:
         if self.halted:
             if mem[0xFFFF] & mem[0xFF0F]:
                 self.halted = False
+                if self.interrupts_master_enabled:
+                    return 4 + self._handle_interrupts()
             return 4
 
+        if self.ime_pending:
+            self.interrupts_master_enabled = True
+            self.ime_pending = False
+
         pc = self.reg.pc
-        opcode = mem[pc]
-        self.reg.pc = pc + 1
+        if self.halt_bug_pending:
+            self.halt_bug_pending = False
+            opcode = mem[pc]
+            # PC NOT advanced (HALT bug)
+        else:
+            opcode = mem[pc]
+            self.reg.pc = pc + 1
         self.current_opcode_pc = pc
         cycles = self.execute(opcode)
         cycles += self._handle_interrupts()
@@ -474,7 +486,11 @@ class CPU:
             return self._exec_low(opcode)
         if opcode < 0x80:
             if opcode == 0x76:
-                self.halted = True
+                if not self.interrupts_master_enabled and (self.mem[0xFFFF] & self.mem[0xFF0F]):
+                    # HALT bug: IME=0 with pending interrupt -> PC not incremented
+                    self.halt_bug_pending = True
+                else:
+                    self.halted = True
                 return 4
             dst = (opcode >> 3) & 0x7
             src = opcode & 0x7
@@ -529,6 +545,13 @@ class CPU:
             self.reg.set_flag(FLAG_Z, 0); self.reg.set_flag(FLAG_N, 0)
             self.reg.set_flag(FLAG_H, 0); self.reg.set_flag(FLAG_C, carry); return 4
         if opcode == 0x10:
+            self.fetch_byte()  # consume 0x00 padding
+            if self.mmu.is_cgb and (self.mmu.key1 & 0x01):
+                self.mmu.key1 ^= 0x80  # toggle double-speed
+                self.mmu.key1 &= ~0x01  # clear prepare flag
+            elif not self.mmu.is_cgb:
+                self.mmu.memory[0xFF40] &= 0x7F  # disable LCD
+                self.halted = True  # wakes on any pending interrupt (joypad)
             return 4  # STOP
         if opcode == 0x11:
             self.reg.de = self.fetch_word(); return 12
@@ -857,7 +880,7 @@ class CPU:
         if opcode == 0xFA:
             self.reg.a = self.mmu.read_byte(self.fetch_word()); return 16
         if opcode == 0xFB:
-            self.interrupts_master_enabled = True; return 4
+            self.ime_pending = True; return 4
         if opcode == 0xFE:
             self._alu_a_op(7, self.fetch_byte()); return 8
         if opcode == 0xFF:
@@ -1019,6 +1042,42 @@ class MMU:
         self.rp = 0x00
         self.wram_banks = [bytearray(0x1000) for _ in range(7)]
         self.svbk = 1
+        self.hdma_active = False
+        self.hdma_src = 0
+        self.hdma_dst = 0
+        self.hdma_remaining = 0
+        # OAM DMA (0xFF46): timed transfer over 640 dot-cycles
+        self.dma_remaining = 0  # remaining CPU T-cycles of the transfer
+        self.dma_src = 0       # source page high byte
+        self.dma_buffer = bytearray()
+        # MBC3 RTC (real-time clock, battery-backed)
+        self.has_rtc = False
+        self.rtc_s = 0
+        self.rtc_m = 0
+        self.rtc_h = 0
+        self.rtc_dl = 0
+        self.rtc_dh = 0
+        self.rtc_latch_s = 0
+        self.rtc_latch_m = 0
+        self.rtc_latch_h = 0
+        self.rtc_latch_dl = 0
+        self.rtc_latch_dh = 0
+        self.rtc_latch_state = 0xFF
+        self.rtc_last_time = time.time()
+        # Boot ROM
+        self.bootrom = bytearray()
+        self.bootrom_enabled = False
+
+    def load_bootrom(self, bootrom_data):
+        """Install a boot ROM that will shadow cartridge reads at 0x0000-N.
+
+        Length 256 = DMG boot ROM, length ~2304 = CGB boot ROM.
+        Sets bootrom_enabled = True; the boot ROM itself un-maps by writing
+        to 0xFF50."""
+        if not bootrom_data:
+            return
+        self.bootrom = bytearray(bootrom_data)
+        self.bootrom_enabled = True
 
     def load_rom(self, rom_data):
         self.rom_data = bytearray(rom_data)
@@ -1031,13 +1090,18 @@ class MMU:
         self.num_rom_banks = rom_size_map.get(rom_size_code, 2)
         self.num_ram_banks = ram_size_map.get(ram_size_code, 0)
 
-        mbc_ram_types = {0x02, 0x03, 0x0F, 0x10, 0x12, 0x13, 0x1A, 0x1B, 0x1D, 0x1E}
+        mbc_ram_types = {0x02, 0x03, 0x05, 0x06, 0x0F, 0x10, 0x12, 0x13, 0x1A, 0x1B, 0x1D, 0x1E}
         mbc_battery_types = {0x03, 0x06, 0x0F, 0x10, 0x13, 0x1B, 0x1E}
         self.has_ram = self.mbc_type in mbc_ram_types or self.num_ram_banks > 0
         self.has_battery = self.mbc_type in mbc_battery_types
+        # MBC3 RTC is present on types 0x0F (timer+batt) and 0x10 (timer+ram+batt)
+        self.has_rtc = self.mbc_type in (0x0F, 0x10)
         cgb_flag = self.rom_data[0x0143] if len(self.rom_data) > 0x0143 else 0x00
         self.is_cgb = bool(cgb_flag & 0x80)
-        if self.has_ram and self.num_ram_banks > 0:
+        if self.mbc_type in (0x05, 0x06):
+            # MBC2 has 512 nibbles = 256 bytes of 4-bit RAM
+            self.ram_data = bytearray(256)
+        elif self.has_ram and self.num_ram_banks > 0:
             self.ram_data = bytearray(self.num_ram_banks * 0x2000)
 
         self.memory[0:0x8000] = self.rom_data[0:min(0x8000, len(self.rom_data))]
@@ -1050,12 +1114,21 @@ class MMU:
         logging.info(f"Loaded ROM: {len(rom_data)} bytes [{mbc_name}, {self.num_rom_banks} ROM banks, {self.num_ram_banks} RAM banks{' CGB' if self.is_cgb else ''}]")
 
     def read_byte(self, address):
+        # Boot ROM shadows cartridge ROM at 0x0000-N while enabled
+        if self.bootrom_enabled and address < len(self.bootrom):
+            return self.bootrom[address]
         # Fast path: most accesses hit WRAM/HRAM/VRAM/OAM (direct array)
         if address >= 0xC000:
             if address < 0xFE00:
                 if address < 0xE000:
                     return self.memory[address]
                 return self.memory[address - 0x2000]  # Echo RAM
+            # OAM (0xFE00-0xFE9F): blocked during PPU modes 2 and 3, or during OAM DMA
+            if address < 0xFEA0:
+                if self.dma_remaining > 0:
+                    return 0xFF
+                if self.ppu is not None and self.ppu.mode >= 2:
+                    return 0xFF
             if address == 0xFF00:
                 return self._read_joypad()
             if address == 0xFF01:
@@ -1063,8 +1136,12 @@ class MMU:
             if address == 0xFF02:
                 return (self.serial_control & 0x83) | 0x7C
             if address == 0xFF4F:
+                if not self.is_cgb:
+                    return 0xFF
                 return self.vram_bank_select | 0xFE
             if address == 0xFF70:
+                if not self.is_cgb:
+                    return 0xFF
                 return self.svbk | 0xF8
             if address == 0xFF68:
                 return self.ppu.bg_palette_addr if self.ppu else 0x00
@@ -1077,17 +1154,44 @@ class MMU:
             if address == 0xFF6C:
                 return self.ppu.cgb_opri | 0xFE if self.ppu else 0xFE
             if address == 0xFF4D:
+                if not self.is_cgb:
+                    return 0xFF
                 return self.key1 | 0x7E
             if address == 0xFF56:
+                if not self.is_cgb:
+                    return 0xFF
                 return self.rp | 0x3C
+            if 0xFF10 <= address <= 0xFF3F:
+                if self.apu is not None:
+                    return self.apu.read_register(address)
+                return self.memory[address]
             return self.memory[address]
-        # VRAM (0x8000-0x9FFF)
+        # VRAM (0x8000-0x9FFF): blocked during PPU mode 3
         if 0x8000 <= address <= 0x9FFF:
+            if self.ppu is not None and self.ppu.mode == 3:
+                return 0xFF
             if self.vram_bank_select:
                 return self.vram_bank1[address - 0x8000]
             return self.memory[address]
         # Cartridge RAM (0xA000-0xBFFF)
         if 0xA000 <= address <= 0xBFFF:
+            if self.mbc_type in (0x05, 0x06):
+                if not self.ram_enabled or len(self.ram_data) == 0:
+                    return 0xFF
+                # MBC2: lower 4 bits stored, upper 4 bits read as 1
+                offset = address & 0x1FF
+                return (self.ram_data[offset] & 0x0F) | 0xF0
+            if self.mbc_type in (0x0F, 0x10, 0x11, 0x12, 0x13):
+                if not self.ram_enabled:
+                    return 0xFF
+                if self.ram_bank <= 0x03:
+                    if self.has_ram and len(self.ram_data) > 0:
+                        offset = self.ram_bank * 0x2000 + (address - 0xA000)
+                        return self.ram_data[offset] if offset < len(self.ram_data) else 0xFF
+                    return 0xFF
+                if 0x08 <= self.ram_bank <= 0x0C:
+                    return self._rtc_read(self.ram_bank)
+                return 0xFF
             if self.has_ram and self.ram_enabled and len(self.ram_data) > 0:
                 offset = self.ram_bank * 0x2000 + (address - 0xA000)
                 return self.ram_data[offset] if offset < len(self.ram_data) else 0xFF
@@ -1134,7 +1238,7 @@ class MMU:
 
     def read_word(self, address):
         lo = self.read_byte(address)
-        hi = self.read_byte(address + 1)
+        hi = self.read_byte((address + 1) & 0xFFFF)
         return (hi << 8) | lo
 
     def write_byte(self, address, value):
@@ -1142,7 +1246,23 @@ class MMU:
         if address < 0x8000:
             self._handle_mbc_write(address, value)
         elif 0xA000 <= address <= 0xBFFF:
-            if self.has_ram and self.ram_enabled and len(self.ram_data) > 0:
+            if self.mbc_type in (0x05, 0x06):
+                if not self.ram_enabled or len(self.ram_data) == 0:
+                    return
+                # MBC2: only lower 4 bits of address matter (256 entries), lower 4 bits stored
+                offset = address & 0x1FF
+                self.ram_data[offset] = value & 0x0F
+            elif self.mbc_type in (0x0F, 0x10, 0x11, 0x12, 0x13):
+                if not self.ram_enabled:
+                    return
+                if self.ram_bank <= 0x03:
+                    if self.has_ram and len(self.ram_data) > 0:
+                        offset = self.ram_bank * 0x2000 + (address - 0xA000)
+                        if offset < len(self.ram_data):
+                            self.ram_data[offset] = value
+                elif 0x08 <= self.ram_bank <= 0x0C:
+                    self._rtc_write(self.ram_bank, value)
+            elif self.has_ram and self.ram_enabled and len(self.ram_data) > 0:
                 offset = self.ram_bank * 0x2000 + (address - 0xA000)
                 if offset < len(self.ram_data):
                     self.ram_data[offset] = value
@@ -1169,8 +1289,13 @@ class MMU:
                 self.memory[address] = value
         elif address == 0xFF46:
             self._dma_transfer(value)
+        elif address == 0xFF44:
+            self.memory[0xFF44] = 0
+        elif address == 0xFF50:
+            # Boot ROM unmap: any write disables the boot ROM
+            self.bootrom_enabled = False
         elif address == 0xFF4D:
-            self.key1 = value & 0x01
+            self.key1 = (self.key1 & 0x80) | (value & 0x01)
         elif address == 0xFF56:
             self.rp = value & 0xC1
         elif 0xFF68 <= address <= 0xFF6C:
@@ -1178,9 +1303,24 @@ class MMU:
                 self.ppu.write_cgb_register(address, value)
             self.memory[address] = value
         elif address == 0xFF55:
-            self.memory[address] = value
-            if not (value & 0x80):
+            if value & 0x80:
+                # H-Blank DMA request
+                if self.hdma_active:
+                    # Cancel active HDMA
+                    self.hdma_active = False
+                    remaining_blocks = (self.hdma_remaining + 15) // 16
+                    self.memory[0xFF55] = 0x80 | (remaining_blocks & 0x7F)
+                else:
+                    # Start new H-Blank DMA
+                    self.hdma_src = ((self.memory[0xFF51] << 8) | self.memory[0xFF52]) & 0xFFF0
+                    self.hdma_dst = (((self.memory[0xFF53] << 8) | self.memory[0xFF54]) & 0x1FF0) | 0x8000
+                    self.hdma_remaining = ((value & 0x7F) + 1) * 16
+                    self.hdma_active = True
+                    self.memory[0xFF55] = value & 0x7F
+            else:
+                # General Purpose DMA (GDMA) - immediate bulk transfer
                 self._hdma_transfer()
+                self.hdma_active = False
         elif address == 0xFF4F:
             self.vram_bank_select = value & 0x01
         elif address == 0xFF70 and self.is_cgb:
@@ -1192,16 +1332,24 @@ class MMU:
                 self.memory[0xD000:0xE000] = self.wram_banks[new_bank - 1]
                 self.svbk = new_bank
         elif 0x8000 <= address <= 0x9FFF:
+            if self.ppu is not None and self.ppu.mode == 3:
+                return
             if self.vram_bank_select:
                 self.vram_bank1[address - 0x8000] = value
             else:
                 self.memory[address] = value
         else:
+            # OAM (0xFE00-0xFE9F): blocked during PPU modes 2/3 or during OAM DMA
+            if 0xFE00 <= address <= 0xFE9F:
+                if self.dma_remaining > 0:
+                    return
+                if self.ppu is not None and self.ppu.mode >= 2:
+                    return
             self.memory[address] = value
 
     def write_word(self, address, value):
         self.write_byte(address, value & 0xFF)
-        self.write_byte(address + 1, (value >> 8) & 0xFF)
+        self.write_byte((address + 1) & 0xFFFF, (value >> 8) & 0xFF)
 
     def _serial_transfer(self):
         self.serial_control &= 0x7F
@@ -1215,10 +1363,30 @@ class MMU:
             self.write_byte(dst + i, self.read_byte(src + i))
         self.memory[0xFF55] = 0xFF
 
+    def _hdma_hblank_step(self):
+        if not self.hdma_active:
+            return
+        chunk = min(16, self.hdma_remaining)
+        for i in range(chunk):
+            self.write_byte(self.hdma_dst + i, self.read_byte(self.hdma_src + i))
+        self.hdma_src += 16
+        self.hdma_dst += 16
+        self.hdma_remaining -= chunk
+        if self.hdma_remaining <= 0:
+            self.hdma_active = False
+            self.memory[0xFF55] = 0xFF
+        else:
+            remaining_blocks = (self.hdma_remaining + 15) // 16
+            self.memory[0xFF55] = remaining_blocks & 0x7F
+
     def _dma_transfer(self, value):
+        # Pre-cache source bytes; the actual OAM copy & timing happen in step_all
         src_base = value << 8
+        self.dma_src = value
+        self.dma_buffer = bytearray(160)
         for i in range(160):
-            self.memory[0xFE00 + i] = self.read_byte(src_base + i)
+            self.dma_buffer[i] = self.read_byte(src_base + i)
+        self.dma_remaining = 640  # CPU T-cycles at single speed (640 dot-cycles)
 
     def _remap_rom_bank(self):
         bank = self.rom_bank % self.num_rom_banks
@@ -1242,6 +1410,12 @@ class MMU:
             elif mbc in (0x05, 0x06):
                 self.rom_bank = value & 0x0F
                 self._remap_rom_bank()
+            elif mbc in (0x0F, 0x10, 0x11, 0x12, 0x13):
+                bank = value & 0x7F
+                if bank == 0:
+                    bank = 1
+                self.rom_bank = bank
+                self._remap_rom_bank()
             elif mbc in (0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E):
                 self.rom_bank = (self.rom_bank & 0x100) | value
                 self._remap_rom_bank()
@@ -1259,13 +1433,97 @@ class MMU:
                 self._remap_rom_bank()
         elif 0x4000 <= address <= 0x5FFF and mbc in (0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E):
             self.ram_bank = value & 0x0F
+        elif 0x4000 <= address <= 0x5FFF and mbc in (0x0F, 0x10, 0x11, 0x12, 0x13):
+            # MBC3: 0x00-0x03 -> RAM bank 0-3, 0x08-0x0C -> RTC register
+            v = value & 0x0F
+            if v <= 0x03 or (0x08 <= v <= 0x0C):
+                self.ram_bank = v
         elif 0x6000 <= address <= 0x7FFF and mbc in (0x01, 0x02, 0x03):
             self.mbc1_mode = value & 0x01
+        elif 0x6000 <= address <= 0x7FFF and mbc in (0x0F, 0x10, 0x11, 0x12, 0x13):
+            # MBC3 latch: write 0x00 then 0x01 to copy RTC -> latched registers
+            if self.rtc_latch_state == 0x00 and value == 0x01:
+                self._rtc_latch()
+            self.rtc_latch_state = value
         elif 0x0000 <= address <= 0x1FFF:
             if mbc in (0x05, 0x06):
                 self.ram_enabled = (value & 0x0F) == 0x0A
             else:
                 self.ram_enabled = (value & 0x0F) == 0x0A
+
+    # ===== MBC3 RTC =====
+    def _rtc_update(self):
+        """Advance MBC3 RTC state based on wall-clock time since last update."""
+        if not self.has_rtc:
+            return
+        if self.rtc_dh & 0x40:  # halted
+            self.rtc_last_time = time.time()
+            return
+        now = time.time()
+        delta = int(now - self.rtc_last_time)
+        if delta <= 0:
+            return
+        self.rtc_last_time += delta
+        if delta > 86400:
+            delta = 86400  # cap at 1 day per call to avoid runaway after sleep
+        for _ in range(delta):
+            self._rtc_tick()
+
+    def _rtc_tick(self):
+        """Increment RTC by one second with proper carry/overflow."""
+        if not self.has_rtc or (self.rtc_dh & 0x40):
+            return
+        self.rtc_s += 1
+        if self.rtc_s < 60:
+            return
+        self.rtc_s = 0
+        self.rtc_m += 1
+        if self.rtc_m < 60:
+            return
+        self.rtc_m = 0
+        self.rtc_h += 1
+        if self.rtc_h < 24:
+            return
+        self.rtc_h = 0
+        days = ((self.rtc_dh & 0x01) << 8) | self.rtc_dl
+        days = (days + 1) & 0x1FF
+        self.rtc_dl = days & 0xFF
+        self.rtc_dh = (self.rtc_dh & 0xC0) | ((days >> 8) & 0x01)
+        if days == 0:  # wrapped past 511 days
+            self.rtc_dh |= 0x80
+
+    def _rtc_latch(self):
+        """Snapshot current RTC state into the latched registers."""
+        self._rtc_update()
+        self.rtc_latch_s = self.rtc_s
+        self.rtc_latch_m = self.rtc_m
+        self.rtc_latch_h = self.rtc_h
+        self.rtc_latch_dl = self.rtc_dl
+        self.rtc_latch_dh = self.rtc_dh
+
+    def _rtc_read(self, reg):
+        """Return the latched value of the given RTC register (0x08-0x0C)."""
+        return {
+            0x08: self.rtc_latch_s,
+            0x09: self.rtc_latch_m,
+            0x0A: self.rtc_latch_h,
+            0x0B: self.rtc_latch_dl,
+            0x0C: self.rtc_latch_dh,
+        }[reg]
+
+    def _rtc_write(self, reg, value):
+        """Write a value to the current (not latched) RTC register."""
+        if reg == 0x08:
+            self.rtc_s = value & 0x3F
+        elif reg == 0x09:
+            self.rtc_m = value & 0x3F
+        elif reg == 0x0A:
+            self.rtc_h = value & 0x1F
+        elif reg == 0x0B:
+            self.rtc_dl = value
+        elif reg == 0x0C:
+            # bit 0 = day high, bit 6 = halt, bit 7 = overflow
+            self.rtc_dh = value & 0xC1
 
 
 class PPU:
@@ -1282,6 +1540,8 @@ class PPU:
     def __init__(self, mmu):
         self.mmu = mmu
         self.cycles = 0
+        self.scanline_dot = 0
+        self.mode3_duration = 172
         self.mode = 2
         self.framebuffer = [(255, 255, 255)] * (SCREEN_WIDTH * SCREEN_HEIGHT)
         self.bg_palette_idx = bytearray(SCREEN_WIDTH * SCREEN_HEIGHT)
@@ -1292,6 +1552,9 @@ class PPU:
         self.bg_palette_addr = 0x00
         self.obj_palette_addr = 0x00
         self.cgb_opri = 0x00
+        self.prev_stat_irq = False
+        self.lcd_was_on = False
+        self.window_line_counter = 0
         self._bg_rgb = [(0, 0, 0)] * 32
         self._obj_rgb = [(0, 0, 0)] * 32
         unsigned_addrs = tuple(0x8000 + i * 16 for i in range(256))
@@ -1355,49 +1618,116 @@ class PPU:
             self.cgb_opri = value & 0x01
 
     def step(self, cycles_passed):
-        cycles = self.cycles + cycles_passed
         mem = self.mmu.memory
         lcdc = mem[0xFF40]
+
         if not (lcdc & 0x80):
-            self.cycles = cycles
+            if self.lcd_was_on:
+                mem[0xFF44] = 0
+                self.mode = 0
+                self.scanline_dot = 0
+                self.window_line_counter = 0
+                self.prev_stat_irq = False
+                stat = mem[0xFF41] & 0xF8
+                mem[0xFF41] = stat
+                self.lcd_was_on = False
             return
 
-        while cycles >= 456:
-            cycles -= 456
-            ly = mem[0xFF44]
+        if not self.lcd_was_on:
+            mem[0xFF44] = 0
+            self.scanline_dot = 0
+            self.mode = 2
+            self._update_stat_mode(2)
+            self._check_lyc(0)
+            self.lcd_was_on = True
 
-            if ly < 144:
-                self._update_stat_mode(2)
-                self._update_stat_mode(3)
-                if lcdc & 0x01:
-                    self._render_scanline(ly)
-                self._update_stat_mode(0)
-            else:
-                self._update_stat_mode(1)
+        dot = self.scanline_dot + cycles_passed
 
-            new_ly = ly + 1
-            if new_ly == 154:
-                new_ly = 0
-            mem[0xFF44] = new_ly
+        while dot >= 456:
+            remaining = 456 - self.scanline_dot
+            dot -= remaining
+            self._advance_dots(456)
+            self._finish_scanline()
+            self.scanline_dot = 0
+            if not (mem[0xFF40] & 0x80):
+                return
+            dot += self._begin_scanline()
 
-            if new_ly == 144:
+        if dot > 0:
+            self._advance_dots(dot)
+            self.scanline_dot = dot
+
+    def _begin_scanline(self):
+        mem = self.mmu.memory
+        ly = mem[0xFF44]
+
+        if ly < 144:
+            self._update_stat_mode(2)
+            self._check_lyc(ly)
+        else:
+            self._update_stat_mode(1)
+            if ly == 144:
                 mem[0xFF0F] |= 0x01
+            self._check_lyc(ly)
+        return 0
 
-            self._check_lyc(new_ly)
+    def _advance_dots(self, target_dot):
+        mem = self.mmu.memory
+        ly = mem[0xFF44]
+        lcdc = mem[0xFF40]
 
-        self.cycles = cycles
+        if ly >= 144:
+            return
+
+        mode3_start = 80
+        mode3_end = 80 + self.mode3_duration
+
+        if self.scanline_dot < mode3_start <= target_dot:
+            self._enter_mode3(ly, lcdc)
+
+        if self.scanline_dot < mode3_end <= target_dot:
+            self._update_stat_mode(0)
+            if self.mmu.hdma_active:
+                self.mmu._hdma_hblank_step()
+
+    def _enter_mode3(self, ly, lcdc):
+        mem = self.mmu.memory
+        scx = mem[0xFF43]
+        sprite_height = 16 if (lcdc & 0x04) else 8
+        sprite_count = 0
+        for i in range(40):
+            oam_addr = 0xFE00 + i * 4
+            y = mem[oam_addr]
+            if y == 0 or y >= 160:
+                continue
+            spr_y = y - 16
+            if spr_y > ly or spr_y + sprite_height <= ly:
+                continue
+            sprite_count += 1
+            if sprite_count >= 10:
+                break
+        self.mode3_duration = 172 + (scx & 7) + sprite_count * 11
+        if self.is_cgb or (lcdc & 0x01) or (lcdc & 0x20) or (lcdc & 0x02):
+            self._render_scanline(ly, lcdc)
+        self.mode = 3
+        stat = (mem[0xFF41] & 0xFC) | 3
+        mem[0xFF41] = stat
+
+    def _finish_scanline(self):
+        mem = self.mmu.memory
+        ly = mem[0xFF44]
+        new_ly = ly + 1
+        if new_ly == 154:
+            new_ly = 0
+            self.window_line_counter = 0
+        mem[0xFF44] = new_ly
 
     def _update_stat_mode(self, mode):
         self.mode = mode
         mem = self.mmu.memory
         stat = (mem[0xFF41] & 0xFC) | mode
         mem[0xFF41] = stat
-        if mode == 0 and (stat & 0x08):
-            mem[0xFF0F] |= 0x02
-        elif mode == 1 and (stat & 0x10):
-            mem[0xFF0F] |= 0x02
-        elif mode == 2 and (stat & 0x20):
-            mem[0xFF0F] |= 0x02
+        self._fire_stat_irq(stat)
 
     def _check_lyc(self, ly):
         mem = self.mmu.memory
@@ -1405,15 +1735,48 @@ class PPU:
         stat = mem[0xFF41]
         if ly == lyc:
             stat |= 0x04
-            mem[0xFF41] = stat
-            if stat & 0x40:
-                mem[0xFF0F] |= 0x02
         else:
-            mem[0xFF41] = stat & ~0x04
+            stat &= ~0x04
+        mem[0xFF41] = stat
+        self._fire_stat_irq(stat)
 
-    def _render_scanline(self, ly):
+    def _fire_stat_irq(self, stat):
         mem = self.mmu.memory
-        lcdc = mem[0xFF40]
+        ly = mem[0xFF44]
+        lyc = mem[0xFF45]
+        mode = self.mode
+        # Combined STAT interrupt line: OR of all enabled sources
+        current_irq = (
+            (mode == 0 and (stat & 0x08)) or
+            (mode == 1 and (stat & 0x10)) or
+            (mode == 2 and (stat & 0x20)) or
+            (ly == lyc and (stat & 0x40))
+        )
+        # Fire only on rising edge (0->1)
+        if current_irq and not self.prev_stat_irq:
+            mem[0xFF0F] |= 0x02
+        self.prev_stat_irq = current_irq
+
+    def _render_scanline(self, ly, lcdc):
+        mem = self.mmu.memory
+        is_cgb = self.is_cgb
+        # On CGB, LCDC bit 0 is BG/OBJ priority flag, not BG enable.
+        # BG is always rendered in CGB mode regardless of bit 0.
+        bg_enabled = (lcdc & 0x01) or is_cgb
+        fb_row = ly * SCREEN_WIDTH
+
+        if not bg_enabled:
+            # DMG: BG/Window off - clear scanline to white, render sprites only.
+            white = self.shades[0]
+            fb = self.framebuffer
+            bg_pri = self.bg_palette_idx
+            for i in range(SCREEN_WIDTH):
+                fb[fb_row + i] = white
+            bg_pri[fb_row:fb_row + SCREEN_WIDTH] = 0
+            if lcdc & 0x02:
+                self._render_sprites(ly)
+            return
+
         bg_map_base = 0x9C00 if (lcdc & 0x08) else 0x9800
         signed_tiles = not (lcdc & 0x10)
         tile_base_idx = 1 if signed_tiles else 0
@@ -1427,7 +1790,6 @@ class PPU:
         tile_row = bg_y >> 3
         pixel_row = bg_y & 7
 
-        fb_row = ly * SCREEN_WIDTH
         shades = self.shades
         fb = self.framebuffer
         bg_pri = self.bg_palette_idx
@@ -1564,7 +1926,11 @@ class PPU:
                         bg_pri[fb_row + x] = c
 
         if lcdc & 0x20:
-            self._render_window(ly)
+            wy = mem[0xFF4A]
+            wx_raw = mem[0xFF4B]
+            if ly >= wy and (wx_raw - 7) < SCREEN_WIDTH:
+                self._render_window(ly)
+                self.window_line_counter += 1
         if lcdc & 0x02:
             self._render_sprites(ly)
 
@@ -1573,8 +1939,6 @@ class PPU:
         lcdc = mem[0xFF40]
         wy = mem[0xFF4A]
         wx_raw = mem[0xFF4B]
-        if ly < wy:
-            return
         win_x_offset = wx_raw - 7
         if win_x_offset >= SCREEN_WIDTH:
             return
@@ -1583,7 +1947,7 @@ class PPU:
         tile_base_idx = 1 if signed_tiles else 0
         tile_addrs = self._tile_base_addrs[tile_base_idx]
         bgp = mem[0xFF47]
-        win_y = ly - wy
+        win_y = self.window_line_counter
         tile_row = win_y >> 3
         pixel_row = win_y & 7
         fb_row = ly * SCREEN_WIDTH
@@ -1724,6 +2088,9 @@ class PPU:
         if is_cgb:
             vram_bank1 = self.mmu.vram_bank1
             pr = self._obj_rgb
+            # LCDC bit 0: when 1, BG tile attributes control sprite priority.
+            # When 0, sprites always draw on top of BG (OAM priority ignored).
+            cgb_opri = mem[0xFF40] & 0x01
         for spr_x, spr_y, tile, flags in sprites:
             sprite_pixel_y = ly - spr_y
             if flags & 0x40:
@@ -1760,7 +2127,10 @@ class PPU:
                         continue
                     idx = fb_row + pixel_x
                     if use_cgb_obj:
-                        if bg_priority and (bg_pri[idx] & 0x80 or (bg_pri[idx] & 0x7F) != 0):
+                        # CGB: when LCDC.0=1, sprite with OAM pri bit is hidden
+                        # behind BG pixels whose tile attr bit 7 is set and color != 0.
+                        # When LCDC.0=0, sprites always draw on top.
+                        if bg_priority and cgb_opri and (bg_pri[idx] & 0x80) and (bg_pri[idx] & 0x7F) != 0:
                             continue
                         fb[idx] = pr[pal * 4 + c]
                     else:
@@ -1777,7 +2147,7 @@ class PPU:
                         continue
                     idx = fb_row + pixel_x
                     if use_cgb_obj:
-                        if bg_priority and (bg_pri[idx] & 0x80 or (bg_pri[idx] & 0x7F) != 0):
+                        if bg_priority and cgb_opri and (bg_pri[idx] & 0x80) and (bg_pri[idx] & 0x7F) != 0:
                             continue
                         fb[idx] = pr[pal * 4 + c]
                     else:
@@ -1839,20 +2209,22 @@ _WAVE_VOL_SHIFT = (4, 0, 1, 2)
 
 # OR masks for register reads (unused bits read as 1)
 _APU_READ_OR = {
-    0xFF10: 0x80, 0xFF11: 0x3F, 0xFF12: 0x00, 0xFF13: 0xFF, 0xFF14: 0xBF,
+    0xFF10: 0x80, 0xFF11: 0x3F, 0xFF12: 0x00, 0xFF13: 0xFF, 0xFF14: 0xB8,
     0xFF15: 0xFF,
-    0xFF16: 0x3F, 0xFF17: 0x00, 0xFF18: 0xFF, 0xFF19: 0xBF,
-    0xFF1A: 0x7F, 0xFF1B: 0xFF, 0xFF1C: 0x9F, 0xFF1D: 0xFF, 0xFF1E: 0xBF,
+    0xFF16: 0x3F, 0xFF17: 0x00, 0xFF18: 0xFF, 0xFF19: 0xB8,
+    0xFF1A: 0x7F, 0xFF1B: 0xFF, 0xFF1C: 0x9F, 0xFF1D: 0xFF, 0xFF1E: 0xB8,
     0xFF1F: 0xFF,
-    0xFF20: 0xFF, 0xFF21: 0x00, 0xFF22: 0x00, 0xFF23: 0xBF,
+    0xFF20: 0xFF, 0xFF21: 0x00, 0xFF22: 0x00, 0xFF23: 0xB8,
     0xFF24: 0x00, 0xFF25: 0x00, 0xFF26: 0x70,
 }
 
 # Post-BIOS register defaults (DMG)
 _APU_BOOT_VALUES = {
     0xFF10: 0x80, 0xFF11: 0xBF, 0xFF12: 0xF3, 0xFF13: 0xFF, 0xFF14: 0xBF,
+    0xFF15: 0xFF,
     0xFF16: 0x3F, 0xFF17: 0x00, 0xFF18: 0xFF, 0xFF19: 0xBF,
     0xFF1A: 0x7F, 0xFF1B: 0xFF, 0xFF1C: 0x9F, 0xFF1D: 0xFF, 0xFF1E: 0xBF,
+    0xFF1F: 0xFF,
     0xFF20: 0xFF, 0xFF21: 0x00, 0xFF22: 0x00, 0xFF23: 0xBF,
     0xFF24: 0x77, 0xFF25: 0xF3, 0xFF26: 0xF1,
 }
@@ -2109,6 +2481,36 @@ class APU:
         else:
             mem[addr] = value | _APU_READ_OR.get(addr, 0)
 
+    def read_register(self, addr):
+        """Return the current value of an APU register, computing dynamic
+        fields (current channel volume, sweep state) on the fly."""
+        if not self.power:
+            if 0xFF10 <= addr <= 0xFF25:
+                return 0xFF
+            if addr == 0xFF26:
+                return 0x70
+            if 0xFF30 <= addr <= 0xFF3F:
+                return 0xFF
+            return 0xFF
+        mem = self.mmu.memory
+        if 0xFF30 <= addr <= 0xFF3F:
+            return self.wave_ram[addr - 0xFF30]
+        if addr == 0xFF12:
+            return (self.ch1_volume << 4) | (mem[0xFF12] & 0x0F)
+        if addr == 0xFF17:
+            return (self.ch2_volume << 4) | (mem[0xFF17] & 0x0F)
+        if addr == 0xFF21:
+            return (self.ch4_volume << 4) | (mem[0xFF21] & 0x0F)
+        if addr == 0xFF14:
+            return mem[0xFF14] & 0xBF | (0x40 if self.ch1_length_enabled else 0)
+        if addr == 0xFF19:
+            return mem[0xFF19] & 0xBF | (0x40 if self.ch2_length_enabled else 0)
+        if addr == 0xFF1E:
+            return mem[0xFF1E] & 0xBF | (0x40 if self.ch3_length_enabled else 0)
+        if addr == 0xFF23:
+            return mem[0xFF23] & 0xBF | (0x40 if self.ch4_length_enabled else 0)
+        return mem[addr] | _APU_READ_OR.get(addr, 0)
+
     def _refresh_nr52(self):
         flags = 0
         if self.ch1_enabled: flags |= 0x01
@@ -2121,6 +2523,9 @@ class APU:
     def _power_off(self):
         for addr in range(0xFF10, 0xFF26):
             self.mmu.memory[addr] = 0
+        for i in range(16):
+            self.wave_ram[i] = 0
+            self.mmu.memory[0xFF30 + i] = 0
         self.ch1_enabled = self.ch2_enabled = self.ch3_enabled = self.ch4_enabled = False
         self.ch1_dac = self.ch2_dac = self.ch3_dac = self.ch4_dac = False
         self.vol_left = self.vol_right = 0
@@ -2333,9 +2738,11 @@ class APU:
                 width = self.ch4_width_mode
                 for _ in range(advances):
                     bit = (lfsr & 1) ^ ((lfsr >> 1) & 1)
-                    lfsr = (lfsr >> 1) | (bit << 14)
                     if width:
-                        lfsr = (lfsr & ~0x40) | (bit << 6)
+                        # 7-bit mode: shift within low 7 bits, new bit at 6
+                        lfsr = ((lfsr >> 1) & 0x3F) | (bit << 6)
+                    else:
+                        lfsr = (lfsr >> 1) | (bit << 14)
                 self.ch4_lfsr = lfsr
                 t = period - ((-t) % period)
             self.ch4_freq_timer = t
@@ -2401,6 +2808,8 @@ class APU:
             while self.sample_accum >= sn:
                 self.sample_accum -= sn
                 self.buffer.extend(b'\x00\x00\x00\x00')
+            if len(self.buffer) > self.SOFT_BUFFER_CAP:
+                del self.buffer[:len(self.buffer) - self.SOFT_BUFFER_CAP]
             return
 
         # Frame sequencer (512 Hz)
@@ -2747,7 +3156,7 @@ class GameBoy:
     """The main emulator orchestrator class."""
     def __init__(self, rom_path=None, window_scale=4, fps_limit=59.73,
                  volume=1.0, palette=PALETTE_DMG, smooth_scale=False,
-                 shader=None):
+                 shader=None, bootrom_path=None):
         self.mmu = MMU()
         self.cpu = CPU(self.mmu)
         self.ppu = PPU(self.mmu)
@@ -2761,6 +3170,16 @@ class GameBoy:
         self.mmu.memory[0xFF06] = 0x00
         self.mmu.memory[0xFF07] = 0xF8
 
+        # Optional boot ROM: takes precedence over post-boot register init
+        if bootrom_path and os.path.isfile(bootrom_path):
+            try:
+                with open(bootrom_path, 'rb') as f:
+                    self.mmu.load_bootrom(f.read())
+                logging.info(f"Loaded boot ROM: {os.path.basename(bootrom_path)} ({len(self.mmu.bootrom)} bytes)")
+                self.cpu.reg.pc = 0x0000
+            except OSError as e:
+                logging.warning(f"Could not load boot ROM: {e}")
+
         if rom_path:
             with open(rom_path, 'rb') as f:
                 self.mmu.load_rom(f.read())
@@ -2768,11 +3187,22 @@ class GameBoy:
             if self.mmu.is_cgb:
                 self.ppu.is_cgb = True
                 self.ppu._cgb_init_palettes()
-                self.cpu.reg.a = 0x11
-                self.cpu.reg.f = 0x80
-                self.cpu.reg.d = 0xFF
-                self.cpu.reg.e = 0x56
-                self.cpu.reg.l = 0x0D
+            if not self.mmu.bootrom_enabled:
+                # Set post-boot register state only if no boot ROM will run
+                if self.mmu.is_cgb:
+                    self.cpu.reg.a = 0x11
+                    self.cpu.reg.f = 0x80
+                    self.cpu.reg.d = 0xFF
+                    self.cpu.reg.e = 0x56
+                    self.cpu.reg.l = 0x0D
+                else:
+                    # DMG boot ROM register state.
+                    self.cpu.reg.a = 0x01
+                    self.cpu.reg.f = 0xB0
+                    self.cpu.reg.c = 0x13
+                    self.cpu.reg.e = 0xD8
+                    self.cpu.reg.h = 0x01
+                    self.cpu.reg.l = 0x4D
             self._load_sav()
         else:
             logging.info("No ROM provided. Running dummy infinite loop.")
@@ -2781,6 +3211,8 @@ class GameBoy:
             self.mmu.memory[0x0102] = 0x00
             self.mmu.memory[0x0103] = 0x01
 
+        self.speed_remainder = 0
+        self._prev_double_speed = False
         self.fps_limit = fps_limit
         self.smooth_scale = smooth_scale
         self.shader = shader if shader is not None else _shader_none
@@ -2847,6 +3279,15 @@ class GameBoy:
                     self.mmu.ram_data[:len(data)] = data
                 else:
                     self.mmu.ram_data[:] = data[:len(self.mmu.ram_data)]
+                # MBC3 RTC: extra 48 bytes (VBA format) with 5 RTC regs at offset 4
+                if self.mmu.has_rtc and len(data) >= len(self.mmu.ram_data) + 8:
+                    rtc_blob = data[len(self.mmu.ram_data):len(self.mmu.ram_data) + 48]
+                    self.mmu.rtc_s = rtc_blob[4] & 0x3F
+                    self.mmu.rtc_m = rtc_blob[5] & 0x3F
+                    self.mmu.rtc_h = rtc_blob[6] & 0x1F
+                    self.mmu.rtc_dl = rtc_blob[7]
+                    self.mmu.rtc_dh = rtc_blob[8] & 0xC1
+                    self.mmu.rtc_last_time = time.time()
                 logging.info(f"Loaded save: {os.path.basename(path)} ({len(data)} bytes)")
             except OSError as e:
                 logging.warning(f"Could not load save: {e}")
@@ -2860,7 +3301,17 @@ class GameBoy:
         try:
             with open(path, 'wb') as f:
                 f.write(self.mmu.ram_data)
-            logging.info(f"Saved: {os.path.basename(path)} ({len(self.mmu.ram_data)} bytes)")
+                if self.mmu.has_rtc:
+                    # VBA-style 48-byte RTC block: 4 zero bytes + 5 RTC bytes + 39 zeros
+                    rtc_blob = bytearray(48)
+                    self.mmu._rtc_update()
+                    rtc_blob[4] = self.mmu.rtc_s & 0x3F
+                    rtc_blob[5] = self.mmu.rtc_m & 0x3F
+                    rtc_blob[6] = self.mmu.rtc_h & 0x1F
+                    rtc_blob[7] = self.mmu.rtc_dl
+                    rtc_blob[8] = self.mmu.rtc_dh & 0xC1
+                    f.write(rtc_blob)
+            logging.info(f"Saved: {os.path.basename(path)} ({len(self.mmu.ram_data) + 48 if self.mmu.has_rtc else len(self.mmu.ram_data)} bytes)")
         except OSError as e:
             logging.warning(f"Could not save: {e}")
 
@@ -2890,11 +3341,32 @@ class GameBoy:
         """Execute one CPU step and propagate cycles to PPU, timers, and APU in a
         single Python function call.  Avoids extra function-call dispatches per
         opcode, which is a measurable win when the per-opcode path is otherwise tight."""
-        cycles = self.cpu.step()
-        self.ppu.step(cycles)
-        self.timers.step(cycles)
-        self.apu.step(cycles)
-        return cycles
+        double_speed = bool(self.mmu.key1 & 0x80)
+        if double_speed != self._prev_double_speed:
+            self.speed_remainder = 0
+            self._prev_double_speed = double_speed
+        # OAM DMA: consumes CPU T-cycles without executing instructions
+        if self.mmu.dma_remaining > 0:
+            chunk = min(self.mmu.dma_remaining, 4)
+            self.mmu.dma_remaining -= chunk
+            cpu_cycles = chunk
+            if self.mmu.dma_remaining == 0:
+                self.mmu.memory[0xFE00:0xFEA0] = self.mmu.dma_buffer
+                self.mmu.dma_buffer = bytearray()
+        else:
+            cpu_cycles = self.cpu.step()
+        if double_speed:
+            total = self.speed_remainder + cpu_cycles
+            dot_cycles = total // 2
+            self.speed_remainder = total % 2
+        else:
+            dot_cycles = cpu_cycles
+        self.ppu.step(dot_cycles)
+        self.timers.step(dot_cycles)
+        self.apu.step(dot_cycles)
+        if self.mmu.has_rtc:
+            self.mmu._rtc_update()
+        return dot_cycles
 
     def run(self):
         """Main execution loop.  Returns to caller when user presses Escape or closes window."""
@@ -2970,10 +3442,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Python Game Boy Emulator")
     parser.add_argument("rom", nargs="?", help="Path to the .gb or .gbc ROM file")
     parser.add_argument("--nomenu", action="store_true", help="Skip menu, boot directly into ROM")
+    parser.add_argument("--bootrom", help="Path to boot ROM (DMG 256B or CGB ~2304B)")
     args = parser.parse_args()
 
     if args.nomenu and args.rom:
-        emulator = GameBoy(args.rom)
+        emulator = GameBoy(args.rom, bootrom_path=args.bootrom)
         emulator.run()
     else:
         menu = EmulatorMenu()
