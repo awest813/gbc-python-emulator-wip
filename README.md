@@ -128,7 +128,7 @@ filesystem (up to two levels deep) looking for `.gb` / `.gbc` files.
 
 ## Architecture
 
-The emulator lives in a single ~1700-line Python file. The hot path
+The emulator lives in a single ~3,900-line Python file. The hot path
 is:
 
 1. `GameBoy.step_all` — combined per-opcode dispatcher.
@@ -155,6 +155,7 @@ Performance-critical helpers:
 
 ```
 gbc_emulator_skeleton.py   Single-file emulator (CPU, MMU, PPU, Timers, menu, runner)
+test_headless.py           Self-contained smoke test (synthetic ROM, no display)
 requirements.txt           Pinned dependency list (pygame, numpy)
 run.bat                    Windows launcher (installs deps if missing, then runs)
 run.sh                     Linux / macOS launcher (bash, installs deps if missing)
@@ -164,6 +165,19 @@ LICENSE                    MIT License
 .gitattributes             Enforces LF line endings on shell / source files
 *.sav                      Battery-backed cartridge save files (auto-created next to ROM)
 ```
+
+## Testing
+
+A portable smoke test builds a synthetic ROM in memory and exercises the CPU,
+PPU, timers and APU without a display or any local ROM files:
+
+```bash
+python test_headless.py
+```
+
+It verifies representative opcode flag behaviour (ADD / SUB / DAA / CB
+SWAP / SRL / BIT), illegal-opcode handling, a full multi-step run, and
+CGB double-speed dot scaling. Exits non-zero on failure.
 
 ## Status
 
@@ -176,10 +190,11 @@ interpreter on modest hardware.
 
 ### Known Limitations
 
-- CGB double-speed mode is implemented at the cycle-accurate level
-  (PPU / APU / timers all see 2× cycles), but the cartridge bus
-  access-time penalty (one extra wait state per cartridge read at
-  2× speed) is not emulated.
+- CGB double-speed mode (KEY1) runs the CPU and the DIV / TIMA timers
+  at 2× the base clock while the PPU and APU stay on the base clock, so
+  display and audio timing remain correct. The cartridge bus access-time
+  penalty (one extra wait state per cartridge read at 2× speed) is not
+  emulated.
 - Per-cycle STAT blocking for non-CPU bus activity (e.g. during DMA)
   is approximated; the OAM / VRAM access blocking during PPU modes
   2/3 is correctly enforced.
