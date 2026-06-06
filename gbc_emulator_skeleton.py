@@ -187,6 +187,9 @@ class Registers:
 
 class CPU:
     """The LR35902 CPU."""
+    # Opcodes with no defined behaviour on real hardware (they hang the CPU).
+    INVALID_OPS = frozenset({0xD3, 0xDB, 0xDD, 0xE3, 0xE4, 0xEB, 0xEC, 0xED, 0xF4, 0xFC, 0xFD})
+
     def __init__(self, mmu):
         self.mmu = mmu
         self.mem = mmu.memory
@@ -884,9 +887,11 @@ class CPU:
         if opcode == 0xFF:
             self.trace_branch("RST 38", self.current_opcode_pc, 0x38, opcode)
             self._push(self.reg.pc); self.reg.pc = 0x38; return 16
-        INVALID_OPS = {0xD3, 0xDB, 0xDD, 0xE3, 0xE4, 0xEB, 0xEC, 0xED, 0xF4, 0xFC, 0xFD}
-        if opcode in INVALID_OPS:
+        if opcode in self.INVALID_OPS:
+            # Hardware-illegal opcode (locks up a real DMG/CGB); treat as NOP.
+            self.invalid_opcode_count += 1
             return 4
+        self.invalid_opcode_count += 1
         logging.error(f"Unimplemented Opcode: {opcode:02X} at PC: {self.current_opcode_pc:04X}")
         return 4
 
@@ -3227,7 +3232,7 @@ class GameBoy:
             self.mmu.memory[0x0102] = 0x00
             self.mmu.memory[0x0103] = 0x01
 
-        self._prev_double_speed = False
+        self.speed_remainder = 0  # carries the odd base-clock dot in double-speed mode
         self._status_msg = ''
         self._status_ttl = 0
         self.fps_limit = fps_limit
@@ -3715,10 +3720,6 @@ class GameBoy:
         """Execute one CPU step and propagate cycles to PPU, timers, and APU in a
         single Python function call.  Avoids extra function-call dispatches per
         opcode, which is a measurable win when the per-opcode path is otherwise tight."""
-        double_speed = bool(self.mmu.key1 & 0x80)
-        if double_speed != self._prev_double_speed:
-            self.speed_remainder = 0
-            self._prev_double_speed = double_speed
         # OAM DMA: consumes CPU T-cycles without executing instructions
         if self.mmu.dma_remaining > 0:
             chunk = min(self.mmu.dma_remaining, 4)
@@ -3729,9 +3730,18 @@ class GameBoy:
                 self.mmu.dma_buffer = bytearray()
         else:
             cpu_cycles = self.cpu.step()
-        dot_cycles = cpu_cycles
+        # CGB double-speed (KEY1): the CPU and the DIV/TIMA timer run at 2x the
+        # base clock, but the PPU and APU stay on the base clock. Feed the latter
+        # half the CPU cycles, carrying the odd cycle across calls so no dot is
+        # lost. In normal speed this is a straight pass-through (dot == cpu).
+        if self.mmu.key1 & 0x80:
+            self.speed_remainder += cpu_cycles
+            dot_cycles = self.speed_remainder >> 1
+            self.speed_remainder &= 1
+        else:
+            dot_cycles = cpu_cycles
         self.ppu.step(dot_cycles)
-        self.timers.step(dot_cycles)
+        self.timers.step(cpu_cycles)
         self.apu.step(dot_cycles)
         if self.mmu.has_rtc:
             self.mmu._rtc_update()
@@ -3758,9 +3768,6 @@ class GameBoy:
                 if elapsed < target_time:
                     time.sleep(target_time - elapsed)
             clock = time.time()
-
-            if not pygame and int(time.time() * 10) % 10 == 0:
-                print(f"Running... PC: {hex(self.cpu.reg.pc)}")
 
         self._save_sav()
 
