@@ -549,7 +549,7 @@ class CPU:
             if self.mmu.is_cgb and (self.mmu.key1 & 0x01):
                 self.mmu.key1 ^= 0x80  # toggle double-speed
                 self.mmu.key1 &= ~0x01  # clear prepare flag
-            elif not self.mmu.is_cgb:
+            else:
                 self.mmu.memory[0xFF40] &= 0x7F  # disable LCD
                 self.halted = True  # wakes on any pending interrupt (joypad)
             return 4  # STOP
@@ -745,8 +745,6 @@ class CPU:
                 self.trace_branch("JP Z", self.current_opcode_pc, addr, opcode)
                 self.reg.pc = addr; return 16
             return 12
-        if opcode == 0xCB:
-            cb_opcode = self.fetch_byte(); return self.execute_cb(cb_opcode)
         if opcode == 0xCC:
             addr = self.fetch_word()
             if self._check_cond(1):
@@ -1276,6 +1274,8 @@ class MMU:
                 self.div_reset_callback()
         elif address == 0xFF07:
             self.memory[0xFF07] = value | 0xF8
+        elif address == 0xFF41:
+            self.memory[0xFF41] = (value & 0x78) | (self.memory[0xFF41] & 0x07) | 0x80
         elif address == 0xFF01:
             self.serial_data = value
         elif address == 0xFF02:
@@ -1360,7 +1360,12 @@ class MMU:
         dst = (((self.memory[0xFF53] << 8) | self.memory[0xFF54]) & 0x1FF0) | 0x8000
         length = ((self.memory[0xFF55] & 0x7F) + 1) * 16
         for i in range(length):
-            self.write_byte(dst + i, self.read_byte(src + i))
+            val = self.read_byte(src + i)
+            addr = 0x8000 + ((dst + i) & 0x1FFF)
+            if self.vram_bank_select:
+                self.vram_bank1[addr - 0x8000] = val
+            else:
+                self.memory[addr] = val
         self.memory[0xFF55] = 0xFF
 
     def _hdma_hblank_step(self):
@@ -1368,7 +1373,12 @@ class MMU:
             return
         chunk = min(16, self.hdma_remaining)
         for i in range(chunk):
-            self.write_byte(self.hdma_dst + i, self.read_byte(self.hdma_src + i))
+            val = self.read_byte(self.hdma_src + i)
+            addr = 0x8000 + ((self.hdma_dst + i) & 0x1FFF)
+            if self.vram_bank_select:
+                self.vram_bank1[addr - 0x8000] = val
+            else:
+                self.memory[addr] = val
         self.hdma_src += 16
         self.hdma_dst += 16
         self.hdma_remaining -= chunk
@@ -1569,7 +1579,11 @@ class PPU:
         r5 = low & 0x1F
         g5 = ((low >> 5) & 0x07) | ((high & 0x03) << 3)
         b5 = (high >> 2) & 0x1F
-        return ((r5 << 3) | (r5 >> 2), (g5 << 3) | (g5 >> 2), (b5 << 3) | (b5 >> 2))
+        # Apply GBC color correction (Gambatte integer approximation)
+        r = (r5 * 26 + g5 * 4 + b5 * 2) >> 5
+        g = (g5 * 24 + b5 * 8) >> 5
+        b = (r5 * 6 + g5 * 14 + b5 * 12) >> 5
+        return ((r << 3) | (r >> 2), (g << 3) | (g >> 2), (b << 3) | (b >> 2))
 
     def _update_cgb_bg_color(self, color_idx):
         off = color_idx * 2
@@ -2073,7 +2087,8 @@ class PPU:
             sprites.append((spr_x, spr_y, tile, flags))
             if len(sprites) >= 10:
                 break
-        sprites.sort(key=lambda s: s[0])
+        if not self.is_cgb:
+            sprites.sort(key=lambda s: s[0])
         obp0 = mem[0xFF48]
         obp1 = mem[0xFF49]
         fb_row = ly * SCREEN_WIDTH
@@ -2090,8 +2105,8 @@ class PPU:
             pr = self._obj_rgb
             # LCDC bit 0: when 1, BG tile attributes control sprite priority.
             # When 0, sprites always draw on top of BG (OAM priority ignored).
-            cgb_opri = mem[0xFF40] & 0x01
-        for spr_x, spr_y, tile, flags in sprites:
+            lcdc = mem[0xFF40]
+        for spr_x, spr_y, tile, flags in reversed(sprites):
             sprite_pixel_y = ly - spr_y
             if flags & 0x40:
                 sprite_pixel_y = sprite_height - 1 - sprite_pixel_y
@@ -2127,10 +2142,9 @@ class PPU:
                         continue
                     idx = fb_row + pixel_x
                     if use_cgb_obj:
-                        # CGB: when LCDC.0=1, sprite with OAM pri bit is hidden
-                        # behind BG pixels whose tile attr bit 7 is set and color != 0.
-                        # When LCDC.0=0, sprites always draw on top.
-                        if bg_priority and cgb_opri and (bg_pri[idx] & 0x80) and (bg_pri[idx] & 0x7F) != 0:
+                        bg_color_idx = bg_pri[idx] & 0x7F
+                        bg_attr_pri = bg_pri[idx] & 0x80
+                        if (lcdc & 0x01) and bg_color_idx != 0 and (bg_attr_pri or bg_priority):
                             continue
                         fb[idx] = pr[pal * 4 + c]
                     else:
@@ -2147,7 +2161,9 @@ class PPU:
                         continue
                     idx = fb_row + pixel_x
                     if use_cgb_obj:
-                        if bg_priority and cgb_opri and (bg_pri[idx] & 0x80) and (bg_pri[idx] & 0x7F) != 0:
+                        bg_color_idx = bg_pri[idx] & 0x7F
+                        bg_attr_pri = bg_pri[idx] & 0x80
+                        if (lcdc & 0x01) and bg_color_idx != 0 and (bg_attr_pri or bg_priority):
                             continue
                         fb[idx] = pr[pal * 4 + c]
                     else:
@@ -3211,8 +3227,9 @@ class GameBoy:
             self.mmu.memory[0x0102] = 0x00
             self.mmu.memory[0x0103] = 0x01
 
-        self.speed_remainder = 0
         self._prev_double_speed = False
+        self._status_msg = ''
+        self._status_ttl = 0
         self.fps_limit = fps_limit
         self.smooth_scale = smooth_scale
         self.shader = shader if shader is not None else _shader_none
@@ -3315,6 +3332,363 @@ class GameBoy:
         except OSError as e:
             logging.warning(f"Could not save: {e}")
 
+
+    # ── Save state support ─────────────────────────────────────────
+    SAVE_STATE_MAGIC = b'GBST'
+    SAVE_STATE_VERSION = 1
+
+    def _state_path(self, slot):
+        if not self.mmu.rom_path:
+            return None
+        base = os.path.splitext(self.mmu.rom_path)[0]
+        return f"{base}.ss{slot}"
+
+    def save_state(self, slot=0):
+        path = self._state_path(slot)
+        if not path:
+            return False
+        try:
+            apu = self.apu
+            mmu = self.mmu
+            ppu = self.ppu
+            cpu = self.cpu
+            timers = self.timers
+            # Cancel any in-flight OAM DMA so it doesn't run during load.
+            mmu.dma_remaining = 0
+            mmu.dma_buffer = bytearray()
+            # Sync CGB WRAM bank back to main memory so it round-trips.
+            mmu.wram_banks[mmu.svbk - 1][:] = mmu.memory[0xD000:0xE000]
+            # Flush APU to silence (state captures the buffer's tail).
+            apu.drain()
+            import struct
+            parts = []
+            parts.append(self.SAVE_STATE_MAGIC)
+            parts.append(struct.pack('<BBBB', self.SAVE_STATE_VERSION, slot, 0, 0))
+            # CPU
+            reg = cpu.reg
+            parts.append(struct.pack('<BBBB BB BB HHHH',
+                                     reg.a, reg.f, reg.b, reg.c, reg.d, reg.e, reg.h, reg.l,
+                                     reg.sp, reg.pc, 0, 0))
+            parts.append(struct.pack('<BBBB',
+                                     1 if cpu.halted else 0,
+                                     1 if cpu.interrupts_master_enabled else 0,
+                                     1 if cpu.ime_pending else 0,
+                                     1 if cpu.halt_bug_pending else 0))
+            # MMU
+            parts.append(mmu.memory)  # 64KB
+            parts.append(struct.pack('<BBBBBBBBBBBBBBBBBBB',
+                                     mmu.mbc_type, 1 if mmu.ram_enabled else 0,
+                                     mmu.rom_bank & 0xFF, (mmu.rom_bank >> 8) & 0xFF,
+                                     mmu.ram_bank & 0xFF, mmu.mbc1_mode & 0xFF,
+                                     mmu.num_rom_banks, mmu.num_ram_banks,
+                                     1 if mmu.has_ram else 0, 1 if mmu.has_battery else 0,
+                                     1 if mmu.has_rtc else 0, 1 if mmu.is_cgb else 0,
+                                     mmu.joypad_buttons, mmu.serial_data, mmu.serial_control,
+                                     mmu.vram_bank_select, mmu.key1, mmu.rp, mmu.svbk))
+            parts.append(struct.pack('<iiBBBBBBBBBB',
+                                     mmu.hdma_remaining, mmu.hdma_src, mmu.hdma_dst,
+                                     1 if mmu.hdma_active else 0, mmu.dma_src,
+                                     0, 0, 0, 0, 0, 0, 0))
+            # RTC
+            parts.append(struct.pack('<BBBBBB d',
+                                     mmu.rtc_s & 0xFF, mmu.rtc_m & 0xFF, mmu.rtc_h & 0xFF,
+                                     mmu.rtc_dl & 0xFF, mmu.rtc_dh & 0xFF,
+                                     mmu.rtc_latch_state & 0xFF, mmu.rtc_last_time))
+            parts.append(struct.pack('<BBBBB',
+                                     mmu.rtc_latch_s & 0xFF, mmu.rtc_latch_m & 0xFF,
+                                     mmu.rtc_latch_h & 0xFF, mmu.rtc_latch_dl & 0xFF,
+                                     mmu.rtc_latch_dh & 0xFF))
+            parts.append(mmu.vram_bank1)
+            # WRAM bank snapshots
+            for i in range(7):
+                parts.append(mmu.wram_banks[i])
+            # PPU
+            parts.append(struct.pack('<BBB BBBBB BBBBB BBBB BB',
+                                     ppu.mode, ppu.scanline_dot & 0xFF,
+                                     (ppu.scanline_dot >> 8) & 0xFF,
+                                     ppu.mode3_duration & 0xFF, (ppu.mode3_duration >> 8) & 0xFF,
+                                     0, 0, 0,  # reserved
+                                     ppu.bg_palette_addr, ppu.obj_palette_addr, ppu.cgb_opri,
+                                     1 if ppu.lcd_was_on else 0, 1 if ppu.is_cgb else 0,
+                                     ppu.window_line_counter & 0xFF,
+                                     (ppu.window_line_counter >> 8) & 0xFF,
+                                     0, 0, 0, 0))
+            parts.append(ppu.bg_palette_data)
+            parts.append(ppu.obj_palette_data)
+            # APU: pack a flat list of 1-byte values for each boolean / small int.
+            apu_values = [
+                1 if apu.power else 0,
+                apu.frame_seq_step & 0x07,
+                (apu.frame_seq_counter >> 8) & 0xFF,
+                apu.vol_left & 0x07, apu.vol_right & 0x07,
+                apu.pan_left, apu.pan_right,
+                apu.sample_accum & 0xFF, (apu.sample_accum >> 8) & 0xFF,
+                apu.sample_num & 0xFF, (apu.sample_num >> 8) & 0xFF,
+                apu.sample_den & 0xFF, (apu.sample_den >> 8) & 0xFF,
+                # Channel 1 (16 bytes)
+                1 if apu.ch1_enabled else 0, 1 if apu.ch1_dac else 0,
+                apu.ch1_freq & 0xFF, (apu.ch1_freq >> 8) & 0x0F,
+                apu.ch1_freq_timer & 0xFF, (apu.ch1_freq_timer >> 8) & 0xFF,
+                apu.ch1_duty & 0x03, apu.ch1_duty_step & 0x07,
+                1 if apu.ch1_length_enabled else 0, apu.ch1_length & 0x3F,
+                apu.ch1_volume & 0x0F, apu.ch1_env_initial & 0x0F,
+                apu.ch1_env_direction & 0x01, apu.ch1_env_period & 0x07,
+                apu.ch1_env_timer & 0x07, apu.ch1_sweep_period & 0x07,
+                # Channel 2 (12 bytes)
+                1 if apu.ch2_enabled else 0, 1 if apu.ch2_dac else 0,
+                apu.ch2_freq & 0xFF, (apu.ch2_freq >> 8) & 0x0F,
+                apu.ch2_freq_timer & 0xFF, (apu.ch2_freq_timer >> 8) & 0xFF,
+                apu.ch2_duty & 0x03, apu.ch2_duty_step & 0x07,
+                1 if apu.ch2_length_enabled else 0, apu.ch2_length & 0x3F,
+                apu.ch2_volume & 0x0F, apu.ch2_env_period & 0x07,
+                # Channel 3 (10 bytes)
+                1 if apu.ch3_enabled else 0, 1 if apu.ch3_dac else 0,
+                apu.ch3_freq & 0xFF, (apu.ch3_freq >> 8) & 0x0F,
+                apu.ch3_freq_timer & 0xFF, (apu.ch3_freq_timer >> 8) & 0xFF,
+                1 if apu.ch3_length_enabled else 0, apu.ch3_length & 0xFF,
+                apu.ch3_vol_shift & 0x03, apu.ch3_wave_pos & 0x1F,
+                # Channel 4 (12 bytes)
+                1 if apu.ch4_enabled else 0, 1 if apu.ch4_dac else 0,
+                apu.ch4_freq_timer & 0xFF, (apu.ch4_freq_timer >> 8) & 0xFF,
+                1 if apu.ch4_length_enabled else 0, apu.ch4_length & 0x3F,
+                apu.ch4_volume & 0x0F, apu.ch4_env_period & 0x07,
+                apu.ch4_lfsr & 0xFF, (apu.ch4_lfsr >> 8) & 0x7F,
+                apu.ch4_shift & 0x0F, apu.ch4_width_mode & 0x01,
+                # Sweep + env state not in main channels
+                apu.ch1_sweep_direction & 0x01, apu.ch1_sweep_shift & 0x07,
+                apu.ch1_sweep_timer & 0x07, apu.ch1_sweep_shadow & 0xFF,
+                (apu.ch1_sweep_shadow >> 8) & 0x0F,
+                1 if apu.ch1_sweep_enabled else 0,
+                apu.ch1_env_timer & 0x07,
+                apu.ch2_env_initial & 0x0F, apu.ch2_env_direction & 0x01,
+                apu.ch2_env_timer & 0x07,
+                apu.ch4_env_initial & 0x0F, apu.ch4_env_direction & 0x01,
+                apu.ch4_env_timer & 0x07,
+                apu.ch4_divisor_code & 0x07,
+            ]
+            parts.append(bytes(apu_values))
+            parts.append(apu.wave_ram)
+            # Timers
+            parts.append(struct.pack('<II', timers.div_counter, timers.tima_accum))
+            with open(path, 'wb') as f:
+                for p in parts:
+                    f.write(p)
+            logging.info(f"Saved state to slot {slot}: {os.path.basename(path)}")
+            return True
+        except OSError as e:
+            logging.warning(f"Could not save state: {e}")
+            return False
+
+    def load_state(self, slot=0):
+        path = self._state_path(slot)
+        if not path or not os.path.isfile(path):
+            return False
+        try:
+            import struct
+            with open(path, 'rb') as f:
+                data = f.read()
+            pos = 0
+            if data[pos:pos+4] != self.SAVE_STATE_MAGIC:
+                logging.warning("Save state: bad magic")
+                return False
+            pos += 4
+            ver = data[pos]
+            if ver != self.SAVE_STATE_VERSION:
+                logging.warning(f"Save state: unsupported version {ver}")
+                return False
+            pos += 4
+            mmu = self.mmu
+            cpu = self.cpu
+            ppu = self.ppu
+            apu = self.apu
+            timers = self.timers
+            # CPU
+            (a, f_, b, c, d, e, h, l, sp, pc, _, _) = struct.unpack_from('<BBBB BB BB HHHH', data, pos)
+            pos += struct.calcsize('<BBBB BB BB HHHH')
+            cpu.reg.a = a; cpu.reg.f = f_ & 0xF0
+            cpu.reg.b = b; cpu.reg.c = c
+            cpu.reg.d = d; cpu.reg.e = e
+            cpu.reg.h = h; cpu.reg.l = l
+            cpu.reg.sp = sp; cpu.reg.pc = pc
+            (halted, ime, ime_pending, halt_bug) = struct.unpack_from('<BBBB', data, pos)
+            cpu.halted = bool(halted)
+            cpu.interrupts_master_enabled = bool(ime)
+            cpu.ime_pending = bool(ime_pending)
+            cpu.halt_bug_pending = bool(halt_bug)
+            pos += 4
+            # MMU memory
+            mmu.memory[:] = data[pos:pos+0x10000]
+            pos += 0x10000
+            # MMU control
+            fmt = '<BBBBBBBBBBBBBBBBBBB'
+            unpacked = struct.unpack_from(fmt, data, pos)
+            pos += struct.calcsize(fmt)
+            (mbc_type, ram_enabled, rom_bank_lo, rom_bank_hi, ram_bank, mbc1_mode,
+             num_rom_banks, num_ram_banks, has_ram, has_battery, has_rtc, is_cgb,
+             joypad, serial_data, serial_control,
+             vram_bank_select, key1, rp, svbk) = unpacked
+            mmu.mbc_type = mbc_type
+            mmu.ram_enabled = bool(ram_enabled)
+            mmu.rom_bank = rom_bank_lo | ((rom_bank_hi & 1) << 8)
+            mmu.ram_bank = ram_bank
+            mmu.mbc1_mode = mbc1_mode
+            mmu.num_rom_banks = num_rom_banks
+            mmu.num_ram_banks = num_ram_banks
+            mmu.has_ram = bool(has_ram)
+            mmu.has_battery = bool(has_battery)
+            mmu.has_rtc = bool(has_rtc)
+            mmu.is_cgb = bool(is_cgb)
+            mmu.joypad_buttons = joypad
+            mmu.serial_data = serial_data
+            mmu.serial_control = serial_control
+            mmu.vram_bank_select = vram_bank_select & 1
+            mmu.key1 = key1
+            mmu.rp = rp
+            mmu.svbk = svbk
+            # HDMA / DMA
+            fmt = '<iiBBBBBBBBBB'
+            unpacked = struct.unpack_from(fmt, data, pos)
+            pos += struct.calcsize(fmt)
+            (hdma_remaining, hdma_src, hdma_dst, hdma_active, dma_src,
+             _d0, _d1, _d2, _d3, _d4, _d5, _d6) = unpacked
+            mmu.hdma_remaining = hdma_remaining
+            mmu.hdma_src = hdma_src
+            mmu.hdma_dst = hdma_dst
+            mmu.hdma_active = bool(hdma_active)
+            mmu.dma_src = dma_src
+            mmu.dma_remaining = 0
+            mmu.dma_buffer = bytearray()
+            # RTC current
+            fmt = '<BBBBBB d'
+            unpacked = struct.unpack_from(fmt, data, pos)
+            pos += struct.calcsize(fmt)
+            (rtc_s, rtc_m, rtc_h, rtc_dl, rtc_dh, rtc_latch_state, rtc_last_time) = unpacked
+            mmu.rtc_s = rtc_s & 0x3F
+            mmu.rtc_m = rtc_m & 0x3F
+            mmu.rtc_h = rtc_h & 0x1F
+            mmu.rtc_dl = rtc_dl
+            mmu.rtc_dh = rtc_dh & 0xC1
+            mmu.rtc_latch_state = rtc_latch_state & 0xFF
+            mmu.rtc_last_time = rtc_last_time
+            # RTC latched
+            fmt = '<BBBBB'
+            unpacked = struct.unpack_from(fmt, data, pos)
+            pos += struct.calcsize(fmt)
+            (rtc_ls, rtc_lm, rtc_lh, rtc_ldl, rtc_ldh) = unpacked
+            mmu.rtc_latch_s = rtc_ls & 0x3F
+            mmu.rtc_latch_m = rtc_lm & 0x3F
+            mmu.rtc_latch_h = rtc_lh & 0x1F
+            mmu.rtc_latch_dl = rtc_ldl
+            mmu.rtc_latch_dh = rtc_ldh & 0xC1
+            # VRAM bank 1
+            mmu.vram_bank1[:] = data[pos:pos+0x2000]
+            pos += 0x2000
+            # WRAM banks
+            for i in range(7):
+                mmu.wram_banks[i][:] = data[pos:pos+0x1000]
+                pos += 0x1000
+            # PPU
+            fmt = '<BBB BBBBB BBBBB BBBB BB'
+            unpacked = struct.unpack_from(fmt, data, pos)
+            pos += struct.calcsize(fmt)
+            (mode, scan_lo, scan_hi, m3_lo, m3_hi, _r0, _r1, _r2,
+             bg_pal_addr, obj_pal_addr, cgb_opri, lcd_was_on, is_cgb_ppu,
+             win_lo, win_hi, _w0, _w1, _w2, _w3) = unpacked
+            ppu.mode = mode
+            ppu.scanline_dot = scan_lo | (scan_hi << 8)
+            ppu.mode3_duration = m3_lo | (m3_hi << 8)
+            ppu.bg_palette_addr = bg_pal_addr
+            ppu.obj_palette_addr = obj_pal_addr
+            ppu.cgb_opri = cgb_opri & 1
+            ppu.lcd_was_on = bool(lcd_was_on)
+            ppu.is_cgb = bool(is_cgb_ppu)
+            ppu.window_line_counter = win_lo | (win_hi << 8)
+            ppu.bg_palette_data[:] = data[pos:pos+64]
+            pos += 64
+            ppu.obj_palette_data[:] = data[pos:pos+64]
+            pos += 64
+            # Refresh derived CGB color tables so the PPU can use the loaded palettes.
+            for i in range(32):
+                ppu._update_cgb_bg_color(i)
+                ppu._update_cgb_obj_color(i)
+            # APU
+            apu_size = 13 + 16 + 12 + 10 + 12 + 14
+            apu_bytes = data[pos:pos+apu_size]
+            pos += apu_size
+            ap = apu_bytes
+            ai = 0
+            apu.power = bool(ap[ai]); ai += 1
+            apu.frame_seq_step = ap[ai] & 0x07; ai += 1
+            apu.frame_seq_counter = (ap[ai] & 0xFF) << 8; ai += 1
+            apu.vol_left = ap[ai] & 0x07; apu.vol_right = ap[ai+1] & 0x07; ai += 2
+            apu.pan_left = ap[ai]; apu.pan_right = ap[ai+1]; ai += 2
+            apu.sample_accum = ap[ai] | (ap[ai+1] << 8); ai += 2
+            _loaded_sample_num = ap[ai] | (ap[ai+1] << 8); ai += 2
+            _loaded_sample_den = ap[ai] | (ap[ai+1] << 8); ai += 2
+            apu.sample_num = apu.CPU_CLOCK
+            apu.sample_den = apu.SAMPLE_RATE
+            # Channel 1
+            apu.ch1_enabled = bool(ap[ai]); apu.ch1_dac = bool(ap[ai+1]); ai += 2
+            apu.ch1_freq = ap[ai] | ((ap[ai+1] & 0x07) << 8); ai += 2
+            apu.ch1_freq_timer = ap[ai] | (ap[ai+1] << 8); ai += 2
+            apu.ch1_duty = ap[ai] & 0x03; apu.ch1_duty_step = ap[ai+1] & 0x07; ai += 2
+            apu.ch1_length_enabled = bool(ap[ai]); apu.ch1_length = ap[ai+1] & 0x3F; ai += 2
+            apu.ch1_volume = ap[ai] & 0x0F; apu.ch1_env_initial = ap[ai+1] & 0x0F; ai += 2
+            apu.ch1_env_direction = ap[ai] & 0x01
+            apu.ch1_env_period = ap[ai+1] & 0x07
+            apu.ch1_env_timer = ap[ai+2] & 0x07
+            apu.ch1_sweep_period = ap[ai+3] & 0x07; ai += 4
+            # Channel 2
+            apu.ch2_enabled = bool(ap[ai]); apu.ch2_dac = bool(ap[ai+1]); ai += 2
+            apu.ch2_freq = ap[ai] | ((ap[ai+1] & 0x07) << 8); ai += 2
+            apu.ch2_freq_timer = ap[ai] | (ap[ai+1] << 8); ai += 2
+            apu.ch2_duty = ap[ai] & 0x03; apu.ch2_duty_step = ap[ai+1] & 0x07; ai += 2
+            apu.ch2_length_enabled = bool(ap[ai]); apu.ch2_length = ap[ai+1] & 0x3F; ai += 2
+            apu.ch2_volume = ap[ai] & 0x0F
+            apu.ch2_env_period = ap[ai+1] & 0x07; ai += 2
+            # Channel 3
+            apu.ch3_enabled = bool(ap[ai]); apu.ch3_dac = bool(ap[ai+1]); ai += 2
+            apu.ch3_freq = ap[ai] | ((ap[ai+1] & 0x07) << 8); ai += 2
+            apu.ch3_freq_timer = ap[ai] | (ap[ai+1] << 8); ai += 2
+            apu.ch3_length_enabled = bool(ap[ai]); apu.ch3_length = ap[ai+1] & 0xFF; ai += 2
+            apu.ch3_vol_shift = ap[ai] & 0x03; apu.ch3_wave_pos = ap[ai+1] & 0x1F; ai += 2
+            # Channel 4
+            apu.ch4_enabled = bool(ap[ai]); apu.ch4_dac = bool(ap[ai+1]); ai += 2
+            apu.ch4_freq_timer = ap[ai] | (ap[ai+1] << 8); ai += 2
+            apu.ch4_length_enabled = bool(ap[ai]); apu.ch4_length = ap[ai+1] & 0x3F; ai += 2
+            apu.ch4_volume = ap[ai] & 0x0F
+            apu.ch4_env_period = ap[ai+1] & 0x07; ai += 2
+            apu.ch4_lfsr = ap[ai] | ((ap[ai+1] & 0x7F) << 8); ai += 2
+            apu.ch4_shift = ap[ai] & 0x0F
+            apu.ch4_width_mode = ap[ai+1] & 0x01; ai += 2
+            # Sweep + env state not in main channels
+            apu.ch1_sweep_direction = ap[ai] & 0x01
+            apu.ch1_sweep_shift = ap[ai+1] & 0x07
+            apu.ch1_sweep_timer = ap[ai+2] & 0x07
+            apu.ch1_sweep_shadow = ap[ai+3] | ((ap[ai+4] & 0x0F) << 8)
+            apu.ch1_sweep_enabled = bool(ap[ai+5])
+            apu.ch1_env_timer = ap[ai+6] & 0x07; ai += 7
+            apu.ch2_env_initial = ap[ai] & 0x0F
+            apu.ch2_env_direction = ap[ai+1] & 0x01
+            apu.ch2_env_timer = ap[ai+2] & 0x07; ai += 3
+            apu.ch4_env_initial = ap[ai] & 0x0F
+            apu.ch4_env_direction = ap[ai+1] & 0x01
+            apu.ch4_env_timer = ap[ai+2] & 0x07
+            apu.ch4_divisor_code = ap[ai+3] & 0x07; ai += 4
+            apu.wave_ram[:] = data[pos:pos+16]
+            pos += 16
+            apu._refresh_nr52()
+            # Timers
+            (div_counter, tima_accum) = struct.unpack_from('<II', data, pos)
+            pos += 8
+            timers.div_counter = div_counter
+            timers.tima_accum = tima_accum
+            logging.info(f"Loaded state from slot {slot}: {os.path.basename(path)}")
+            return True
+        except (OSError, struct.error) as e:
+            logging.warning(f"Could not load state: {e}")
+            return False
+
     def _flush_audio(self):
         """Push one frame's worth of PCM to the mixer; drop on backpressure."""
         if not self.audio_enabled:
@@ -3355,12 +3729,7 @@ class GameBoy:
                 self.mmu.dma_buffer = bytearray()
         else:
             cpu_cycles = self.cpu.step()
-        if double_speed:
-            total = self.speed_remainder + cpu_cycles
-            dot_cycles = total // 2
-            self.speed_remainder = total % 2
-        else:
-            dot_cycles = cpu_cycles
+        dot_cycles = cpu_cycles
         self.ppu.step(dot_cycles)
         self.timers.step(dot_cycles)
         self.apu.step(dot_cycles)
@@ -3403,6 +3772,30 @@ class GameBoy:
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_ESCAPE:
                     self.running = False
+                elif event.key == pygame.K_F6:
+                    if self.save_state(0):
+                        self._status_msg = "State saved to slot 0"
+                    else:
+                        self._status_msg = "Failed to save state"
+                    self._status_ttl = 90
+                elif event.key == pygame.K_F7:
+                    if self.load_state(0):
+                        self._status_msg = "State loaded from slot 0"
+                    else:
+                        self._status_msg = "No save state in slot 0"
+                    self._status_ttl = 90
+                elif event.key == pygame.K_F8:
+                    if self.save_state(1):
+                        self._status_msg = "State saved to slot 1"
+                    else:
+                        self._status_msg = "Failed to save state"
+                    self._status_ttl = 90
+                elif event.key == pygame.K_F9:
+                    if self.load_state(1):
+                        self._status_msg = "State loaded from slot 1"
+                    else:
+                        self._status_msg = "No save state in slot 1"
+                    self._status_ttl = 90
                 elif event.key in KEY_TO_JOYPAD_BIT:
                     self.mmu.set_joypad_button(KEY_TO_JOYPAD_BIT[event.key], True)
             elif event.type == pygame.KEYUP:
@@ -3436,6 +3829,19 @@ class GameBoy:
         else:
             scaled = pygame.transform.scale(surf, target_size)
         self.screen.blit(scaled, (0, 0))
+        # Transient status overlay (save/load messages)
+        if getattr(self, '_status_ttl', 0) > 0 and getattr(self, '_status_msg', ''):
+            try:
+                f = pygame.font.Font(None, 22)
+                s = f.render(self._status_msg, True, (255, 255, 200))
+                bg = pygame.Surface((s.get_width() + 16, s.get_height() + 8))
+                bg.fill((0, 0, 0))
+                bg.set_alpha(180)
+                self.screen.blit(bg, (8, 8))
+                self.screen.blit(s, (16, 12))
+            except (pygame.error, AttributeError):
+                pass
+            self._status_ttl -= 1
         pygame.display.flip()
 
 if __name__ == "__main__":

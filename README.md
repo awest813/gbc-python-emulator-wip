@@ -1,7 +1,8 @@
 # Python GBC Emulator
 
 A Game Boy / Game Boy Color emulator written in Python, featuring a built-in
-menu system, ROM browser, and MBC1/MBC5 cartridge support.
+menu system, ROM browser, MBC1/MBC2/MBC3/MBC5 cartridge support, and full
+CGB compatibility.
 
 ![status](https://img.shields.io/badge/status-playable-brightgreen)
 ![license](https://img.shields.io/badge/license-MIT-blue)
@@ -11,11 +12,14 @@ menu system, ROM browser, and MBC1/MBC5 cartridge support.
 ## Features
 
 - **CPU** — Complete LR35902 instruction set (standard + CB-prefixed),
-  interrupt handling, HALT / wait states.
+  interrupt handling, HALT bug, HALT / wait states, EI delay, double-speed
+  mode on CGB.
 - **PPU** — Background, window, and 8×8 / 8×16 sprite rendering with
   DMG 4-shade palette and CGB 8-palette × 4-color BG/OBJ palettes,
-  tile-level attributes from VRAM bank 1, X/Y flip, and sprite-over-BG
-  priority.
+  tile-level attributes from VRAM bank 1, X/Y flip, sprite-over-BG
+  priority, OPRI register, OAM / VRAM access blocking during PPU
+  modes 2/3 (STAT blocking), 8x16 sprite y-flip, and correct sprite
+  X / OAM priority ordering.
 - **APU** — All four DMG sound channels (two squares with envelope,
   sweep on channel 1, 32-step wave channel, LFSR noise channel),
   frame sequencer for length / envelope / sweep, master volume and
@@ -24,9 +28,16 @@ menu system, ROM browser, and MBC1/MBC5 cartridge support.
   generation (link cable TCP client/server planned).
 - **Timers** — DIV, TIMA, TMA, TAC with all four programmable rates and
   correct overflow → interrupt signalling.
-- **Cartridge** — MBC1 and MBC5 (ROM / RAM banking, battery-backed RAM
-  with automatic `.sav` file load on boot and save on exit). CGB mode
-  auto-detected from header byte 0x0143.
+- **Cartridge** — MBC1, MBC2 (4-bit RAM), MBC3 (with RTC), and MBC5
+  (ROM / RAM banking, battery-backed RAM with automatic `.sav` file
+  load on boot and save on exit). CGB mode auto-detected from header
+  byte 0x0143. Boot ROM support (DMG 256B / CGB ~2304B).
+- **DMA** — OAM DMA (FF46), CGB H-Blank DMA (FF51-FF55), and CGB GDMA.
+- **CGB extras** — VRAM bank 1 (FF4F), WRAM bank 1-7 (FF70), CGB BG/OBJ
+  palettes (FF68-FF6C), KEY1 double-speed (FF4D), and all write-protection
+  rules (STAT read-only bits 0-2 / 6, unused bits forced to 1).
+- **Save states** — Snapshot full emulator state to `<rom>.ss<slot>`
+  with F6 / F8 (save) and F7 / F9 (load).
 - **Menu system** — ROM browser, window-scale selector, keyboard controls,
   project logo.
 - **Input** — D-pad, A / B, Start, Select via the standard joypad register
@@ -95,6 +106,8 @@ python gbc_emulator_skeleton.py path/to/rom.gb --nomenu
 | Enter          | Start         |
 | Escape         | Menu / Quit   |
 | F5 (in menu)   | Refresh ROMs  |
+| F6 / F8        | Save state (slot 0 / 1) |
+| F7 / F9        | Load state (slot 0 / 1) |
 
 ## Menu
 
@@ -154,18 +167,25 @@ LICENSE                    MIT License
 
 ## Status
 
-A working DMG-compatible emulator that successfully displays the title
+A working DMG/CGB-compatible emulator that successfully displays the title
 screen of several homebrew ROMs (including **SUPERBAJTEK** by Arte Frog
-FF Studio) with proper scrolling background, window layer, sprite
-rendering, and interrupt timing. Runs at ~60–90 fps in the Python
+FF Studio) and commercial CGB games (such as **Dragon Warrior III**)
+with proper scrolling background, window layer, sprite rendering, CGB
+palettes, and interrupt timing. Runs at ~60–90 fps in the Python
 interpreter on modest hardware.
 
 ### Known Limitations
 
-- CGB double-speed mode not yet implemented.
-- STAT blocking mode is not emulated per-cycle.
-- Unimplemented opcodes halt the CPU silently (logged as an error).
-- No save-state support.
+- CGB double-speed mode is implemented at the cycle-accurate level
+  (PPU / APU / timers all see 2× cycles), but the cartridge bus
+  access-time penalty (one extra wait state per cartridge read at
+  2× speed) is not emulated.
+- Per-cycle STAT blocking for non-CPU bus activity (e.g. during DMA)
+  is approximated; the OAM / VRAM access blocking during PPU modes
+  2/3 is correctly enforced.
+- Unimplemented opcodes are logged as errors and treated as a 4-cycle
+  NOP (the original DMG behaviour is to fully fault on them).
+- SGB (Super Game Boy) features are not emulated.
 
 ## License
 
