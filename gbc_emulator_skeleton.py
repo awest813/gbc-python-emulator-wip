@@ -2201,6 +2201,35 @@ class PPU:
                 flipped = (colors[7], colors[6], colors[5], colors[4],
                              colors[3], colors[2], colors[1], colors[0])
                 self._cgb_sprite_plot8(fb, bg_pri, fb_row, spr_x, lcdc, bg_priority, pr, pal, flipped)
+            elif on_screen:
+                # DMG fully-on-screen fast path: unrolled 8-pixel writer with no
+                # per-pixel bounds or CGB-branch checks. Reached only for DMG
+                # objects (CGB on-screen cases handled above).
+                if x_flip:
+                    c0, c1, c2, c3, c4, c5, c6, c7 = (
+                        colors[7], colors[6], colors[5], colors[4],
+                        colors[3], colors[2], colors[1], colors[0])
+                else:
+                    c0, c1, c2, c3, c4, c5, c6, c7 = colors
+                base = fb_row + spr_x
+                if bg_priority:
+                    if c0 and bg_pri[base] == 0:     fb[base] = dmg_obj_rgb[c0]
+                    if c1 and bg_pri[base + 1] == 0: fb[base + 1] = dmg_obj_rgb[c1]
+                    if c2 and bg_pri[base + 2] == 0: fb[base + 2] = dmg_obj_rgb[c2]
+                    if c3 and bg_pri[base + 3] == 0: fb[base + 3] = dmg_obj_rgb[c3]
+                    if c4 and bg_pri[base + 4] == 0: fb[base + 4] = dmg_obj_rgb[c4]
+                    if c5 and bg_pri[base + 5] == 0: fb[base + 5] = dmg_obj_rgb[c5]
+                    if c6 and bg_pri[base + 6] == 0: fb[base + 6] = dmg_obj_rgb[c6]
+                    if c7 and bg_pri[base + 7] == 0: fb[base + 7] = dmg_obj_rgb[c7]
+                else:
+                    if c0: fb[base] = dmg_obj_rgb[c0]
+                    if c1: fb[base + 1] = dmg_obj_rgb[c1]
+                    if c2: fb[base + 2] = dmg_obj_rgb[c2]
+                    if c3: fb[base + 3] = dmg_obj_rgb[c3]
+                    if c4: fb[base + 4] = dmg_obj_rgb[c4]
+                    if c5: fb[base + 5] = dmg_obj_rgb[c5]
+                    if c6: fb[base + 6] = dmg_obj_rgb[c6]
+                    if c7: fb[base + 7] = dmg_obj_rgb[c7]
             elif x_flip:
                 for sx in range(8):
                     pixel_x = spr_x + sx

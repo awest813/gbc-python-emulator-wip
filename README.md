@@ -150,6 +150,10 @@ Performance-critical helpers:
 - Unrolled 8-pixel writers in `_render_scanline` and `_render_window`
   for the common fully-on-screen case, with a bounds-checked fallback
   for partial overlap on the left edge.
+- Unrolled fully-on-screen sprite writers: `_cgb_sprite_plot8` (CGB) and a
+  DMG fast path in `_render_sprites` skip the per-pixel bounds and
+  CGB-branch checks for objects fully inside the 160px line, with the
+  generic per-pixel loop kept for partially off-screen sprites.
 - Packed 24-bit framebuffer: each pixel is a single `(r<<16)|(g<<8)|b`
   integer rather than an `(r, g, b)` tuple. Scanline writers stay at one
   assignment per pixel, but the per-frame host blit unpacks the whole

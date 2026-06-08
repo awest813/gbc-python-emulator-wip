@@ -380,6 +380,62 @@ def test_dmg_sprite_rendering(ns):
     check("DMG BG-off clears BG-priority row", p.bg_palette_idx[100] == 0)
 
 
+def test_dmg_sprite_fastpath(ns):
+    """Unrolled DMG on-screen sprite writer: X-flip and BG-priority branches."""
+    MMU, PPU = ns["MMU"], ns["PPU"]
+    m = MMU()
+    m.load_rom(build_rom(cgb=False))
+    p = PPU(m)
+    m.ppu = p
+    mem = m.memory
+    mem[0xFF47] = 0xE4  # BGP identity
+    mem[0xFF48] = 0xE4  # OBP0 identity (color c -> shade c)
+    obp0 = p._dmg_bgp_rgb[0xE4]
+
+    # Tile 0: pixel 0 = color 1, pixel 7 = color 2, rest transparent (color 0).
+    for row in range(8):
+        mem[0x8000 + row * 2] = 0x80      # lo: only pixel 0 set
+        mem[0x8000 + row * 2 + 1] = 0x01  # hi: only pixel 7 set
+
+    # On-screen sprite (spr_x = 8), no flip, OBP0, BG off so writer runs clean.
+    mem[0xFF40] = 0x92  # LCD on, OBJ on, BG off
+    mem[0xFF4B] = 167   # window parked off-screen
+    mem[0xFE00] = 16    # spr_y = 0
+    mem[0xFE01] = 16    # spr_x = 8 (fully on screen -> fast path)
+    mem[0xFE02] = 0
+    mem[0xFE03] = 0x00  # no flip, OBP0, in front of BG
+    p._render_scanline(0, mem[0xFF40])
+    check("DMG fast-path no-flip pixel 0", fb_px(p.framebuffer, 8) == as_rgb(obp0[1]))
+    check("DMG fast-path no-flip pixel 7", fb_px(p.framebuffer, 15) == as_rgb(obp0[2]))
+    check("DMG fast-path leaves transparent pixel untouched",
+          fb_px(p.framebuffer, 11) == as_rgb(p.shades[0]))
+
+    # X-flip mirrors the row: pixel 0 <- color 2, pixel 7 <- color 1.
+    mem[0xFE03] = 0x20  # X-flip
+    p._render_scanline(0, mem[0xFF40])
+    check("DMG fast-path X-flip pixel 0", fb_px(p.framebuffer, 8) == as_rgb(obp0[2]))
+    check("DMG fast-path X-flip pixel 7", fb_px(p.framebuffer, 15) == as_rgb(obp0[1]))
+
+    # BG-priority branch: solid sprite behind BG. Hidden over non-zero BG,
+    # visible over zero BG.
+    mem[0xFF40] = 0x93  # LCD on, OBJ on, BG on, unsigned tiles
+    mem[0x9800] = 0
+    _fill_tile(mem, 0, 1)   # BG solid color 1 -> bg priority row all non-zero
+    _fill_tile(mem, 1, 3)   # sprite tile solid color 3
+    mem[0xFE01] = 16        # spr_x = 8
+    mem[0xFE02] = 1
+    mem[0xFE03] = 0x80      # behind BG
+    p._render_scanline(0, mem[0xFF40])
+    bgp = p._dmg_bgp_rgb[0xE4]
+    check("DMG fast-path BG-priority hides OBJ over BG",
+          fb_px(p.framebuffer, 8) == as_rgb(bgp[1]))
+
+    _fill_tile(mem, 0, 0)   # BG solid color 0 -> bg priority row all zero
+    p._render_scanline(0, mem[0xFF40])
+    check("DMG fast-path BG-priority shows OBJ over blank BG",
+          fb_px(p.framebuffer, 8) == as_rgb(obp0[3]))
+
+
 def test_apu_frame_sync(ns):
     """APU sample output and frame sequencer must track one video frame of dots."""
     MMU, APU = ns["MMU"], ns["APU"]
@@ -487,6 +543,7 @@ def main():
     print("full-machine run:");        test_run(ns)
     print("cgb sprite rendering:");  test_cgb_sprite_rendering(ns)
     print("dmg sprite rendering:");  test_dmg_sprite_rendering(ns)
+    print("dmg sprite fast-path:");   test_dmg_sprite_fastpath(ns)
     print("apu frame sync:");          test_apu_frame_sync(ns)
     print("gameboy frame audio:");     test_gameboy_frame_audio(ns)
     print("double-speed timing:");     test_double_speed(ns)
