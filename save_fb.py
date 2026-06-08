@@ -1,13 +1,16 @@
+"""Run a ROM headless and dump the framebuffer to fb.ppm.
+Usage: python save_fb.py [path-to-rom]   (defaults to roms/game.gb)"""
+import os
 import sys
 import time
 
-sys.path.insert(0, r'C:\Users\allen\Downloads\GBC')
-src = open(r'C:\Users\allen\Downloads\GBC\gbc_emulator_skeleton.py', encoding='utf-8').read()
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+src = open(os.path.join(HERE, "gbc_emulator_skeleton.py"), encoding="utf-8").read()
 src = src.split('if __name__')[0]
 exec(compile(src, 'gbc_emulator_skeleton.py', 'exec'))
 
-import os
-rom_path = os.path.join('roms', 'game.gb')
+rom_path = sys.argv[1] if len(sys.argv) > 1 else os.path.join(HERE, 'roms', 'game.gb')
 print(f'=== {os.path.basename(rom_path)} ===')
 with open(rom_path, 'rb') as f:
     rom = f.read()

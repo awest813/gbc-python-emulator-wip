@@ -184,6 +184,18 @@ It verifies representative opcode flag behaviour (ADD / SUB / DAA / CB
 SWAP / SRL / BIT), illegal-opcode handling, a full multi-step run, and
 CGB double-speed dot scaling. Exits non-zero on failure.
 
+A second portable test covers the save-state system end to end — it
+snapshots a running synthetic CGB machine, mutates live state, reloads,
+and asserts the CPU / PPU / timer state and the derived CGB colour tables
+are restored exactly:
+
+```bash
+python test_save_state.py
+```
+
+Both tests are self-contained (no display, no local ROMs) and exit
+non-zero on failure, so they work as CI checks.
+
 ## Status
 
 A working DMG/CGB-compatible emulator that successfully displays the title
