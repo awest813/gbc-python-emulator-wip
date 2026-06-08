@@ -1545,7 +1545,7 @@ class PPU:
     """Picture Processing Unit with background rendering."""
     _TILE_COLORS = tuple(
         tuple((((hi >> p) & 1) << 1 | ((lo >> p) & 1) for p in range(7, -1, -1)))
-        for lo in range(256) for hi in range(256)
+        for hi in range(256) for lo in range(256)
     )
     _PALETTE_SHADES = tuple(
         tuple((bgp >> (c << 1)) & 0x03 for c in range(4))
@@ -2072,6 +2072,30 @@ class PPU:
                     bp[base + 6] = c6
                     bp[base + 7] = c7
 
+    def _cgb_sprite_plot(self, fb, bg_pri, idx, lcdc, bg_priority, pr, pal, c):
+        if c == 0:
+            return
+        bg_color_idx = bg_pri[idx] & 0x7F
+        if (lcdc & 0x01) and bg_color_idx != 0 and ((bg_pri[idx] & 0x80) or bg_priority):
+            return
+        fb[idx] = pr[pal * 4 + c]
+
+    def _cgb_sprite_plot8(self, fb, bg_pri, fb_row, spr_x, lcdc, bg_priority, pr, pal, colors):
+        """Unrolled CGB sprite row for sprites fully within the 160px scanline."""
+        off = pal * 4
+        cgb_pri = lcdc & 0x01
+        c0, c1, c2, c3, c4, c5, c6, c7 = colors
+        base = fb_row + spr_x
+        for sx, c in enumerate((c0, c1, c2, c3, c4, c5, c6, c7)):
+            if c == 0:
+                continue
+            idx = base + sx
+            if cgb_pri:
+                bg_color_idx = bg_pri[idx] & 0x7F
+                if bg_color_idx != 0 and ((bg_pri[idx] & 0x80) or bg_priority):
+                    continue
+            fb[idx] = pr[off + c]
+
     def _render_sprites(self, ly):
         mem = self.mmu.memory
         lcdc = mem[0xFF40]
@@ -2092,7 +2116,8 @@ class PPU:
             sprites.append((spr_x, spr_y, tile, flags))
             if len(sprites) >= 10:
                 break
-        if not self.is_cgb:
+        # CGB: OAM index priority (OPRI=0). DMG / CGB with OPRI=1: sort by X.
+        if not self.is_cgb or self.cgb_opri:
             sprites.sort(key=lambda s: s[0])
         obp0 = mem[0xFF48]
         obp1 = mem[0xFF49]
@@ -2137,22 +2162,23 @@ class PPU:
                 use_obp1 = flags & 0x10
                 palette_shades = obp1_shades if use_obp1 else obp0_shades
                 use_cgb_obj = False
-            if x_flip:
+            on_screen = spr_x >= 0 and spr_x + 8 <= SCREEN_WIDTH
+            if use_cgb_obj and on_screen and not x_flip:
+                self._cgb_sprite_plot8(fb, bg_pri, fb_row, spr_x, lcdc, bg_priority, pr, pal, colors)
+            elif use_cgb_obj and on_screen and x_flip:
+                flipped = (colors[7], colors[6], colors[5], colors[4],
+                             colors[3], colors[2], colors[1], colors[0])
+                self._cgb_sprite_plot8(fb, bg_pri, fb_row, spr_x, lcdc, bg_priority, pr, pal, flipped)
+            elif x_flip:
                 for sx in range(8):
                     pixel_x = spr_x + sx
                     if pixel_x < 0 or pixel_x >= SCREEN_WIDTH:
                         continue
                     c = colors[7 - sx]
-                    if c == 0:
-                        continue
-                    idx = fb_row + pixel_x
                     if use_cgb_obj:
-                        bg_color_idx = bg_pri[idx] & 0x7F
-                        bg_attr_pri = bg_pri[idx] & 0x80
-                        if (lcdc & 0x01) and bg_color_idx != 0 and (bg_attr_pri or bg_priority):
-                            continue
-                        fb[idx] = pr[pal * 4 + c]
-                    else:
+                        self._cgb_sprite_plot(fb, bg_pri, fb_row + pixel_x, lcdc, bg_priority, pr, pal, c)
+                    elif c != 0:
+                        idx = fb_row + pixel_x
                         if bg_priority and bg_pri[idx] != 0:
                             continue
                         fb[idx] = shades[palette_shades[c]]
@@ -2162,16 +2188,10 @@ class PPU:
                     if pixel_x < 0 or pixel_x >= SCREEN_WIDTH:
                         continue
                     c = colors[sx]
-                    if c == 0:
-                        continue
-                    idx = fb_row + pixel_x
                     if use_cgb_obj:
-                        bg_color_idx = bg_pri[idx] & 0x7F
-                        bg_attr_pri = bg_pri[idx] & 0x80
-                        if (lcdc & 0x01) and bg_color_idx != 0 and (bg_attr_pri or bg_priority):
-                            continue
-                        fb[idx] = pr[pal * 4 + c]
-                    else:
+                        self._cgb_sprite_plot(fb, bg_pri, fb_row + pixel_x, lcdc, bg_priority, pr, pal, c)
+                    elif c != 0:
+                        idx = fb_row + pixel_x
                         if bg_priority and bg_pri[idx] != 0:
                             continue
                         fb[idx] = shades[palette_shades[c]]
