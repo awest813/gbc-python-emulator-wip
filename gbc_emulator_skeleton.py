@@ -1585,6 +1585,8 @@ class PPU:
         # surface with a vectorised unpack instead of iterating 23 040 tuples.
         self.framebuffer = [0xFFFFFF] * (SCREEN_WIDTH * SCREEN_HEIGHT)
         self.bg_palette_idx = bytearray(SCREEN_WIDTH * SCREEN_HEIGHT)
+        # Reusable all-zero scanline for clearing BG priority when BG is disabled.
+        self._zero_row = bytes(SCREEN_WIDTH)
         self.shades = [(r << 16) | (g << 8) | b for (r, g, b) in PALETTE_DMG]
         self._rebuild_dmg_lut()
         self.is_cgb = False
@@ -1826,7 +1828,7 @@ class PPU:
             bg_pri = self.bg_palette_idx
             for i in range(SCREEN_WIDTH):
                 fb[fb_row + i] = white
-            bg_pri[fb_row:fb_row + SCREEN_WIDTH] = 0
+            bg_pri[fb_row:fb_row + SCREEN_WIDTH] = self._zero_row
             if lcdc & 0x02:
                 self._render_sprites(ly)
             return
