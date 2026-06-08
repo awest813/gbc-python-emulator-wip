@@ -1,14 +1,20 @@
+"""Run a ROM headless and save a PNG of the framebuffer.
+Usage: python test_zelda.py <path-to-rom>"""
+import os
 import sys
 import time
-import os
 import imageio
 
-sys.path.insert(0, r'C:\Users\allen\Downloads\GBC')
-src = open(r'C:\Users\allen\Downloads\GBC\gbc_emulator_skeleton.py', encoding='utf-8').read()
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+src = open(os.path.join(HERE, "gbc_emulator_skeleton.py"), encoding="utf-8").read()
 src = src.split('if __name__')[0]
 exec(compile(src, 'gbc_emulator_skeleton.py', 'exec'))
 
-rom_path = r"C:\Users\allen\Downloads\Legend of Zelda, The - Oracle of Seasons (USA, Australia)\Legend of Zelda, The - Oracle of Seasons (USA, Australia).gbc"
+if len(sys.argv) < 2:
+    print("Usage: python test_zelda.py <path-to-rom>")
+    sys.exit(1)
+rom_path = sys.argv[1]
 print(f'=== {os.path.basename(rom_path)} ===')
 with open(rom_path, 'rb') as f:
     rom = f.read()
@@ -63,6 +69,10 @@ for idx in range(160*144):
     colors.add(fb[idx])
 print(f"Unique colors in framebuffer: {len(colors)}")
 
-arr = np.array(fb, dtype=np.uint8).reshape(144, 160, 3)
+packed = np.asarray(fb, dtype=np.uint32).reshape(144, 160)
+arr = np.empty((144, 160, 3), np.uint8)
+arr[:, :, 0] = (packed >> 16) & 0xFF
+arr[:, :, 1] = (packed >> 8) & 0xFF
+arr[:, :, 2] = packed & 0xFF
 imageio.imwrite('zelda.png', arr)
 print("Saved frame to zelda.png")

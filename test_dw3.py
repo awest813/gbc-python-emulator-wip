@@ -1,16 +1,19 @@
+"""Run a ROM headless and save a PNG of the framebuffer.
+Usage: python test_dw3.py [path-to-rom]   (defaults to roms/Dragon Warrior III (USA).gbc)"""
+import os
 import sys
 import time
-import os
 
-sys.path.insert(0, r'C:\Users\allen\Downloads\GBC')
-src = open(r'C:\Users\allen\Downloads\GBC\gbc_emulator_skeleton.py', encoding='utf-8').read()
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+src = open(os.path.join(HERE, "gbc_emulator_skeleton.py"), encoding="utf-8").read()
 src = src.split('if __name__')[0]
 exec(compile(src, 'gbc_emulator_skeleton.py', 'exec'))
 
 import numpy as np
 import imageio.v3 as iio
 
-rom_path = os.path.join('roms', 'Dragon Warrior III (USA).gbc')
+rom_path = sys.argv[1] if len(sys.argv) > 1 else os.path.join(HERE, 'roms', 'Dragon Warrior III (USA).gbc')
 print(f'=== {os.path.basename(rom_path)} ===')
 with open(rom_path, 'rb') as f:
     rom = f.read()
@@ -43,7 +46,11 @@ for i in range(8000000):
 
 # Save framebuffer
 fb = ppu.framebuffer
-arr = np.array(fb, dtype=np.uint8).reshape(144, 160, 3)
+packed = np.asarray(fb, dtype=np.uint32).reshape(144, 160)
+arr = np.empty((144, 160, 3), np.uint8)
+arr[:, :, 0] = (packed >> 16) & 0xFF
+arr[:, :, 1] = (packed >> 8) & 0xFF
+arr[:, :, 2] = packed & 0xFF
 big = arr.repeat(4, axis=0).repeat(4, axis=1)
 iio.imwrite('dw3.png', big)
 print(f'Final PC: 0x{cpu.reg.pc:04X}, LY: {mmu.memory[0xFF44]}, LCDC: 0x{mmu.memory[0xFF40]:02X}')

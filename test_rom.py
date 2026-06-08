@@ -1,8 +1,17 @@
+"""Long-run debug harness for a real ROM. Usage: python test_rom.py <rom>"""
+import os
 import sys
-sys.path.insert(0, r'C:\Users\allen\Downloads\GBC')
-exec(open(r'C:\Users\allen\Downloads\GBC\gbc_emulator_skeleton.py', encoding='utf-8').read().split('if __name__')[0])
 
-rom_path = r'C:\Users\allen\Downloads\rom (2)\extracted\Dragon Warrior III (USA).gbc'
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+exec(compile(
+    open(os.path.join(HERE, "gbc_emulator_skeleton.py"), encoding="utf-8").read().split("if __name__")[0],
+    "gbc_emulator_skeleton.py", "exec"))
+
+if len(sys.argv) < 2:
+    print("Usage: python test_rom.py <path-to-rom>")
+    sys.exit(1)
+rom_path = sys.argv[1]
 with open(rom_path, 'rb') as f:
     rom = f.read()
 mmu = MMU()
@@ -48,8 +57,8 @@ colors = {}
 for y in range(SCREEN_HEIGHT):
     for x in range(SCREEN_WIDTH):
         idx = y * SCREEN_WIDTH + x
-        r, g, b = fb[idx]
-        key = (r, g, b)
+        px = fb[idx]
+        key = ((px >> 16) & 0xFF, (px >> 8) & 0xFF, px & 0xFF)
         colors[key] = colors.get(key, 0) + 1
 
 print('Unique colors:', len(colors))

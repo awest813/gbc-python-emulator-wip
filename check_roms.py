@@ -1,5 +1,11 @@
+"""Print Game Boy cartridge header info for one or more ROMs.
+Usage: python check_roms.py <rom> [<rom> ...]   (defaults to roms/game.gb)"""
 import os
-for path in [r'C:\Users\allen\Downloads\GBC\roms\game.gb', r'C:\Users\allen\Downloads\GBC\roms\Dragon Warrior III (USA).gbc']:
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+paths = sys.argv[1:] or [os.path.join(HERE, 'roms', 'game.gb')]
+for path in paths:
     with open(path, 'rb') as f:
         data = f.read()
     title = data[0x134:0x144].decode('latin-1', errors='replace').rstrip(chr(0))

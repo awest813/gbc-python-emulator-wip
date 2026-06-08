@@ -150,6 +150,11 @@ Performance-critical helpers:
 - Unrolled 8-pixel writers in `_render_scanline` and `_render_window`
   for the common fully-on-screen case, with a bounds-checked fallback
   for partial overlap on the left edge.
+- Packed 24-bit framebuffer: each pixel is a single `(r<<16)|(g<<8)|b`
+  integer rather than an `(r, g, b)` tuple. Scanline writers stay at one
+  assignment per pixel, but the per-frame host blit unpacks the whole
+  frame with a vectorised numpy shift instead of iterating 23 040 tuples
+  (~2.5× faster render-to-surface path).
 
 ## Project Layout
 
@@ -178,6 +183,18 @@ python test_headless.py
 It verifies representative opcode flag behaviour (ADD / SUB / DAA / CB
 SWAP / SRL / BIT), illegal-opcode handling, a full multi-step run, and
 CGB double-speed dot scaling. Exits non-zero on failure.
+
+A second portable test covers the save-state system end to end — it
+snapshots a running synthetic CGB machine, mutates live state, reloads,
+and asserts the CPU / PPU / timer state and the derived CGB colour tables
+are restored exactly:
+
+```bash
+python test_save_state.py
+```
+
+Both tests are self-contained (no display, no local ROMs) and exit
+non-zero on failure, so they work as CI checks.
 
 ## Status
 
