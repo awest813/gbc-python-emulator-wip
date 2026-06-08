@@ -37,6 +37,10 @@ except ImportError:
 
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 
+def _noop_trace(*_args, **_kwargs):
+    """No-op branch trace hook used when tracing is disabled (avoids call overhead)."""
+    return
+
 # --- CONSTANTS ---
 SCREEN_WIDTH = 160
 SCREEN_HEIGHT = 144
@@ -202,10 +206,9 @@ class CPU:
         self.trace_enabled = False
         self.branch_trace = deque(maxlen=8192)
         self.invalid_opcode_count = 0
+        self.trace_branch = _noop_trace
 
-    def trace_branch(self, kind, old_pc, new_pc, opcode):
-        if not self.trace_enabled:
-            return
+    def _record_branch(self, kind, old_pc, new_pc, opcode):
         self.branch_trace.append({
             "kind": kind,
             "from": old_pc,
@@ -222,6 +225,10 @@ class CPU:
             "if": self.mmu.read_byte(0xFF0F),
         })
 
+    def set_branch_trace(self, enabled):
+        """Enable or disable branch tracing (swaps in a no-op when off)."""
+        self.trace_enabled = enabled
+        self.trace_branch = self._record_branch if enabled else _noop_trace
 
     def dump_branch_trace(self):
         print("=== Last 64 branches ===")
@@ -485,6 +492,18 @@ class CPU:
             self.reg.pc = addr; return 24
         if opcode == 0x00:  # NOP
             return 4
+        if opcode == 0x18:  # JR - common in tight loops
+            offset = self.fetch_byte()
+            if offset & 0x80:
+                offset -= 256
+            self.reg.pc = (self.reg.pc + offset) & 0xFFFF
+            return 12
+        if opcode == 0xE0:  # LDH (a8),A - frequent IO writes
+            self.mmu.write_byte(0xFF00 + self.fetch_byte(), self.reg.a)
+            return 12
+        if opcode == 0xF0:  # LD A,(a8) - frequent IO reads
+            self.reg.a = self.mmu.read_byte(0xFF00 + self.fetch_byte())
+            return 12
         # Hot-path opcodes: LD r,r (0x40-0x7F), ALU A,r (0x80-0xBF).
         if opcode < 0x40:
             return self._exec_low(opcode)
@@ -1562,6 +1581,7 @@ class PPU:
         self.framebuffer = [(255, 255, 255)] * (SCREEN_WIDTH * SCREEN_HEIGHT)
         self.bg_palette_idx = bytearray(SCREEN_WIDTH * SCREEN_HEIGHT)
         self.shades = list(PALETTE_DMG)
+        self._rebuild_dmg_lut()
         self.is_cgb = False
         self.bg_palette_data = bytearray(64)
         self.obj_palette_data = bytearray(64)
@@ -1579,6 +1599,15 @@ class PPU:
 
     def set_palette(self, palette):
         self.shades = list(palette)
+        self._rebuild_dmg_lut()
+
+    def _rebuild_dmg_lut(self):
+        """Pre-map BGP/OBP register values to RGB tuples for the active DMG palette."""
+        shades = self.shades
+        self._dmg_bgp_rgb = tuple(
+            tuple(shades[self._PALETTE_SHADES[bgp][c]] for c in range(4))
+            for bgp in range(256)
+        )
 
     @staticmethod
     def _cgb_rgb555_to_rgb888(low, high):
@@ -1810,14 +1839,12 @@ class PPU:
         tile_row = bg_y >> 3
         pixel_row = bg_y & 7
 
-        shades = self.shades
         fb = self.framebuffer
         bg_pri = self.bg_palette_idx
         tile_colors = self._TILE_COLORS
-        palette_shades = self._PALETTE_SHADES[bgp]
+        dmg_rgb = self._dmg_bgp_rgb[bgp]
         scx_mod = scx & 7
         first_tile_col = scx >> 3
-        is_cgb = self.is_cgb
         # Fast path: when scx is 8-aligned, every tile column is fully on-screen,
         # so the inner 8-pixel loop has no bounds checks.
         if scx_mod == 0:
@@ -1877,14 +1904,14 @@ class PPU:
                     hi = mem[addr + 1]
                     c0, c1, c2, c3, c4, c5, c6, c7 = tile_colors[(hi << 8) | lo]
                     base = fb_row + tile_col_offset * 8
-                    fb[base]     = shades[palette_shades[c0]]
-                    fb[base + 1] = shades[palette_shades[c1]]
-                    fb[base + 2] = shades[palette_shades[c2]]
-                    fb[base + 3] = shades[palette_shades[c3]]
-                    fb[base + 4] = shades[palette_shades[c4]]
-                    fb[base + 5] = shades[palette_shades[c5]]
-                    fb[base + 6] = shades[palette_shades[c6]]
-                    fb[base + 7] = shades[palette_shades[c7]]
+                    fb[base]     = dmg_rgb[c0]
+                    fb[base + 1] = dmg_rgb[c1]
+                    fb[base + 2] = dmg_rgb[c2]
+                    fb[base + 3] = dmg_rgb[c3]
+                    fb[base + 4] = dmg_rgb[c4]
+                    fb[base + 5] = dmg_rgb[c5]
+                    fb[base + 6] = dmg_rgb[c6]
+                    fb[base + 7] = dmg_rgb[c7]
                     bp = bg_pri
                     bp[base]     = c0
                     bp[base + 1] = c1
@@ -1942,7 +1969,7 @@ class PPU:
                         if x < 0 or x >= SCREEN_WIDTH:
                             continue
                         c = colors[p]
-                        fb[fb_row + x] = shades[palette_shades[c]]
+                        fb[fb_row + x] = dmg_rgb[c]
                         bg_pri[fb_row + x] = c
 
         if lcdc & 0x20:
@@ -1971,11 +1998,10 @@ class PPU:
         tile_row = win_y >> 3
         pixel_row = win_y & 7
         fb_row = ly * SCREEN_WIDTH
-        shades = self.shades
         fb = self.framebuffer
         bg_pri = self.bg_palette_idx
         tile_colors = self._TILE_COLORS
-        palette_shades = self._PALETTE_SHADES[bgp]
+        dmg_rgb = self._dmg_bgp_rgb[bgp]
         is_cgb = self.is_cgb
         if is_cgb:
             vram_bank1 = self.mmu.vram_bank1
@@ -2021,7 +2047,7 @@ class PPU:
                             fb[fb_row + px] = pr[pal * 4 + c]
                             bg_pri[fb_row + px] = c | pri_mask
                         else:
-                            fb[fb_row + px] = shades[palette_shades[c]]
+                            fb[fb_row + px] = dmg_rgb[c]
                             bg_pri[fb_row + px] = c
             elif x + 8 > SCREEN_WIDTH:
                 for p in range(SCREEN_WIDTH - x):
@@ -2030,7 +2056,7 @@ class PPU:
                         fb[fb_row + x + p] = pr[pal * 4 + c]
                         bg_pri[fb_row + x + p] = c | pri_mask
                     else:
-                        fb[fb_row + x + p] = shades[palette_shades[c]]
+                        fb[fb_row + x + p] = dmg_rgb[c]
                         bg_pri[fb_row + x + p] = c
             else:
                 c0, c1, c2, c3, c4, c5, c6, c7 = colors
@@ -2055,14 +2081,14 @@ class PPU:
                     bp[base + 6] = c6 | pri_mask
                     bp[base + 7] = c7 | pri_mask
                 else:
-                    fb[base]     = shades[palette_shades[c0]]
-                    fb[base + 1] = shades[palette_shades[c1]]
-                    fb[base + 2] = shades[palette_shades[c2]]
-                    fb[base + 3] = shades[palette_shades[c3]]
-                    fb[base + 4] = shades[palette_shades[c4]]
-                    fb[base + 5] = shades[palette_shades[c5]]
-                    fb[base + 6] = shades[palette_shades[c6]]
-                    fb[base + 7] = shades[palette_shades[c7]]
+                    fb[base]     = dmg_rgb[c0]
+                    fb[base + 1] = dmg_rgb[c1]
+                    fb[base + 2] = dmg_rgb[c2]
+                    fb[base + 3] = dmg_rgb[c3]
+                    fb[base + 4] = dmg_rgb[c4]
+                    fb[base + 5] = dmg_rgb[c5]
+                    fb[base + 6] = dmg_rgb[c6]
+                    fb[base + 7] = dmg_rgb[c7]
                     bp = bg_pri
                     bp[base]     = c0
                     bp[base + 1] = c1
@@ -2125,10 +2151,8 @@ class PPU:
         fb_row = ly * SCREEN_WIDTH
         bg_pri = self.bg_palette_idx
         fb = self.framebuffer
-        shades = self.shades
         tile_colors = self._TILE_COLORS
-        obp0_shades = self._PALETTE_SHADES[obp0]
-        obp1_shades = self._PALETTE_SHADES[obp1]
+        obp_rgb = (self._dmg_bgp_rgb[obp0], self._dmg_bgp_rgb[obp1])
         is_cgb = self.is_cgb
         unsigned_addrs = self._tile_base_addrs[0]
         if is_cgb:
@@ -2160,8 +2184,8 @@ class PPU:
                 pal = flags & 0x07
                 use_cgb_obj = True
             else:
-                use_obp1 = flags & 0x10
-                palette_shades = obp1_shades if use_obp1 else obp0_shades
+                use_obp1 = bool(flags & 0x10)
+                dmg_obj_rgb = obp_rgb[use_obp1]
                 use_cgb_obj = False
             on_screen = spr_x >= 0 and spr_x + 8 <= SCREEN_WIDTH
             if use_cgb_obj and on_screen and not x_flip:
@@ -2182,7 +2206,7 @@ class PPU:
                         idx = fb_row + pixel_x
                         if bg_priority and bg_pri[idx] != 0:
                             continue
-                        fb[idx] = shades[palette_shades[c]]
+                        fb[idx] = dmg_obj_rgb[c]
             else:
                 for sx in range(8):
                     pixel_x = spr_x + sx
@@ -2195,7 +2219,7 @@ class PPU:
                         idx = fb_row + pixel_x
                         if bg_priority and bg_pri[idx] != 0:
                             continue
-                        fb[idx] = shades[palette_shades[c]]
+                        fb[idx] = dmg_obj_rgb[c]
 
 
 class Timers:
@@ -3278,6 +3302,7 @@ class GameBoy:
             self.mmu.memory[0x0103] = 0x01
 
         self.speed_remainder = 0  # carries the odd base-clock dot in double-speed mode
+        self._rtc_cycle_accum = 0  # throttle MBC3 RTC wall-clock updates to once per frame
         self._status_msg = ''
         self._status_ttl = 0
         self.fps_limit = fps_limit
@@ -3285,6 +3310,13 @@ class GameBoy:
         self.shader = shader if shader is not None else _shader_none
         self._prev_shader_frame = None
         self.ppu.set_palette(palette)
+        # Reused display buffers avoid per-frame numpy allocations in render().
+        if np is not None:
+            self._frame_np = np.empty((SCREEN_HEIGHT, SCREEN_WIDTH, 3), dtype=np.uint8)
+            self._blit_np = np.empty((SCREEN_WIDTH, SCREEN_HEIGHT, 3), dtype=np.uint8)
+        else:
+            self._frame_np = None
+            self._blit_np = None
 
         if pygame:
             self.window_scale = window_scale
@@ -3823,7 +3855,10 @@ class GameBoy:
         self.timers.step(cpu_cycles)
         self.apu.step(dot_cycles)
         if self.mmu.has_rtc:
-            self.mmu._rtc_update()
+            self._rtc_cycle_accum += cpu_cycles
+            if self._rtc_cycle_accum >= CYCLES_PER_FRAME:
+                self._rtc_cycle_accum -= CYCLES_PER_FRAME
+                self.mmu._rtc_update()
         return dot_cycles
 
     def run(self):
@@ -3889,14 +3924,16 @@ class GameBoy:
     def render(self):
         """Draws the PPU framebuffer to the Pygame screen."""
         if np is not None:
-            arr = np.array(self.ppu.framebuffer, dtype=np.uint8).reshape(SCREEN_HEIGHT, SCREEN_WIDTH, 3)
+            np.copyto(self._frame_np, np.asarray(self.ppu.framebuffer, dtype=np.uint8).reshape(
+                SCREEN_HEIGHT, SCREEN_WIDTH, 3))
+            arr = self._frame_np
             if self.shader is _shader_lcd_ghost:
                 arr = self.shader(arr, prev=self._prev_shader_frame)
                 self._prev_shader_frame = arr.copy()
             else:
                 arr = self.shader(arr)
-            arr = np.ascontiguousarray(arr.transpose(1, 0, 2))
-            surf = pygame.surfarray.make_surface(arr)
+            np.copyto(self._blit_np, arr.transpose(1, 0, 2))
+            surf = pygame.surfarray.make_surface(self._blit_np)
         else:
             surf = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT))
             pxa = pygame.PixelArray(surf)

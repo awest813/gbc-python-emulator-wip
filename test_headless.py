@@ -54,6 +54,16 @@ def check(name, cond):
     print(f"  ok: {name}")
 
 
+def as_rgb(px):
+    """Normalize list/tuple/numpy RGB values to a plain tuple."""
+    return px if isinstance(px, tuple) else (int(px[0]), int(px[1]), int(px[2]))
+
+
+def fb_px(fb, idx):
+    """Return an RGB tuple from either a list- or numpy-backed framebuffer."""
+    return as_rgb(fb[idx])
+
+
 def test_opcodes(ns):
     CPU, MMU = ns["CPU"], ns["MMU"]
     FLAG_Z, FLAG_C, FLAG_H = ns["FLAG_Z"], ns["FLAG_C"], ns["FLAG_H"]
@@ -181,7 +191,7 @@ def test_cgb_sprite_rendering(ns):
     mem[0xFE02] = 1
     mem[0xFE03] = 0x01  # palette 1
     p._render_scanline(0, mem[0xFF40])
-    check("OBJ palette color applied", p.framebuffer[0] == p._obj_rgb[7])
+    check("OBJ palette color applied", fb_px(p.framebuffer, 0) == as_rgb(p._obj_rgb[7]))
 
     # CGB overlap: earlier OAM entry wins (OPRI=0 default).
     m, p, mem = _setup_cgb_ppu(ns)
@@ -202,8 +212,8 @@ def test_cgb_sprite_rendering(ns):
     mem[0xFE06] = 2
     mem[0xFE07] = 0x01
     p._render_scanline(0, mem[0xFF40])
-    check("CGB OAM priority keeps earlier sprite", p.framebuffer[4] == p._obj_rgb[1])
-    check("CGB OAM priority exposes later sprite", p.framebuffer[8] == p._obj_rgb[6])
+    check("CGB OAM priority keeps earlier sprite", fb_px(p.framebuffer, 4) == as_rgb(p._obj_rgb[1]))
+    check("CGB OAM priority exposes later sprite", fb_px(p.framebuffer, 8) == as_rgb(p._obj_rgb[6]))
 
     # OPRI=1 restores DMG-style X priority on CGB.
     m, p, mem = _setup_cgb_ppu(ns)
@@ -225,8 +235,8 @@ def test_cgb_sprite_rendering(ns):
     mem[0xFE06] = 2
     mem[0xFE07] = 0x01
     p._render_scanline(0, mem[0xFF40])
-    check("OPRI=1 X priority at overlap", p.framebuffer[4] == p._obj_rgb[6])
-    check("OPRI=1 X priority keeps higher X", p.framebuffer[12] == p._obj_rgb[1])
+    check("OPRI=1 X priority at overlap", fb_px(p.framebuffer, 4) == as_rgb(p._obj_rgb[6]))
+    check("OPRI=1 X priority keeps higher X", fb_px(p.framebuffer, 12) == as_rgb(p._obj_rgb[1]))
 
     # BG priority hides non-transparent OBJ pixels when LCDC.0=1.
     m, p, mem = _setup_cgb_ppu(ns)
@@ -242,7 +252,7 @@ def test_cgb_sprite_rendering(ns):
     mem[0xFE02] = 1
     mem[0xFE03] = 0x82  # palette 2 + OAM priority
     p._render_scanline(0, mem[0xFF40])
-    check("BG priority hides OBJ pixel", p.framebuffer[0] == p._bg_rgb[2])
+    check("BG priority hides OBJ pixel", fb_px(p.framebuffer, 0) == as_rgb(p._bg_rgb[2]))
 
     # OBJ tiles can be fetched from VRAM bank 1.
     m, p, mem = _setup_cgb_ppu(ns)
@@ -257,7 +267,7 @@ def test_cgb_sprite_rendering(ns):
     mem[0xFE02] = 1
     mem[0xFE03] = 0x1B  # palette 3 + VRAM bank 1
     p._render_scanline(0, mem[0xFF40])
-    check("OBJ tile from VRAM bank 1", p.framebuffer[0] == p._obj_rgb[13])
+    check("OBJ tile from VRAM bank 1", fb_px(p.framebuffer, 0) == as_rgb(p._obj_rgb[13]))
 
     # X flip mirrors the tile row.
     m, p, mem = _setup_cgb_ppu(ns)
@@ -272,8 +282,8 @@ def test_cgb_sprite_rendering(ns):
     mem[0xFE02] = 1
     mem[0xFE03] = 0x20
     p._render_scanline(0, mem[0xFF40])
-    check("OBJ X flip leaves leading pixel transparent", p.framebuffer[0] == p._bg_rgb[0])
-    check("OBJ X flip trailing pixel", p.framebuffer[7] == p._obj_rgb[1])
+    check("OBJ X flip leaves leading pixel transparent", fb_px(p.framebuffer, 0) == as_rgb(p._bg_rgb[0]))
+    check("OBJ X flip trailing pixel", fb_px(p.framebuffer, 7) == as_rgb(p._obj_rgb[1]))
 
     # 8x16 sprites use paired tile indices.
     m, p, mem = _setup_cgb_ppu(ns)
@@ -287,13 +297,13 @@ def test_cgb_sprite_rendering(ns):
     mem[0xFE03] = 0x00
     p._render_scanline(0, mem[0xFF40])
     p._render_scanline(8, mem[0xFF40])
-    check("8x16 OBJ top half", p.framebuffer[0] == p._obj_rgb[1])
-    check("8x16 OBJ bottom half", p.framebuffer[8 * 160] == p._obj_rgb[2])
+    check("8x16 OBJ top half", fb_px(p.framebuffer, 0) == as_rgb(p._obj_rgb[1]))
+    check("8x16 OBJ bottom half", fb_px(p.framebuffer, 8 * 160) == as_rgb(p._obj_rgb[2]))
 
     # Y flip mirrors the full 8x16 object.
     mem[0xFE03] = 0x40
     p._render_scanline(0, mem[0xFF40])
-    check("8x16 OBJ Y flip", p.framebuffer[0] == p._obj_rgb[2])
+    check("8x16 OBJ Y flip", fb_px(p.framebuffer, 0) == as_rgb(p._obj_rgb[2]))
 
     # LCDC.0=0 forces OBJ over BG priority bits.
     m, p, mem = _setup_cgb_ppu(ns)
@@ -307,7 +317,7 @@ def test_cgb_sprite_rendering(ns):
     mem[0xFE02] = 1
     mem[0xFE03] = 0x80
     p._render_scanline(0, mem[0xFF40])
-    check("LCDC.0 clear keeps OBJ on top", p.framebuffer[0] == p._obj_rgb[3])
+    check("LCDC.0 clear keeps OBJ on top", fb_px(p.framebuffer, 0) == as_rgb(p._obj_rgb[3]))
 
     # Ten off-screen (X=0) OBJ still consume the per-line quota.
     m, p, mem = _setup_cgb_ppu(ns)
@@ -321,7 +331,7 @@ def test_cgb_sprite_rendering(ns):
     mem[0xFE2A] = 1
     mem[0xFE2B] = 0x00
     p._render_scanline(0, mem[0xFF40])
-    check("10 OBJ limit blocks 11th sprite", p.framebuffer[0] == p._bg_rgb[0])
+    check("10 OBJ limit blocks 11th sprite", fb_px(p.framebuffer, 0) == as_rgb(p._bg_rgb[0]))
 
 
 def test_dmg_sprite_rendering(ns):
@@ -347,7 +357,7 @@ def test_dmg_sprite_rendering(ns):
     mem[0xFE03] = 0x10  # OBP1
     p._render_scanline(0, mem[0xFF40])
     obp1_shades = p._PALETTE_SHADES[mem[0xFF49]]
-    check("DMG OBJ uses OBP1", p.framebuffer[0] == p.shades[obp1_shades[3]])
+    check("DMG OBJ uses OBP1", fb_px(p.framebuffer, 0) == p.shades[obp1_shades[3]])
 
 
 def test_apu_frame_sync(ns):
