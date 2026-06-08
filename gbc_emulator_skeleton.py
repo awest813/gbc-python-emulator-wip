@@ -101,6 +101,7 @@ SHADER_LIST = [
 ]
 
 FPS_LIMIT_OPTIONS = [("59.7 fps", 59.73), ("60 fps", 60.0), ("Unlimited", 0)]
+AUDIO_OPTIONS = [("On", True), ("Off", False)]
 VOLUME_OPTIONS = [("Mute", 0.0), ("Low", 0.25), ("Medium", 0.5), ("High", 0.75), ("Max", 1.0)]
 FILTER_OPTIONS = [("Nearest", False), ("Smooth", True)]
 
@@ -2922,6 +2923,7 @@ class EmulatorMenu:
         self.settings_cursor = 0
         self.window_scale = 4
         self.fps_limit_idx = 0
+        self.audio_idx = 0
         self.volume_idx = 4
         self.palette_idx = 0
         self.filter_idx = 0
@@ -2993,6 +2995,7 @@ class EmulatorMenu:
         self.settings_items = [
             f"Window Scale: {self.window_scale}x",
             f"Frame Rate: {FPS_LIMIT_OPTIONS[self.fps_limit_idx][0]}",
+            f"Audio: {AUDIO_OPTIONS[self.audio_idx][0]}",
             f"Volume: {VOLUME_OPTIONS[self.volume_idx][0]}",
             f"Palette: {PALETTE_LIST[self.palette_idx][0]}",
             f"Filter: {FILTER_OPTIONS[self.filter_idx][0]}",
@@ -3116,6 +3119,7 @@ class EmulatorMenu:
                                 path,
                                 window_scale=self.window_scale,
                                 fps_limit=FPS_LIMIT_OPTIONS[self.fps_limit_idx][1],
+                                audio_enabled=AUDIO_OPTIONS[self.audio_idx][1],
                                 volume=VOLUME_OPTIONS[self.volume_idx][1],
                                 palette=PALETTE_LIST[self.palette_idx][1],
                                 smooth_scale=FILTER_OPTIONS[self.filter_idx][1],
@@ -3153,12 +3157,14 @@ class EmulatorMenu:
                     elif self.settings_cursor == 1:
                         self.fps_limit_idx = (self.fps_limit_idx + 1) % len(FPS_LIMIT_OPTIONS)
                     elif self.settings_cursor == 2:
-                        self.volume_idx = (self.volume_idx + 1) % len(VOLUME_OPTIONS)
+                        self.audio_idx = (self.audio_idx + 1) % len(AUDIO_OPTIONS)
                     elif self.settings_cursor == 3:
-                        self.palette_idx = (self.palette_idx + 1) % len(PALETTE_LIST)
+                        self.volume_idx = (self.volume_idx + 1) % len(VOLUME_OPTIONS)
                     elif self.settings_cursor == 4:
-                        self.filter_idx = (self.filter_idx + 1) % len(FILTER_OPTIONS)
+                        self.palette_idx = (self.palette_idx + 1) % len(PALETTE_LIST)
                     elif self.settings_cursor == 5:
+                        self.filter_idx = (self.filter_idx + 1) % len(FILTER_OPTIONS)
+                    elif self.settings_cursor == 6:
                         self.shader_idx = (self.shader_idx + 1) % len(SHADER_LIST)
                     self._sync_settings_items()
                 elif event.key == pygame.K_ESCAPE:
@@ -3215,8 +3221,8 @@ class EmulatorMenu:
 class GameBoy:
     """The main emulator orchestrator class."""
     def __init__(self, rom_path=None, window_scale=4, fps_limit=59.73,
-                 volume=1.0, palette=PALETTE_DMG, smooth_scale=False,
-                 shader=None, bootrom_path=None):
+                 audio_enabled=True, volume=1.0, palette=PALETTE_DMG,
+                 smooth_scale=False, shader=None, bootrom_path=None):
         self.mmu = MMU()
         self.cpu = CPU(self.mmu)
         self.ppu = PPU(self.mmu)
@@ -3287,6 +3293,7 @@ class GameBoy:
         elif not rom_path:
             logging.warning("pygame not available — running headless is not useful without a ROM.")
 
+        self._audio_on = audio_enabled
         self._init_audio()
         self._set_volume(volume)
 
@@ -3296,7 +3303,7 @@ class GameBoy:
         self.audio_channel = None
         self._audio_refs = []
         self._audio_pending = deque(maxlen=16)
-        if not pygame:
+        if not pygame or not self._audio_on:
             return
         desired = (self.apu.SAMPLE_RATE, -16, 2)
         init_state = pygame.mixer.get_init()
