@@ -49,6 +49,6 @@ with open('fb.ppm', 'wb') as f:
     f.write(b'P6\n160 144\n255\n')
     for y in range(144):
         for x in range(160):
-            r, g, b = fb[y*160+x]
-            f.write(bytes([r, g, b]))
+            px = fb[y*160+x]
+            f.write(bytes([(px >> 16) & 0xFF, (px >> 8) & 0xFF, px & 0xFF]))
 print('Wrote fb.ppm')

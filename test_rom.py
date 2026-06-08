@@ -48,8 +48,8 @@ colors = {}
 for y in range(SCREEN_HEIGHT):
     for x in range(SCREEN_WIDTH):
         idx = y * SCREEN_WIDTH + x
-        r, g, b = fb[idx]
-        key = (r, g, b)
+        px = fb[idx]
+        key = ((px >> 16) & 0xFF, (px >> 8) & 0xFF, px & 0xFF)
         colors[key] = colors.get(key, 0) + 1
 
 print('Unique colors:', len(colors))

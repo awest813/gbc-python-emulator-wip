@@ -55,8 +55,12 @@ def check(name, cond):
 
 
 def as_rgb(px):
-    """Normalize list/tuple/numpy RGB values to a plain tuple."""
-    return px if isinstance(px, tuple) else (int(px[0]), int(px[1]), int(px[2]))
+    """Normalize tuple/numpy/packed-int RGB values to a plain (r, g, b) tuple."""
+    if isinstance(px, tuple):
+        return px
+    if isinstance(px, int):
+        return ((px >> 16) & 0xFF, (px >> 8) & 0xFF, px & 0xFF)
+    return (int(px[0]), int(px[1]), int(px[2]))
 
 
 def fb_px(fb, idx):
@@ -357,7 +361,7 @@ def test_dmg_sprite_rendering(ns):
     mem[0xFE03] = 0x10  # OBP1
     p._render_scanline(0, mem[0xFF40])
     obp1_shades = p._PALETTE_SHADES[mem[0xFF49]]
-    check("DMG OBJ uses OBP1", fb_px(p.framebuffer, 0) == p.shades[obp1_shades[3]])
+    check("DMG OBJ uses OBP1", fb_px(p.framebuffer, 0) == as_rgb(p.shades[obp1_shades[3]]))
 
 
 def test_apu_frame_sync(ns):

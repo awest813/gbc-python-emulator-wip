@@ -1578,9 +1578,14 @@ class PPU:
         self.scanline_dot = 0
         self.mode3_duration = 172
         self.mode = 2
-        self.framebuffer = [(255, 255, 255)] * (SCREEN_WIDTH * SCREEN_HEIGHT)
+        # The framebuffer stores one packed 24-bit colour per pixel
+        # ((r << 16) | (g << 8) | b).  A single packed int per pixel keeps the
+        # hot scanline writers at one assignment per pixel (same as RGB tuples)
+        # while letting the display path convert the whole frame to a numpy
+        # surface with a vectorised unpack instead of iterating 23 040 tuples.
+        self.framebuffer = [0xFFFFFF] * (SCREEN_WIDTH * SCREEN_HEIGHT)
         self.bg_palette_idx = bytearray(SCREEN_WIDTH * SCREEN_HEIGHT)
-        self.shades = list(PALETTE_DMG)
+        self.shades = [(r << 16) | (g << 8) | b for (r, g, b) in PALETTE_DMG]
         self._rebuild_dmg_lut()
         self.is_cgb = False
         self.bg_palette_data = bytearray(64)
@@ -1591,18 +1596,18 @@ class PPU:
         self.prev_stat_irq = False
         self.lcd_was_on = False
         self.window_line_counter = 0
-        self._bg_rgb = [(0, 0, 0)] * 32
-        self._obj_rgb = [(0, 0, 0)] * 32
+        self._bg_rgb = [0] * 32
+        self._obj_rgb = [0] * 32
         unsigned_addrs = tuple(0x8000 + i * 16 for i in range(256))
         signed_addrs = tuple(0x9000 + ((i if i < 128 else i - 256) << 4) for i in range(256))
         self._tile_base_addrs = (unsigned_addrs, signed_addrs)
 
     def set_palette(self, palette):
-        self.shades = list(palette)
+        self.shades = [(r << 16) | (g << 8) | b for (r, g, b) in palette]
         self._rebuild_dmg_lut()
 
     def _rebuild_dmg_lut(self):
-        """Pre-map BGP/OBP register values to RGB tuples for the active DMG palette."""
+        """Pre-map BGP/OBP register values to packed colours for the active DMG palette."""
         shades = self.shades
         self._dmg_bgp_rgb = tuple(
             tuple(shades[self._PALETTE_SHADES[bgp][c]] for c in range(4))
@@ -1624,13 +1629,13 @@ class PPU:
         off = color_idx * 2
         r, g, b = self._cgb_rgb555_to_rgb888(self.bg_palette_data[off],
                                               self.bg_palette_data[off + 1])
-        self._bg_rgb[color_idx] = (r, g, b)
+        self._bg_rgb[color_idx] = (r << 16) | (g << 8) | b
 
     def _update_cgb_obj_color(self, color_idx):
         off = color_idx * 2
         r, g, b = self._cgb_rgb555_to_rgb888(self.obj_palette_data[off],
                                               self.obj_palette_data[off + 1])
-        self._obj_rgb[color_idx] = (r, g, b)
+        self._obj_rgb[color_idx] = (r << 16) | (g << 8) | b
 
     def _cgb_init_palettes(self):
         dm = [0xFFFF, 0xAD55, 0x52AA, 0x0000]
@@ -3924,9 +3929,15 @@ class GameBoy:
     def render(self):
         """Draws the PPU framebuffer to the Pygame screen."""
         if np is not None:
-            np.copyto(self._frame_np, np.asarray(self.ppu.framebuffer, dtype=np.uint8).reshape(
-                SCREEN_HEIGHT, SCREEN_WIDTH, 3))
-            arr = self._frame_np
+            # framebuffer holds packed 24-bit colours; unpack the whole frame
+            # into the persistent (H, W, 3) uint8 buffer with vectorised shifts.
+            packed = np.asarray(self.ppu.framebuffer, dtype=np.uint32).reshape(
+                SCREEN_HEIGHT, SCREEN_WIDTH)
+            fnp = self._frame_np
+            fnp[:, :, 0] = (packed >> 16) & 0xFF
+            fnp[:, :, 1] = (packed >> 8) & 0xFF
+            fnp[:, :, 2] = packed & 0xFF
+            arr = fnp
             if self.shader is _shader_lcd_ghost:
                 arr = self.shader(arr, prev=self._prev_shader_frame)
                 self._prev_shader_frame = arr.copy()
@@ -3939,8 +3950,7 @@ class GameBoy:
             pxa = pygame.PixelArray(surf)
             fb = self.ppu.framebuffer
             for i in range(SCREEN_HEIGHT * SCREEN_WIDTH):
-                r, g, b = fb[i]
-                pxa[i % SCREEN_WIDTH, i // SCREEN_WIDTH] = (r << 16) | (g << 8) | b
+                pxa[i % SCREEN_WIDTH, i // SCREEN_WIDTH] = fb[i]
             pxa.close()
         target_size = self.screen.get_size()
         if target_size == (SCREEN_WIDTH, SCREEN_HEIGHT):
