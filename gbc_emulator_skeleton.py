@@ -1545,7 +1545,7 @@ class PPU:
     """Picture Processing Unit with background rendering."""
     _TILE_COLORS = tuple(
         tuple((((hi >> p) & 1) << 1 | ((lo >> p) & 1) for p in range(7, -1, -1)))
-        for lo in range(256) for hi in range(256)
+        for hi in range(256) for lo in range(256)
     )
     _PALETTE_SHADES = tuple(
         tuple((bgp >> (c << 1)) & 0x03 for c in range(4))
@@ -2092,7 +2092,8 @@ class PPU:
             sprites.append((spr_x, spr_y, tile, flags))
             if len(sprites) >= 10:
                 break
-        if not self.is_cgb:
+        # CGB: OAM index priority (OPRI=0). DMG / CGB with OPRI=1: sort by X.
+        if not self.is_cgb or self.cgb_opri:
             sprites.sort(key=lambda s: s[0])
         obp0 = mem[0xFF48]
         obp1 = mem[0xFF49]
