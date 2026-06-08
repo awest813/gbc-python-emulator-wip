@@ -1435,15 +1435,22 @@ class MMU:
 
     def _handle_mbc_write(self, address, value):
         mbc = self.mbc_type
+        if mbc in (0x05, 0x06):
+            if address & 0x0100:
+                bank = value & 0x0F
+                if bank == 0:
+                    bank = 1
+                self.rom_bank = bank
+                self._remap_rom_bank()
+            else:
+                self.ram_enabled = (value & 0x0F) == 0x0A
+            return
         if 0x2000 <= address <= 0x2FFF:
             if mbc in (0x01, 0x02, 0x03):
                 bank = value & 0x1F
                 if bank == 0:
                     bank = 1
                 self.rom_bank = (self.rom_bank & 0x60) | bank
-                self._remap_rom_bank()
-            elif mbc in (0x05, 0x06):
-                self.rom_bank = value & 0x0F
                 self._remap_rom_bank()
             elif mbc in (0x0F, 0x10, 0x11, 0x12, 0x13):
                 bank = value & 0x7F
@@ -1481,10 +1488,7 @@ class MMU:
                 self._rtc_latch()
             self.rtc_latch_state = value
         elif 0x0000 <= address <= 0x1FFF:
-            if mbc in (0x05, 0x06):
-                self.ram_enabled = (value & 0x0F) == 0x0A
-            else:
-                self.ram_enabled = (value & 0x0F) == 0x0A
+            self.ram_enabled = (value & 0x0F) == 0x0A
 
     # ===== MBC3 RTC =====
     def _rtc_update(self):
@@ -2257,12 +2261,15 @@ class Timers:
             return
         overflows = tima_accum // step_cyc
         self.tima_accum = tima_accum - overflows * step_cyc
-        tima = mem[0xFF05] + overflows
-        if tima > 0xFF:
-            mem[0xFF05] = mem[0xFF06]
-            mem[0xFF0F] |= 0x04
-        else:
-            mem[0xFF05] = tima
+        tima = mem[0xFF05]
+        tma = mem[0xFF06]
+        for _ in range(overflows):
+            if tima > 0xFF - 1:
+                mem[0xFF0F] |= 0x04
+                tima = tma
+            else:
+                tima += 1
+        mem[0xFF05] = tima & 0xFF
 
 
 # ── Audio Processing Unit ───────────────────────────────────────────
@@ -3714,8 +3721,7 @@ class GameBoy:
             apu.vol_left = ap[ai] & 0x07; apu.vol_right = ap[ai+1] & 0x07; ai += 2
             apu.pan_left = ap[ai]; apu.pan_right = ap[ai+1]; ai += 2
             apu.sample_accum = ap[ai] | (ap[ai+1] << 8); ai += 2
-            _loaded_sample_num = ap[ai] | (ap[ai+1] << 8); ai += 2
-            _loaded_sample_den = ap[ai] | (ap[ai+1] << 8); ai += 2
+            ai += 4  # sample_num and sample_den (constants, skip)
             apu.sample_num = apu.CPU_CLOCK
             apu.sample_den = apu.SAMPLE_RATE
             # Channel 1
@@ -3832,7 +3838,10 @@ class GameBoy:
             target = self._av_start + self._sync_frames / self.fps_limit
         delay = target - now
         if delay > 0:
-            time.sleep(delay)
+            time.sleep(min(delay, 1.0 / 30))
+        elif delay < -0.5:
+            self._av_start = now - (self._sync_frames / self.fps_limit if self.fps_limit > 0 else 0)
+            self._sync_samples = 0
 
     def step_all(self):
         """Execute one CPU step and propagate cycles to PPU, timers, and APU in a
