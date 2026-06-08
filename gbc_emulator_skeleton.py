@@ -2880,6 +2880,25 @@ class APU:
         del self.buffer[:]
         return data
 
+    def peek_samples_for_cycles(self, cycles):
+        """Return how many stereo samples *cycles* base-clock dots would emit."""
+        accum = self.sample_accum + cycles * self.sample_den
+        sn = self.sample_num
+        count = 0
+        while accum >= sn:
+            accum -= sn
+            count += 1
+        return count
+
+
+# Each emulated video frame is CYCLES_PER_FRAME base-clock dots.  At 44.1 kHz the
+# fractional sample timer alternates 738 and 739 stereo samples per frame.
+APU_BYTES_PER_STEREO_SAMPLE = 4
+APU_MIN_SAMPLES_PER_FRAME = (CYCLES_PER_FRAME * APU.SAMPLE_RATE) // APU.CPU_CLOCK
+APU_MAX_SAMPLES_PER_FRAME = APU_MIN_SAMPLES_PER_FRAME + (
+    1 if (CYCLES_PER_FRAME * APU.SAMPLE_RATE) % APU.CPU_CLOCK else 0
+)
+
 
 # ── Menu system ──────────────────────────────────────────────────────
 
@@ -3276,6 +3295,7 @@ class GameBoy:
         self.audio_enabled = False
         self.audio_channel = None
         self._audio_refs = []
+        self._audio_pending = deque(maxlen=16)
         if not pygame:
             return
         desired = (self.apu.SAMPLE_RATE, -16, 2)
@@ -3708,33 +3728,65 @@ class GameBoy:
             pos += 8
             timers.div_counter = div_counter
             timers.tima_accum = tima_accum
+            apu.drain()
+            if hasattr(self, '_audio_pending'):
+                self._audio_pending.clear()
+            self._av_start = time.perf_counter()
+            self._sync_samples = 0
+            self._sync_frames = 0
             logging.info(f"Loaded state from slot {slot}: {os.path.basename(path)}")
             return True
         except (OSError, struct.error) as e:
             logging.warning(f"Could not load state: {e}")
             return False
 
-    def _flush_audio(self):
-        """Push one frame's worth of PCM to the mixer; drop on backpressure."""
+    def _pump_audio(self):
+        """Feed the mixer from the pending-audio deque (channel + one queue slot)."""
         if not self.audio_enabled:
-            self.apu.drain()
             return
+        ch = self.audio_channel
+        while self._audio_pending:
+            if not ch.get_busy():
+                ch.play(self._audio_pending.popleft())
+            elif ch.get_queue() is None:
+                ch.queue(self._audio_pending.popleft())
+                break
+            else:
+                break
+
+    def _flush_audio(self):
+        """Push one frame's worth of PCM to the mixer; return stereo sample count."""
         data = self.apu.drain()
-        if len(data) < 4 or len(data) & 3:
-            return
+        n_samples = len(data) // APU_BYTES_PER_STEREO_SAMPLE
+        if not self.audio_enabled:
+            return n_samples
+        if len(data) < APU_BYTES_PER_STEREO_SAMPLE or len(data) & 3:
+            return 0
         try:
             sound = pygame.mixer.Sound(buffer=data)
         except (pygame.error, TypeError):
+            return 0
+        self._audio_pending.append(sound)
+        self._audio_refs.append(sound)
+        if len(self._audio_refs) > 8:
+            self._audio_refs = self._audio_refs[-4:]
+        self._pump_audio()
+        return n_samples
+
+    def _pace_frame(self, samples_this_frame):
+        """Sleep so wall-clock time tracks emulated audio (or frame count when silent)."""
+        if self.fps_limit <= 0:
             return
-        ch = self.audio_channel
-        if not ch.get_busy():
-            ch.play(sound)
-            self._audio_refs = [sound]
-        elif ch.get_queue() is None:
-            ch.queue(sound)
-            self._audio_refs.append(sound)
-            if len(self._audio_refs) > 4:
-                self._audio_refs = self._audio_refs[-2:]
+        now = time.perf_counter()
+        if self.audio_enabled and samples_this_frame > 0:
+            self._sync_samples += samples_this_frame
+            target = self._av_start + self._sync_samples / self.apu.SAMPLE_RATE
+        else:
+            self._sync_frames += 1
+            target = self._av_start + self._sync_frames / self.fps_limit
+        delay = target - now
+        if delay > 0:
+            time.sleep(delay)
 
     def step_all(self):
         """Execute one CPU step and propagate cycles to PPU, timers, and APU in a
@@ -3770,24 +3822,22 @@ class GameBoy:
     def run(self):
         """Main execution loop.  Returns to caller when user presses Escape or closes window."""
         self.running = True
-        clock = time.time()
+        self._av_start = time.perf_counter()
+        self._sync_samples = 0
+        self._sync_frames = 0
 
         while self.running:
             cycles_this_frame = 0
             while cycles_this_frame < CYCLES_PER_FRAME:
                 cycles_this_frame += self.step_all()
 
+            samples_this_frame = 0
             if pygame:
                 self.handle_events()
                 self.render()
-                self._flush_audio()
+                samples_this_frame = self._flush_audio()
 
-            if self.fps_limit > 0:
-                elapsed = time.time() - clock
-                target_time = 1.0 / self.fps_limit
-                if elapsed < target_time:
-                    time.sleep(target_time - elapsed)
-            clock = time.time()
+            self._pace_frame(samples_this_frame)
 
         self._save_sav()
 

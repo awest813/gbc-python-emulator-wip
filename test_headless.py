@@ -350,6 +350,86 @@ def test_dmg_sprite_rendering(ns):
     check("DMG OBJ uses OBP1", p.framebuffer[0] == p.shades[obp1_shades[3]])
 
 
+def test_apu_frame_sync(ns):
+    """APU sample output and frame sequencer must track one video frame of dots."""
+    MMU, APU = ns["MMU"], ns["APU"]
+    CYCLES_PER_FRAME = ns["CYCLES_PER_FRAME"]
+    APU_MIN_SAMPLES_PER_FRAME = ns["APU_MIN_SAMPLES_PER_FRAME"]
+    APU_MAX_SAMPLES_PER_FRAME = ns["APU_MAX_SAMPLES_PER_FRAME"]
+    APU_BYTES_PER_STEREO_SAMPLE = ns["APU_BYTES_PER_STEREO_SAMPLE"]
+
+    m = MMU()
+    apu = APU(m)
+
+    peek = apu.peek_samples_for_cycles(CYCLES_PER_FRAME)
+    check(
+        f"one frame emits {APU_MIN_SAMPLES_PER_FRAME}-{APU_MAX_SAMPLES_PER_FRAME} samples (peek {peek})",
+        APU_MIN_SAMPLES_PER_FRAME <= peek <= APU_MAX_SAMPLES_PER_FRAME,
+    )
+
+    before = len(apu.buffer)
+    apu.step(CYCLES_PER_FRAME)
+    produced = (len(apu.buffer) - before) // APU_BYTES_PER_STEREO_SAMPLE
+    check(
+        f"one frame step matches peek ({produced} samples)",
+        produced == peek,
+    )
+
+    apu.buffer.clear()
+    apu.sample_accum = 0
+    expected = apu.peek_samples_for_cycles(CYCLES_PER_FRAME * 100)
+    total = 0
+    for _ in range(100):
+        apu.step(CYCLES_PER_FRAME)
+        total += len(apu.drain()) // APU_BYTES_PER_STEREO_SAMPLE
+    check(
+        f"100 frames total samples ({total} vs expected {expected})",
+        total == expected,
+    )
+
+    apu.frame_seq_counter = apu.FRAME_SEQ_PERIOD
+    apu.frame_seq_step = 0
+    ticks = 0
+    fsc = apu.frame_seq_counter
+    fsc -= CYCLES_PER_FRAME
+    while fsc <= 0:
+        fsc += apu.FRAME_SEQ_PERIOD
+        ticks += 1
+    check("frame sequencer ticks per video frame (8-9)", 8 <= ticks <= 9)
+
+
+def test_gameboy_frame_audio(ns):
+    """GameBoy.step_all for one frame must produce the same PCM size as the APU."""
+    GameBoy = ns["GameBoy"]
+    CYCLES_PER_FRAME = ns["CYCLES_PER_FRAME"]
+    APU_MIN_SAMPLES_PER_FRAME = ns["APU_MIN_SAMPLES_PER_FRAME"]
+    APU_MAX_SAMPLES_PER_FRAME = ns["APU_MAX_SAMPLES_PER_FRAME"]
+    APU_BYTES_PER_STEREO_SAMPLE = ns["APU_BYTES_PER_STEREO_SAMPLE"]
+
+    rom = build_rom()
+    with tempfile.NamedTemporaryFile(suffix=".gbc", delete=False) as tf:
+        tf.write(rom)
+        path = tf.name
+    try:
+        gb = GameBoy(path, fps_limit=0)
+        gb.cpu.reg.pc = 0x0100
+        gb.apu.buffer.clear()
+        gb.apu.sample_accum = 0
+        cycles = 0
+        while cycles < CYCLES_PER_FRAME:
+            cycles += gb.step_all()
+        check("step_all covers at least one frame of dots", cycles >= CYCLES_PER_FRAME)
+        n_bytes = len(gb.apu.buffer)
+        n_samples = n_bytes // APU_BYTES_PER_STEREO_SAMPLE
+        check(
+            f"frame buffer is {APU_MIN_SAMPLES_PER_FRAME}-{APU_MAX_SAMPLES_PER_FRAME} samples ({n_samples})",
+            APU_MIN_SAMPLES_PER_FRAME <= n_samples <= APU_MAX_SAMPLES_PER_FRAME,
+        )
+        check("frame buffer is sample-aligned", n_bytes % APU_BYTES_PER_STEREO_SAMPLE == 0)
+    finally:
+        os.unlink(path)
+
+
 def test_double_speed(ns):
     """KEY1 double-speed must halve the base-clock dots fed to the PPU/APU."""
     GameBoy = ns["GameBoy"]
@@ -377,6 +457,8 @@ def main():
     print("full-machine run:");        test_run(ns)
     print("cgb sprite rendering:");  test_cgb_sprite_rendering(ns)
     print("dmg sprite rendering:");  test_dmg_sprite_rendering(ns)
+    print("apu frame sync:");          test_apu_frame_sync(ns)
+    print("gameboy frame audio:");     test_gameboy_frame_audio(ns)
     print("double-speed timing:");     test_double_speed(ns)
     print("\nALL CHECKS PASSED")
 
