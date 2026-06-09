@@ -104,7 +104,7 @@ python gbc_emulator_skeleton.py path/to/rom.gb --nomenu
 | X              | B             |
 | Right Shift    | Select        |
 | Enter          | Start         |
-| Escape         | Menu / Quit   |
+| Escape         | Pause menu (in game) / Back |
 | F5 (in menu)   | Refresh ROMs  |
 | F6 / F8        | Save state (slot 0 / 1) |
 | F7 / F9        | Load state (slot 0 / 1) |
@@ -120,7 +120,20 @@ python gbc_emulator_skeleton.py path/to/rom.gb --nomenu
   - *Palette* — DMG Green / Grayscale / Amber / Blue / Brown / Pastel
   - *Filter* — Nearest (pixel-sharp) / Smooth (bilinear)
   - *Shader* — Off / LCD Ghost / CRT Scanlines / Gamma Warm / Pixel Bloom / Pocket Green
-- **Exit to OS** — Quit the emulator.
+- **Exit to OS** — Quit the emulator (with a confirmation prompt).
+
+## Pause menu
+
+Press **Escape** while a game is running to open the in-game pause menu.
+Emulation and audio halt, and the current frame is dimmed behind the menu:
+
+- **Resume** — Return to the game (Escape also resumes).
+- **Save State** / **Load State** — Quick-save or restore slot 0.
+- **Settings** — The same options as the main settings page, applied
+  **live** to the running game (palette, shader, filter, volume, audio,
+  frame rate, and window scale all update immediately).
+- **Exit to Menu** — Return to the main menu, with a confirmation prompt.
+  Your battery save (`.sav`) is written out on the way back.
 
 Place ROM files in a `roms/` folder next to the emulator script, or
 anywhere in the current / parent directory — the scanner walks the

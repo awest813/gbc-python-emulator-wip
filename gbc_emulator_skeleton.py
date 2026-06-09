@@ -108,6 +108,15 @@ FPS_LIMIT_OPTIONS = [("59.7 fps", 59.73), ("60 fps", 60.0), ("Unlimited", 0)]
 AUDIO_OPTIONS = [("On", True), ("Off", False)]
 VOLUME_OPTIONS = [("Mute", 0.0), ("Low", 0.25), ("Medium", 0.5), ("High", 0.75), ("Max", 1.0)]
 FILTER_OPTIONS = [("Nearest", False), ("Smooth", True)]
+WINDOW_SCALE_OPTIONS = [2, 3, 4, 5]
+
+
+def _opt_index(options, value, default=0):
+    """Return the index in a (label, value) option list whose value matches, else default."""
+    for i, opt in enumerate(options):
+        if opt[1] == value:
+            return i
+    return default
 
 # Flag bit positions in the F register
 FLAG_Z = 7  # Zero flag
@@ -1152,8 +1161,13 @@ class MMU:
                     return 0xFF
                 if self.ppu is not None and self.ppu.mode >= 2:
                     return 0xFF
+            elif address < 0xFF00:
+                return 0xFF  # 0xFEA0-0xFEFF is unusable; reads back as 0xFF on DMG
             if address == 0xFF00:
                 return self._read_joypad()
+            if address == 0xFF0F:
+                # IF: only bits 0-4 are implemented; the top 3 read back as 1.
+                return self.memory[0xFF0F] | 0xE0
             if address == 0xFF01:
                 return self.serial_data
             if address == 0xFF02:
@@ -1602,6 +1616,9 @@ class PPU:
         self.prev_stat_irq = False
         self.lcd_was_on = False
         self.window_line_counter = 0
+        # Latched once LY==WY occurs in a frame; the window then stays active for
+        # the rest of the frame even if WY is changed, matching hardware.
+        self.window_active = False
         self._bg_rgb = [0] * 32
         self._obj_rgb = [0] * 32
         unsigned_addrs = tuple(0x8000 + i * 16 for i in range(256))
@@ -1687,6 +1704,7 @@ class PPU:
                 self.mode = 0
                 self.scanline_dot = 0
                 self.window_line_counter = 0
+                self.window_active = False
                 self.prev_stat_irq = False
                 stat = mem[0xFF41] & 0xF8
                 mem[0xFF41] = stat
@@ -1772,6 +1790,10 @@ class PPU:
         self.mode = 3
         stat = (mem[0xFF41] & 0xFC) | 3
         mem[0xFF41] = stat
+        # Mode 3 has no STAT source, so the interrupt line drops here. Re-evaluate
+        # it (unless LY=LYC holds) so the rising edge into mode 0 fires the HBlank
+        # STAT interrupt even when the mode-2 OAM source was also enabled.
+        self._fire_stat_irq(stat)
 
     def _finish_scanline(self):
         mem = self.mmu.memory
@@ -1780,6 +1802,7 @@ class PPU:
         if new_ly == 154:
             new_ly = 0
             self.window_line_counter = 0
+            self.window_active = False
         mem[0xFF44] = new_ly
 
     def _update_stat_mode(self, mode):
@@ -1826,8 +1849,9 @@ class PPU:
         fb_row = ly * SCREEN_WIDTH
 
         if not bg_enabled:
-            # DMG: BG/Window off - clear scanline to white, render sprites only.
-            white = self.shades[0]
+            # DMG: BG/Window off - the background outputs colour 0 through BGP
+            # (usually white, but BGP can remap it), then sprites draw on top.
+            white = self._dmg_bgp_rgb[mem[0xFF47]][0]
             fb = self.framebuffer
             bg_pri = self.bg_palette_idx
             for i in range(SCREEN_WIDTH):
@@ -1983,10 +2007,13 @@ class PPU:
                         fb[fb_row + x] = dmg_rgb[c]
                         bg_pri[fb_row + x] = c
 
-        if lcdc & 0x20:
-            wy = mem[0xFF4A]
+        # The window's WY==LY trigger latches for the whole frame; once latched the
+        # window keeps rendering even if WY is later moved past the current line.
+        if ly == mem[0xFF4A]:
+            self.window_active = True
+        if (lcdc & 0x20) and self.window_active:
             wx_raw = mem[0xFF4B]
-            if ly >= wy and (wx_raw - 7) < SCREEN_WIDTH:
+            if (wx_raw - 7) < SCREEN_WIDTH:
                 self._render_window(ly)
                 self.window_line_counter += 1
         if lcdc & 0x02:
@@ -2575,12 +2602,8 @@ class APU:
         mem = self.mmu.memory
         if 0xFF30 <= addr <= 0xFF3F:
             return self.wave_ram[addr - 0xFF30]
-        if addr == 0xFF12:
-            return (self.ch1_volume << 4) | (mem[0xFF12] & 0x0F)
-        if addr == 0xFF17:
-            return (self.ch2_volume << 4) | (mem[0xFF17] & 0x0F)
-        if addr == 0xFF21:
-            return (self.ch4_volume << 4) | (mem[0xFF21] & 0x0F)
+        # NRx2 (envelope) registers read back the last written value, not the live
+        # envelope volume — the running volume is internal and not exposed.
         if addr == 0xFF14:
             return mem[0xFF14] & 0xBF | (0x40 if self.ch1_length_enabled else 0)
         if addr == 0xFF19:
@@ -2818,11 +2841,12 @@ class APU:
                 width = self.ch4_width_mode
                 for _ in range(advances):
                     bit = (lfsr & 1) ^ ((lfsr >> 1) & 1)
+                    # The LFSR is always 15 bits wide; the feedback bit goes to bit
+                    # 14. In width ("7-bit") mode it is ALSO copied into bit 6, which
+                    # shortens the period without discarding the upper state.
+                    lfsr = (lfsr >> 1) | (bit << 14)
                     if width:
-                        # 7-bit mode: shift within low 7 bits, new bit at 6
-                        lfsr = ((lfsr >> 1) & 0x3F) | (bit << 6)
-                    else:
-                        lfsr = (lfsr >> 1) | (bit << 14)
+                        lfsr = (lfsr & ~(1 << 6)) | (bit << 6)
                 self.ch4_lfsr = lfsr
                 t = period - ((-t) % period)
             self.ch4_freq_timer = t
@@ -2959,6 +2983,7 @@ class EmulatorMenu:
         self.max_visible = 12
         self.settings_items = ["Window Scale: 4x"]
         self.settings_cursor = 0
+        self.exit_cursor = 0
         self.window_scale = 4
         self.fps_limit_idx = 0
         self.audio_idx = 0
@@ -3075,6 +3100,8 @@ class EmulatorMenu:
                 self._render_load_rom()
             elif page == "settings":
                 self._render_settings()
+            elif page == "confirm_exit":
+                self._render_confirm_exit()
             if self.status_ttl:
                 self._centre_text(self.status_line, MENU_H - 28, MENU_DIM, 18)
             pygame.display.flip()
@@ -3130,11 +3157,11 @@ class EmulatorMenu:
                         self.settings_cursor = 0
                         return "settings"
                     elif self.selected == 2:
-                        pygame.quit()
-                        sys.exit()
+                        self.exit_cursor = 0
+                        return "confirm_exit"
                 elif event.key == pygame.K_ESCAPE:
-                    pygame.quit()
-                    sys.exit()
+                    self.exit_cursor = 0
+                    return "confirm_exit"
             elif page == "load_rom":
                 if event.key == pygame.K_UP:
                     if self.rom_cursor > 0:
@@ -3208,6 +3235,18 @@ class EmulatorMenu:
                 elif event.key == pygame.K_ESCAPE:
                     self.selected = 1
                     return "main"
+            elif page == "confirm_exit":
+                if event.key in (pygame.K_UP, pygame.K_DOWN, pygame.K_LEFT, pygame.K_RIGHT):
+                    self.exit_cursor ^= 1
+                elif event.key == pygame.K_RETURN:
+                    if self.exit_cursor == 1:
+                        pygame.quit()
+                        sys.exit()
+                    self.selected = 0
+                    return "main"
+                elif event.key == pygame.K_ESCAPE:
+                    self.selected = 0
+                    return "main"
         return page
 
     def _render_main(self):
@@ -3254,6 +3293,13 @@ class EmulatorMenu:
         self._centre_text("Settings", 40, MENU_HI, 36)
         self._draw_menu(self.settings_items, self.settings_cursor, 120, 45)
         self._centre_text("Enter: Cycle  |  Esc: Back", MENU_H - 30, MENU_DIM, 18)
+
+    def _render_confirm_exit(self):
+        self._centre_text("Exit Emulator?", 130, MENU_HI, 40)
+        self._centre_text("Are you sure you want to quit to the OS?", 195, MENU_DIM, 22)
+        self._draw_menu(["Keep Playing", "Exit to OS"], self.exit_cursor, 270, 50)
+        self._centre_text("Arrow Keys: Choose  |  Enter: Select  |  Esc: Cancel",
+                          MENU_H - 30, MENU_DIM, 18)
 
 
 class GameBoy:
@@ -3342,6 +3388,24 @@ class GameBoy:
         self._audio_on = audio_enabled
         self._init_audio()
         self._set_volume(volume)
+
+        # In-game pause menu state. Selection indices mirror the global option
+        # lists so the pause "Settings" page can cycle them and apply changes live.
+        self.paused = False
+        self.pause_cursor = 0
+        self.pause_settings_cursor = 0
+        self.pause_exit_cursor = 0
+        self._pause_msg = ""
+        self._pause_msg_ttl = 0
+        self._set_idx = {
+            'scale':   _opt_index([(s, s) for s in WINDOW_SCALE_OPTIONS], window_scale, 2),
+            'fps':     _opt_index(FPS_LIMIT_OPTIONS, fps_limit, 0),
+            'audio':   0 if audio_enabled else 1,
+            'volume':  _opt_index(VOLUME_OPTIONS, volume, 4),
+            'palette': _opt_index(PALETTE_LIST, palette, 0),
+            'filter':  _opt_index(FILTER_OPTIONS, smooth_scale, 0),
+            'shader':  _opt_index(SHADER_LIST, self.shader, 0),
+        }
 
     def _init_audio(self):
         """Bring up the SDL audio mixer at the APU's sample rate (signed 16-bit stereo)."""
@@ -3878,8 +3942,10 @@ class GameBoy:
         return dot_cycles
 
     def run(self):
-        """Main execution loop.  Returns to caller when user presses Escape or closes window."""
+        """Main execution loop.  Returns to caller when the user exits to the menu
+        (via the pause menu) or closes the window."""
         self.running = True
+        self.paused = False
         self._av_start = time.perf_counter()
         self._sync_samples = 0
         self._sync_frames = 0
@@ -3895,6 +3961,10 @@ class GameBoy:
                 self.render()
                 samples_this_frame = self._flush_audio()
 
+            if self.paused and pygame:
+                self._pause_menu_loop()
+                continue
+
             self._pace_frame(samples_this_frame)
 
         self._save_sav()
@@ -3906,7 +3976,8 @@ class GameBoy:
                 self.running = False
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_ESCAPE:
-                    self.running = False
+                    self._open_pause_menu()
+                    return
                 elif event.key == pygame.K_F6:
                     if self.save_state(0):
                         self._status_msg = "State saved to slot 0"
@@ -3936,6 +4007,231 @@ class GameBoy:
             elif event.type == pygame.KEYUP:
                 if event.key in KEY_TO_JOYPAD_BIT:
                     self.mmu.set_joypad_button(KEY_TO_JOYPAD_BIT[event.key], False)
+
+    # ── In-game pause menu ────────────────────────────────────────────
+    PAUSE_ITEMS = ["Resume", "Save State", "Load State", "Settings", "Exit to Menu"]
+
+    def _open_pause_menu(self):
+        """Enter the paused state; the main loop hands control to _pause_menu_loop."""
+        self.paused = True
+        self.pause_cursor = 0
+        self.pause_settings_cursor = 0
+        self.pause_exit_cursor = 0
+
+    def _pause_status(self, msg):
+        self._pause_msg = msg
+        self._pause_msg_ttl = 120
+
+    def _pause_settings_items(self):
+        si = self._set_idx
+        return [
+            f"Window Scale: {WINDOW_SCALE_OPTIONS[si['scale']]}x",
+            f"Frame Rate: {FPS_LIMIT_OPTIONS[si['fps']][0]}",
+            f"Audio: {AUDIO_OPTIONS[si['audio']][0]}",
+            f"Volume: {VOLUME_OPTIONS[si['volume']][0]}",
+            f"Palette: {PALETTE_LIST[si['palette']][0]}",
+            f"Filter: {FILTER_OPTIONS[si['filter']][0]}",
+            f"Shader: {SHADER_LIST[si['shader']][0]}",
+        ]
+
+    def _cycle_pause_setting(self, cursor):
+        """Advance the setting under the cursor and apply it to the live emulator.
+        Returns True if the window was resized (so the backdrop must be recaptured)."""
+        si = self._set_idx
+        resized = False
+        if cursor == 0:
+            si['scale'] = (si['scale'] + 1) % len(WINDOW_SCALE_OPTIONS)
+            self.window_scale = WINDOW_SCALE_OPTIONS[si['scale']]
+            self.screen = pygame.display.set_mode(
+                (SCREEN_WIDTH * self.window_scale, SCREEN_HEIGHT * self.window_scale))
+            resized = True
+        elif cursor == 1:
+            si['fps'] = (si['fps'] + 1) % len(FPS_LIMIT_OPTIONS)
+            self.fps_limit = FPS_LIMIT_OPTIONS[si['fps']][1]
+        elif cursor == 2:
+            si['audio'] = (si['audio'] + 1) % len(AUDIO_OPTIONS)
+            self._audio_on = AUDIO_OPTIONS[si['audio']][1]
+            if self._audio_on:
+                self._init_audio()
+                self._set_volume(VOLUME_OPTIONS[si['volume']][1])
+            else:
+                if self.audio_channel is not None:
+                    try:
+                        self.audio_channel.stop()
+                    except pygame.error:
+                        pass
+                self.audio_enabled = False
+        elif cursor == 3:
+            si['volume'] = (si['volume'] + 1) % len(VOLUME_OPTIONS)
+            self._set_volume(VOLUME_OPTIONS[si['volume']][1])
+        elif cursor == 4:
+            si['palette'] = (si['palette'] + 1) % len(PALETTE_LIST)
+            self.ppu.set_palette(PALETTE_LIST[si['palette']][1])
+        elif cursor == 5:
+            si['filter'] = (si['filter'] + 1) % len(FILTER_OPTIONS)
+            self.smooth_scale = FILTER_OPTIONS[si['filter']][1]
+        elif cursor == 6:
+            si['shader'] = (si['shader'] + 1) % len(SHADER_LIST)
+            self.shader = SHADER_LIST[si['shader']][1]
+            self._prev_shader_frame = None
+        return resized
+
+    def _capture_pause_backdrop(self):
+        """Render the current frame, then return a dimmed copy to sit behind the menu."""
+        self.render()
+        backdrop = self.screen.copy()
+        veil = pygame.Surface(backdrop.get_size())
+        veil.fill((0, 0, 0))
+        veil.set_alpha(160)
+        backdrop.blit(veil, (0, 0))
+        return backdrop
+
+    def _pause_menu_loop(self):
+        """Blocking loop that runs while the game is paused. Halts emulation and
+        audio, shows the overlay menu, and returns once the player resumes or exits."""
+        # Release every joypad button so the game doesn't see a stuck input.
+        self.mmu.joypad_buttons = 0xFF
+        if self.audio_channel is not None:
+            try:
+                self.audio_channel.stop()
+            except pygame.error:
+                pass
+        self._audio_pending.clear()
+        self.apu.drain()
+        pygame.event.clear()
+
+        backdrop = self._capture_pause_backdrop()
+        clock = pygame.time.Clock()
+        page = "pause"
+        while self.paused and self.running:
+            page, backdrop = self._handle_pause_events(page, backdrop)
+            if not self.paused or not self.running:
+                break
+            if self._pause_msg_ttl > 0:
+                self._pause_msg_ttl -= 1
+            self._render_pause_page(page, backdrop)
+            clock.tick(30)
+
+        # Resume cleanly: re-sync held keys to the joypad and reset the A/V clock
+        # so frame pacing doesn't try to "catch up" on the paused wall-clock time.
+        if self.running:
+            pressed = pygame.key.get_pressed()
+            for key, bit in KEY_TO_JOYPAD_BIT.items():
+                self.mmu.set_joypad_button(bit, bool(pressed[key]))
+        pygame.event.clear()
+        self._av_start = time.perf_counter()
+        self._sync_samples = 0
+        self._sync_frames = 0
+
+    def _handle_pause_events(self, page, backdrop):
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                self.running = False
+                self.paused = False
+                return page, backdrop
+            if event.type != pygame.KEYDOWN:
+                continue
+            if page == "pause":
+                if event.key == pygame.K_UP:
+                    self.pause_cursor = (self.pause_cursor - 1) % len(self.PAUSE_ITEMS)
+                elif event.key == pygame.K_DOWN:
+                    self.pause_cursor = (self.pause_cursor + 1) % len(self.PAUSE_ITEMS)
+                elif event.key == pygame.K_RETURN:
+                    page, backdrop = self._activate_pause_item(page, backdrop)
+                elif event.key == pygame.K_ESCAPE:
+                    self.paused = False
+            elif page == "settings":
+                items = self._pause_settings_items()
+                if event.key == pygame.K_UP:
+                    self.pause_settings_cursor = (self.pause_settings_cursor - 1) % len(items)
+                elif event.key == pygame.K_DOWN:
+                    self.pause_settings_cursor = (self.pause_settings_cursor + 1) % len(items)
+                elif event.key in (pygame.K_RETURN, pygame.K_LEFT, pygame.K_RIGHT):
+                    if self._cycle_pause_setting(self.pause_settings_cursor):
+                        backdrop = self._capture_pause_backdrop()
+                elif event.key == pygame.K_ESCAPE:
+                    page = "pause"
+            elif page == "confirm_exit":
+                if event.key in (pygame.K_UP, pygame.K_DOWN, pygame.K_LEFT, pygame.K_RIGHT):
+                    self.pause_exit_cursor ^= 1
+                elif event.key == pygame.K_RETURN:
+                    if self.pause_exit_cursor == 1:
+                        self.running = False
+                        self.paused = False
+                    else:
+                        page = "pause"
+                elif event.key == pygame.K_ESCAPE:
+                    page = "pause"
+        return page, backdrop
+
+    def _activate_pause_item(self, page, backdrop):
+        choice = self.PAUSE_ITEMS[self.pause_cursor]
+        if choice == "Resume":
+            self.paused = False
+        elif choice == "Save State":
+            ok = self.save_state(0)
+            self._pause_status("State saved to slot 0" if ok else "Failed to save state")
+        elif choice == "Load State":
+            if self.load_state(0):
+                self._pause_status("State loaded from slot 0")
+                backdrop = self._capture_pause_backdrop()
+            else:
+                self._pause_status("No save state in slot 0")
+        elif choice == "Settings":
+            self.pause_settings_cursor = 0
+            page = "settings"
+        elif choice == "Exit to Menu":
+            self.pause_exit_cursor = 0
+            page = "confirm_exit"
+        return page, backdrop
+
+    def _draw_overlay_menu(self, backdrop, title, items, cursor, hint):
+        self.screen.blit(backdrop, (0, 0))
+        w, h = self.screen.get_size()
+        panel_w = min(w - 40, 380)
+        panel_h = 70 + len(items) * 42
+        px = (w - panel_w) // 2
+        py = (h - panel_h) // 2
+        panel = pygame.Surface((panel_w, panel_h))
+        panel.fill(MENU_BG)
+        panel.set_alpha(238)
+        self.screen.blit(panel, (px, py))
+        pygame.draw.rect(self.screen, MENU_HI, (px, py, panel_w, panel_h), 2)
+
+        tf = pygame.font.Font(None, 38)
+        ts = tf.render(title, True, MENU_HI)
+        self.screen.blit(ts, (px + (panel_w - ts.get_width()) // 2, py + 16))
+
+        itf = pygame.font.Font(None, 30)
+        for i, item in enumerate(items):
+            colour = MENU_HI if i == cursor else MENU_FG
+            isf = itf.render(item, True, colour)
+            iy = py + 62 + i * 42
+            ix = px + (panel_w - isf.get_width()) // 2
+            self.screen.blit(isf, (ix, iy))
+            if i == cursor:
+                pygame.draw.rect(self.screen, colour, (ix, iy + 26, isf.get_width(), 2))
+
+        if hint:
+            hf = pygame.font.Font(None, 22)
+            hs = hf.render(hint, True, MENU_DIM)
+            self.screen.blit(hs, ((w - hs.get_width()) // 2, h - 30))
+        pygame.display.flip()
+
+    def _render_pause_page(self, page, backdrop):
+        if page == "settings":
+            self._draw_overlay_menu(backdrop, "Settings", self._pause_settings_items(),
+                                    self.pause_settings_cursor,
+                                    "Enter: Cycle  |  Esc: Back")
+        elif page == "confirm_exit":
+            self._draw_overlay_menu(backdrop, "Exit to Menu?",
+                                    ["Keep Playing", "Exit to Menu"], self.pause_exit_cursor,
+                                    "Tip: Save State (F6) keeps your progress")
+        else:
+            hint = self._pause_msg if self._pause_msg_ttl > 0 else \
+                "Up/Down: Move  |  Enter: Select  |  Esc: Resume"
+            self._draw_overlay_menu(backdrop, "Paused", self.PAUSE_ITEMS,
+                                    self.pause_cursor, hint)
 
     def render(self):
         """Draws the PPU framebuffer to the Pygame screen."""
