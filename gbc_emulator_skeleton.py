@@ -1161,8 +1161,13 @@ class MMU:
                     return 0xFF
                 if self.ppu is not None and self.ppu.mode >= 2:
                     return 0xFF
+            elif address < 0xFF00:
+                return 0xFF  # 0xFEA0-0xFEFF is unusable; reads back as 0xFF on DMG
             if address == 0xFF00:
                 return self._read_joypad()
+            if address == 0xFF0F:
+                # IF: only bits 0-4 are implemented; the top 3 read back as 1.
+                return self.memory[0xFF0F] | 0xE0
             if address == 0xFF01:
                 return self.serial_data
             if address == 0xFF02:
@@ -1611,6 +1616,9 @@ class PPU:
         self.prev_stat_irq = False
         self.lcd_was_on = False
         self.window_line_counter = 0
+        # Latched once LY==WY occurs in a frame; the window then stays active for
+        # the rest of the frame even if WY is changed, matching hardware.
+        self.window_active = False
         self._bg_rgb = [0] * 32
         self._obj_rgb = [0] * 32
         unsigned_addrs = tuple(0x8000 + i * 16 for i in range(256))
@@ -1696,6 +1704,7 @@ class PPU:
                 self.mode = 0
                 self.scanline_dot = 0
                 self.window_line_counter = 0
+                self.window_active = False
                 self.prev_stat_irq = False
                 stat = mem[0xFF41] & 0xF8
                 mem[0xFF41] = stat
@@ -1781,6 +1790,10 @@ class PPU:
         self.mode = 3
         stat = (mem[0xFF41] & 0xFC) | 3
         mem[0xFF41] = stat
+        # Mode 3 has no STAT source, so the interrupt line drops here. Re-evaluate
+        # it (unless LY=LYC holds) so the rising edge into mode 0 fires the HBlank
+        # STAT interrupt even when the mode-2 OAM source was also enabled.
+        self._fire_stat_irq(stat)
 
     def _finish_scanline(self):
         mem = self.mmu.memory
@@ -1789,6 +1802,7 @@ class PPU:
         if new_ly == 154:
             new_ly = 0
             self.window_line_counter = 0
+            self.window_active = False
         mem[0xFF44] = new_ly
 
     def _update_stat_mode(self, mode):
@@ -1835,8 +1849,9 @@ class PPU:
         fb_row = ly * SCREEN_WIDTH
 
         if not bg_enabled:
-            # DMG: BG/Window off - clear scanline to white, render sprites only.
-            white = self.shades[0]
+            # DMG: BG/Window off - the background outputs colour 0 through BGP
+            # (usually white, but BGP can remap it), then sprites draw on top.
+            white = self._dmg_bgp_rgb[mem[0xFF47]][0]
             fb = self.framebuffer
             bg_pri = self.bg_palette_idx
             for i in range(SCREEN_WIDTH):
@@ -1992,10 +2007,13 @@ class PPU:
                         fb[fb_row + x] = dmg_rgb[c]
                         bg_pri[fb_row + x] = c
 
-        if lcdc & 0x20:
-            wy = mem[0xFF4A]
+        # The window's WY==LY trigger latches for the whole frame; once latched the
+        # window keeps rendering even if WY is later moved past the current line.
+        if ly == mem[0xFF4A]:
+            self.window_active = True
+        if (lcdc & 0x20) and self.window_active:
             wx_raw = mem[0xFF4B]
-            if ly >= wy and (wx_raw - 7) < SCREEN_WIDTH:
+            if (wx_raw - 7) < SCREEN_WIDTH:
                 self._render_window(ly)
                 self.window_line_counter += 1
         if lcdc & 0x02:
@@ -2584,12 +2602,8 @@ class APU:
         mem = self.mmu.memory
         if 0xFF30 <= addr <= 0xFF3F:
             return self.wave_ram[addr - 0xFF30]
-        if addr == 0xFF12:
-            return (self.ch1_volume << 4) | (mem[0xFF12] & 0x0F)
-        if addr == 0xFF17:
-            return (self.ch2_volume << 4) | (mem[0xFF17] & 0x0F)
-        if addr == 0xFF21:
-            return (self.ch4_volume << 4) | (mem[0xFF21] & 0x0F)
+        # NRx2 (envelope) registers read back the last written value, not the live
+        # envelope volume — the running volume is internal and not exposed.
         if addr == 0xFF14:
             return mem[0xFF14] & 0xBF | (0x40 if self.ch1_length_enabled else 0)
         if addr == 0xFF19:
@@ -2827,11 +2841,12 @@ class APU:
                 width = self.ch4_width_mode
                 for _ in range(advances):
                     bit = (lfsr & 1) ^ ((lfsr >> 1) & 1)
+                    # The LFSR is always 15 bits wide; the feedback bit goes to bit
+                    # 14. In width ("7-bit") mode it is ALSO copied into bit 6, which
+                    # shortens the period without discarding the upper state.
+                    lfsr = (lfsr >> 1) | (bit << 14)
                     if width:
-                        # 7-bit mode: shift within low 7 bits, new bit at 6
-                        lfsr = ((lfsr >> 1) & 0x3F) | (bit << 6)
-                    else:
-                        lfsr = (lfsr >> 1) | (bit << 14)
+                        lfsr = (lfsr & ~(1 << 6)) | (bit << 6)
                 self.ch4_lfsr = lfsr
                 t = period - ((-t) % period)
             self.ch4_freq_timer = t

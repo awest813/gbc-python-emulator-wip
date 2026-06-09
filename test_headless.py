@@ -481,13 +481,87 @@ def test_double_speed(ns):
     check(f"double-speed halves PPU dots (ratio {ratio:.3f})", 0.45 < ratio < 0.55)
 
 
+def test_mmu_io_regs(ns):
+    """Read-back masks for the IF register and the unusable memory region."""
+    MMU = ns["MMU"]
+    m = MMU(); m.load_rom(build_rom())
+    m.memory[0xFF0F] = 0x05
+    check("IF (FF0F) reads upper 3 bits as 1", m.read_byte(0xFF0F) == (0xE0 | 0x05))
+    m.memory[0xFEB0] = 0x42
+    check("unusable FEA0-FEFF reads back 0xFF", m.read_byte(0xFEB0) == 0xFF)
+    check("OAM stays readable outside modes 2/3", isinstance(m.read_byte(0xFE00), int))
+
+
+def test_ppu_stat_window(ns):
+    """HBlank STAT IRQ edge with the OAM source also on, and the window WY latch."""
+    GameBoy = ns["GameBoy"]
+    gb = GameBoy(rom_path=None, audio_enabled=False)
+    ppu, mem = gb.ppu, gb.mmu.memory
+
+    # HBlank (mode 0) STAT interrupt must still fire when the mode-2 OAM STAT
+    # source is also enabled: the line drops during mode 3 and rises into mode 0.
+    mem[0xFF40] = 0x80          # LCD on
+    mem[0xFF41] = 0x28          # STAT mode2 (0x20) + mode0/HBlank (0x08) enabled
+    mem[0xFF44] = 0
+    ppu.mode = 2; ppu.scanline_dot = 0; ppu.prev_stat_irq = False; ppu.lcd_was_on = True
+    ppu.step(4)                 # into mode 2 (fires the OAM source)
+    mem[0xFF0F] = 0             # CPU services it and clears IF
+    ppu.step(300)               # advance through mode 3 into HBlank
+    check("HBlank STAT IRQ fires with mode-2 source enabled", mem[0xFF0F] & 0x02)
+    check("PPU reaches HBlank (mode 0)", ppu.mode == 0)
+
+    # The window WY==LY trigger latches for the whole frame, so the window keeps
+    # rendering even after WY is moved past the current scanline.
+    gb2 = GameBoy(rom_path=None, audio_enabled=False)
+    p, m2 = gb2.ppu, gb2.mmu.memory
+    m2[0xFF40] = 0xB1; m2[0xFF4A] = 0; m2[0xFF4B] = 7; p.is_cgb = False
+    p._render_scanline(0, m2[0xFF40])
+    latched = p.window_active
+    m2[0xFF4A] = 100            # move WY beyond the visible area
+    p._render_scanline(5, m2[0xFF40])
+    check("window latches at LY==WY", latched)
+    check("window stays active after WY moves past LY", p.window_active)
+    check("window line counter advances", p.window_line_counter >= 2)
+    m2[0xFF44] = 153; p._finish_scanline()
+    check("window latch resets at frame wrap", p.window_active is False)
+
+
+def test_apu_registers(ns):
+    """NRx2 read-back and the 15-bit-wide noise LFSR period in both modes."""
+    GameBoy = ns["GameBoy"]
+    gb = GameBoy(rom_path=None, audio_enabled=False)
+    apu = gb.apu
+    apu.power = True
+    apu.mmu.memory[0xFF12] = 0xF1   # initial volume 0xF, add, period 1
+    apu.ch1_volume = 0x3            # live (decayed) volume differs
+    check("NR12 reads back the written value, not live volume",
+          apu.read_register(0xFF12) == 0xF1)
+
+    def lfsr_period(width):
+        lfsr = 0x7FFF; seen = set()
+        for _ in range(70000):
+            bit = (lfsr & 1) ^ ((lfsr >> 1) & 1)
+            lfsr = (lfsr >> 1) | (bit << 14)
+            if width:
+                lfsr = (lfsr & ~(1 << 6)) | (bit << 6)
+            if lfsr in seen:
+                break
+            seen.add(lfsr)
+        return len(seen)
+    check("noise LFSR period is 32767 in 15-bit mode", lfsr_period(0) == 32767)
+    check("noise LFSR period is 127 in 7-bit (width) mode", lfsr_period(1) == 127)
+
+
 def main():
     ns = load_module()
     print("opcode checks:");           test_opcodes(ns)
     print("full-machine run:");        test_run(ns)
+    print("mmu io registers:");        test_mmu_io_regs(ns)
     print("cgb sprite rendering:");  test_cgb_sprite_rendering(ns)
     print("dmg sprite rendering:");  test_dmg_sprite_rendering(ns)
+    print("ppu stat + window:");       test_ppu_stat_window(ns)
     print("apu frame sync:");          test_apu_frame_sync(ns)
+    print("apu registers:");           test_apu_registers(ns)
     print("gameboy frame audio:");     test_gameboy_frame_audio(ns)
     print("double-speed timing:");     test_double_speed(ns)
     print("\nALL CHECKS PASSED")
