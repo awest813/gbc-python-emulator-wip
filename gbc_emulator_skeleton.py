@@ -2967,10 +2967,20 @@ APU_MAX_SAMPLES_PER_FRAME = APU_MIN_SAMPLES_PER_FRAME + (
 
 MENU_W = 640
 MENU_H = 480
-MENU_BG = (15, 25, 45)
-MENU_FG = (210, 225, 245)
-MENU_HI = (70, 200, 70)
-MENU_DIM = (110, 130, 155)
+MENU_BG = (8, 24, 32)      # DMG darkest: (8, 24, 32)
+MENU_FG = (136, 192, 112)  # DMG light-mid: (136, 192, 112)
+MENU_HI = (224, 248, 208)  # DMG lightest: (224, 248, 208)
+MENU_DIM = (52, 104, 86)   # DMG dark-mid: (52, 104, 86)
+
+_font_cache = {}
+def get_font(size, bold=True):
+    key = (size, bold)
+    if key not in _font_cache:
+        try:
+            _font_cache[key] = pygame.font.SysFont("Courier New", size, bold=bold)
+        except:
+            _font_cache[key] = pygame.font.Font(None, size)
+    return _font_cache[key]
 
 
 class EmulatorMenu:
@@ -3069,22 +3079,27 @@ class EmulatorMenu:
         self.status_line = msg
         self.status_ttl = 120
 
-    def _centre_text(self, text, y, colour=MENU_FG, size=28):
-        f = pygame.font.Font(None, size)
+    def _centre_text(self, text, y, colour=MENU_FG, size=28, shadow=False):
+        f = get_font(size)
         s = f.render(text, True, colour)
         x = (MENU_W - s.get_width()) // 2
+        if shadow:
+            shadow_color = (8, 24, 32)
+            s_shadow = f.render(text, True, shadow_color)
+            self.screen.blit(s_shadow, (x + 2, y + 2))
         self.screen.blit(s, (x, y))
+        return s.get_width()
 
     def _draw_menu(self, items, cursor, start_y, gap):
+        f = get_font(28)
         for i, item in enumerate(items):
             y = start_y + i * gap
             colour = MENU_HI if i == cursor else MENU_FG
-            self._centre_text(item, y, colour)
+            w = self._centre_text(item, y, colour, 28, shadow=(i == cursor))
             if i == cursor:
-                f = pygame.font.Font(None, 28)
-                w = f.render(item, True, colour).get_width()
-                left = (MENU_W - w) // 2
-                pygame.draw.rect(self.screen, colour, (left, y + 22, w, 2))
+                cursor_surf = f.render(">", True, MENU_HI)
+                cursor_x = (MENU_W - w) // 2 - cursor_surf.get_width() - 10
+                self.screen.blit(cursor_surf, (cursor_x, y))
 
     def run(self):
         clock = pygame.time.Clock()
@@ -3257,17 +3272,17 @@ class EmulatorMenu:
             subtitle_y = 235
             menu_y = 290
         else:
-            self._centre_text("Python GBC Emulator", 60, MENU_HI, 48)
-            title_y = 105
-            subtitle_y = 130
+            self._centre_text("Python GBC Emulator", 60, MENU_HI, 48, shadow=True)
+            title_y = 120
+            subtitle_y = 160
             menu_y = 200
-        self._centre_text("Python GBC Emulator", title_y, MENU_HI, 44)
+        self._centre_text("Python GBC Emulator", title_y, MENU_HI, 44, shadow=True)
         self._centre_text("v1.0", subtitle_y, MENU_DIM, 20)
         self._draw_menu(self.main_items, self.selected, menu_y, 50)
         self._centre_text("Arrow Keys: Navigate  |  Enter: Select  |  Esc: Quit", MENU_H - 30, MENU_DIM, 18)
 
     def _render_load_rom(self):
-        self._centre_text("Select ROM", 40, MENU_HI, 36)
+        self._centre_text("Select ROM", 40, MENU_HI, 36, shadow=True)
         if not self.roms:
             self._centre_text("No .gb/.gbc files found", 180, MENU_DIM)
             self._centre_text("Place your ROM files in the  roms  folder alongside this program", 225, MENU_DIM)
@@ -3282,7 +3297,7 @@ class EmulatorMenu:
                 if len(name) > 44:
                     name = name[:41] + "..."
                 colour = MENU_HI if idx == self.rom_cursor else MENU_FG
-                f = pygame.font.Font(None, 24)
+                f = get_font(24)
                 s = f.render(f"  {name}  ({os.path.dirname(rom_path) or '.'})", True, colour)
                 self.screen.blit(s, (30, y))
                 if idx == self.rom_cursor:
@@ -3290,12 +3305,12 @@ class EmulatorMenu:
         self._centre_text("Enter: Load  |  F5: Refresh  |  Esc: Back", MENU_H - 30, MENU_DIM, 18)
 
     def _render_settings(self):
-        self._centre_text("Settings", 40, MENU_HI, 36)
+        self._centre_text("Settings", 40, MENU_HI, 36, shadow=True)
         self._draw_menu(self.settings_items, self.settings_cursor, 120, 45)
         self._centre_text("Enter: Cycle  |  Esc: Back", MENU_H - 30, MENU_DIM, 18)
 
     def _render_confirm_exit(self):
-        self._centre_text("Exit Emulator?", 130, MENU_HI, 40)
+        self._centre_text("Exit Emulator?", 130, MENU_HI, 40, shadow=True)
         self._centre_text("Are you sure you want to quit to the OS?", 195, MENU_DIM, 22)
         self._draw_menu(["Keep Playing", "Exit to OS"], self.exit_cursor, 270, 50)
         self._centre_text("Arrow Keys: Choose  |  Enter: Select  |  Esc: Cancel",
@@ -4198,11 +4213,11 @@ class GameBoy:
         self.screen.blit(panel, (px, py))
         pygame.draw.rect(self.screen, MENU_HI, (px, py, panel_w, panel_h), 2)
 
-        tf = pygame.font.Font(None, 38)
+        tf = get_font(38)
         ts = tf.render(title, True, MENU_HI)
         self.screen.blit(ts, (px + (panel_w - ts.get_width()) // 2, py + 16))
 
-        itf = pygame.font.Font(None, 30)
+        itf = get_font(30)
         for i, item in enumerate(items):
             colour = MENU_HI if i == cursor else MENU_FG
             isf = itf.render(item, True, colour)
@@ -4210,10 +4225,12 @@ class GameBoy:
             ix = px + (panel_w - isf.get_width()) // 2
             self.screen.blit(isf, (ix, iy))
             if i == cursor:
-                pygame.draw.rect(self.screen, colour, (ix, iy + 26, isf.get_width(), 2))
+                cursor_surf = itf.render(">", True, MENU_HI)
+                cursor_x = ix - cursor_surf.get_width() - 10
+                self.screen.blit(cursor_surf, (cursor_x, iy))
 
         if hint:
-            hf = pygame.font.Font(None, 22)
+            hf = get_font(22)
             hs = hf.render(hint, True, MENU_DIM)
             self.screen.blit(hs, ((w - hs.get_width()) // 2, h - 30))
         pygame.display.flip()
@@ -4270,12 +4287,13 @@ class GameBoy:
         # Transient status overlay (save/load messages)
         if getattr(self, '_status_ttl', 0) > 0 and getattr(self, '_status_msg', ''):
             try:
-                f = pygame.font.Font(None, 22)
-                s = f.render(self._status_msg, True, (255, 255, 200))
+                f = get_font(22)
+                s = f.render(self._status_msg, True, MENU_FG)
                 bg = pygame.Surface((s.get_width() + 16, s.get_height() + 8))
-                bg.fill((0, 0, 0))
-                bg.set_alpha(180)
+                bg.fill(MENU_BG)
+                bg.set_alpha(200)
                 self.screen.blit(bg, (8, 8))
+                pygame.draw.rect(self.screen, MENU_HI, (8, 8, bg.get_width(), bg.get_height()), 1)
                 self.screen.blit(s, (16, 12))
             except (pygame.error, AttributeError):
                 pass
