@@ -23,9 +23,10 @@ CGB compatibility.
 - **APU** — All four DMG sound channels (two squares with envelope,
   sweep on channel 1, 32-step wave channel, LFSR noise channel),
   frame sequencer for length / envelope / sweep, master volume and
-  per-channel stereo panning, streamed to the host at 44.1 kHz.
+  per-channel stereo panning, streamed to the host at 44.1 kHz.  Full
+  CGB audio behaviour (wave RAM access rules, frame-sequencer reset).
 - **Serial port** — FF01/FF02 register support with serial interrupt
-  generation (link cable TCP client/server planned).
+  generation and TCP link cable for local two-player multiplayer.
 - **Timers** — DIV, TIMA, TMA, TAC with all four programmable rates and
   correct overflow → interrupt signalling.
 - **Cartridge** — MBC1, MBC2 (4-bit RAM), MBC3 (with RTC), and MBC5
@@ -40,8 +41,8 @@ CGB compatibility.
   with F6 / F8 (save) and F7 / F9 (load).
 - **Menu system** — ROM browser, window-scale selector, keyboard controls,
   project logo.
-- **Input** — D-pad, A / B, Start, Select via the standard joypad register
-  layout.
+- **Input** — D-pad, A / B, Start, Select via keyboard (customisable
+  key bindings) and gamepad (auto-detected Xbox/PlayStation layout).
 - **Performance** — ~60–90 fps on SUPERBAJTEK (Python 3.11). Precomputed
   tile / palette lookup tables, unrolled scanline writers, and a
   combined per-opcode dispatcher keep the inner loop tight.
@@ -97,6 +98,7 @@ python gbc_emulator_skeleton.py path/to/rom.gb --nomenu
 
 ## Controls
 
+### Keyboard
 | Key            | GB Button     |
 | -------------- | ------------- |
 | Arrow keys     | D-pad         |
@@ -108,6 +110,35 @@ python gbc_emulator_skeleton.py path/to/rom.gb --nomenu
 | F5 (in menu)   | Refresh ROMs  |
 | F6 / F8        | Save state (slot 0 / 1) |
 | F7 / F9        | Load state (slot 0 / 1) |
+
+### Gamepad / Controller
+Gamepads are auto-detected and use Xbox/PlayStation layout by default:
+
+| Gamepad        | GB Button     |
+| -------------- | ------------- |
+| D-pad          | D-pad         |
+| A / Cross      | A             |
+| B / Circle     | B             |
+| Select / Share | Select        |
+| Start / Options | Start (also opens pause menu) |
+
+## Link Cable (Local Multiplayer)
+
+Two emulator instances can connect via TCP for local link cable gameplay:
+
+```bash
+# Player 1 (server):
+python gbc_emulator_skeleton.py rom.gbc --nomenu --link-server 12345
+
+# Player 2 (client):
+python gbc_emulator_skeleton.py rom.gbc --nomenu --link-connect 127.0.0.1:12345
+```
+
+## Settings Persistence
+
+All menu settings (scale, volume, palette, shader, audio toggle, frame rate)
+are saved to `gbc_config.json` and reloaded on next launch.  The file is
+created automatically in the emulator directory.
 
 ## Menu
 
@@ -141,7 +172,7 @@ filesystem (up to two levels deep) looking for `.gb` / `.gbc` files.
 
 ## Architecture
 
-The emulator lives in a single ~3,900-line Python file. The hot path
+The emulator lives in a single ~4,700-line Python file. The hot path
 is:
 
 1. `GameBoy.step_all` — combined per-opcode dispatcher.
@@ -209,6 +240,12 @@ python test_save_state.py
 Both tests are self-contained (no display, no local ROMs) and exit
 non-zero on failure, so they work as CI checks.
 
+A single wrapper script runs all tests sequentially:
+
+```bash
+python ci_test.py
+```
+
 ## Status
 
 A working DMG/CGB-compatible emulator that successfully displays the title
@@ -224,13 +261,15 @@ interpreter on modest hardware.
   at 2× the base clock while the PPU and APU stay on the base clock, so
   display and audio timing remain correct. The cartridge bus access-time
   penalty (one extra wait state per cartridge read at 2× speed) is not
-  emulated.
-- Per-cycle STAT blocking for non-CPU bus activity (e.g. during DMA)
-  is approximated; the OAM / VRAM access blocking during PPU modes
-  2/3 is correctly enforced.
-- Unimplemented opcodes are logged as errors and treated as a 4-cycle
-  NOP (the original DMG behaviour is to fully fault on them).
+  emulated — in practice this only affects a few test ROMs.
 - SGB (Super Game Boy) features are not emulated.
+- MBC6 and MBC7 mappers are recognised in the ROM browser but not emulated;
+  games that require them (e.g. *Kirby Tilt 'n' Tumble*) will not work.
+- Multiplayer requires `--nomenu` mode (the menu does not support the
+  link cable).  Use `--link-server PORT` and `--link-connect HOST:PORT`.
+- Save states (slots 0 and 1) and battery-backed `.sav` files are fully
+  supported.  RTC state is persisted in the `.sav` file in VBA-compatible
+  format.
 
 ## License
 

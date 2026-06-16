@@ -21,7 +21,19 @@ import os
 import time
 import logging
 import argparse
+import struct
+import socket
+import json
 from collections import deque
+
+# On Windows, request 1 ms timer resolution so time.sleep() is more precise.
+if sys.platform == 'win32':
+    try:
+        import ctypes
+        _winmm = ctypes.windll.winmm
+        _winmm.timeBeginPeriod(1)
+    except Exception:
+        pass
 
 try:
     import numpy as np
@@ -44,8 +56,41 @@ def _noop_trace(*_args, **_kwargs):
 # --- CONSTANTS ---
 SCREEN_WIDTH = 160
 SCREEN_HEIGHT = 144
-FPS = 59.73
+FPS = 4194304 / 70224  # ≈ 59.7275 Hz
 CYCLES_PER_FRAME = 70224  # 4.194304 MHz / 59.73 frames per second
+
+# Interrupt flag bits (used in IF and IE registers at 0xFF0F / 0xFFFF)
+IF_VBLANK  = 0x01
+IF_LCD     = 0x02
+IF_TIMER   = 0x04
+IF_SERIAL  = 0x08
+IF_JOYPAD  = 0x10
+
+# PPU timing (in dot-cycles)
+DOTS_PER_SCANLINE     = 456
+TOTAL_SCANLINES       = 154
+MODE3_START_DOT       = 80
+MODE3_BASE_DURATION   = 172
+MAX_SPRITES_PER_LINE  = 10
+TOTAL_OAM_SPRITES     = 40
+OAM_SIZE              = 160  # bytes
+OAM_DMA_CYCLES        = 640  # CPU T-cycles (160 bytes × 4)
+
+# APU constants
+CH_PULSE_MAX_LENGTH = 64
+CH3_MAX_LENGTH      = 256
+MAX_FREQUENCY       = 2048
+DEFAULT_ENV_PERIOD  = 8
+WAVE_RAM_SIZE       = 16
+
+# Audio
+INT16_MAX = 32767
+INT16_MIN = -32768
+AUDIO_SCALE_FACTOR = 70
+
+def _sign_extend_byte(b):
+    """Sign-extend an 8-bit value to a signed Python int (range -128..127)."""
+    return b - 256 if b & 0x80 else b
 
 # --- PALETTES (DMG 4-shade colour sets) ---
 PALETTE_DMG = ((224, 248, 208), (136, 192, 112), (52, 104, 86), (8, 24, 32))
@@ -108,8 +153,44 @@ FPS_LIMIT_OPTIONS = [("59.7 fps", 59.73), ("60 fps", 60.0), ("Unlimited", 0)]
 AUDIO_OPTIONS = [("On", True), ("Off", False)]
 VOLUME_OPTIONS = [("Mute", 0.0), ("Low", 0.25), ("Medium", 0.5), ("High", 0.75), ("Max", 1.0)]
 FILTER_OPTIONS = [("Nearest", False), ("Smooth", True)]
-WINDOW_SCALE_OPTIONS = [2, 3, 4, 5]
+WINDOW_SCALE_OPTIONS = [("2x", 2), ("3x", 3), ("4x", 4), ("5x", 5)]
 
+
+def _parse_rom_header(rom_path):
+    """Parse ROM header bytes and return a short info string, or None on error."""
+    try:
+        with open(rom_path, 'rb') as f:
+            f.seek(0x0143)
+            cgb = f.read(1)[0]
+            f.seek(0x0147)
+            cart_type = f.read(1)[0]
+            f.seek(0x0148)
+            rom_size = f.read(1)[0]
+            f.seek(0x0149)
+            ram_size = f.read(1)[0]
+    except OSError:
+        return None
+    _MBC_NAMES = {
+        0x00: "ROM ONLY", 0x01: "MBC1", 0x02: "MBC1+RAM", 0x03: "MBC1+RAM+BATT",
+        0x05: "MBC2", 0x06: "MBC2+BATT",
+        0x0F: "MBC3+TIMER+BATT", 0x10: "MBC3+TIMER+RAM+BATT", 0x11: "MBC3",
+        0x12: "MBC3+RAM", 0x13: "MBC3+RAM+BATT",
+        0x19: "MBC5", 0x1A: "MBC5+RAM", 0x1B: "MBC5+RAM+BATT",
+        0x1C: "MBC5+RUMBLE", 0x1D: "MBC5+RUMBLE+RAM", 0x1E: "MBC5+RUMBLE+RAM+BATT",
+        0x20: "MBC6", 0x22: "MBC7",
+    }
+    mbc = _MBC_NAMES.get(cart_type, f"Unknown ({cart_type:02X})")
+    rom_kb = (32 << rom_size) if rom_size <= 8 else 0
+    ram_info = ""
+    if ram_size == 0x00: ram_info = "No RAM"
+    elif ram_size == 0x01: ram_info = "2 KB RAM"
+    elif ram_size == 0x02: ram_info = "8 KB RAM"
+    elif ram_size == 0x03: ram_info = "32 KB RAM"
+    elif ram_size == 0x04: ram_info = "128 KB RAM"
+    elif ram_size == 0x05: ram_info = "64 KB RAM"
+    else: ram_info = f"RAM: {ram_size:02X}"
+    cgb_str = "CGB" if cgb & 0x80 else "DMG"
+    return f"{cgb_str}  |  {mbc}  |  {rom_kb} KB  |  {ram_info}"
 
 def _opt_index(options, value, default=0):
     """Return the index in a (label, value) option list whose value matches, else default."""
@@ -135,6 +216,99 @@ KEY_TO_JOYPAD_BIT = {
     pygame.K_RSHIFT: 6,  # Select
     pygame.K_RETURN: 7,  # Start
 } if pygame else {}
+
+# Gamepad mapping: joystick button index -> joypad bit (Xbox / PlayStation layout)
+_GAMEPAD_BUTTON_MAP = {
+    0: 4,   # A (Cross)  -> A
+    1: 5,   # B (Circle) -> B
+    6: 6,   # Select/Back -> Select
+    7: 7,   # Start       -> Start
+}
+_GAMEPAD_AXIS_THRESHOLD = 0.5
+_GAMEPAD_DPAD_BITS = {0: 0, 1: 1, 2: 2, 3: 3}  # hat direction index -> joypad bit
+
+def _init_joysticks():
+    """Initialise all connected joysticks. Safe to call multiple times."""
+    if not pygame or not pygame.get_init():
+        return
+    try:
+        pygame.joystick.init()
+    except pygame.error:
+        return
+    for i in range(pygame.joystick.get_count()):
+        try:
+            pygame.joystick.Joystick(i).init()
+        except pygame.error:
+            pass
+
+def _joystick_dpad_from_hat(event):
+    """Convert a JOYHATMOTION event to a list of (joypad_bit, pressed) tuples."""
+    x, y = event.value
+    results = []
+    dj = {0: (x == 1), 1: (x == -1), 2: (y == 1), 3: (y == -1)}
+    for di, pressed in dj.items():
+        results.append((_GAMEPAD_DPAD_BITS[di], pressed))
+    return results
+
+def _joystick_dpad_from_axis(event):
+    """Convert a JOYAXISMOTION event to (joypad_bit, pressed) tuples for axes 0/1."""
+    T = _GAMEPAD_AXIS_THRESHOLD
+    if event.axis == 0:
+        if event.value > T:      return [(0, True), (1, False)]
+        elif event.value < -T:   return [(1, True), (0, False)]
+        else:                    return [(0, False), (1, False)]
+    if event.axis == 1:
+        if event.value > T:      return [(3, True), (2, False)]
+        elif event.value < -T:   return [(2, True), (3, False)]
+        else:                    return [(2, False), (3, False)]
+    return []
+
+def _gamepad_menu_action(event):
+    """Map a joystick event to a menu keystroke string: 'up','down','left','right','select','back', or None."""
+    if event.type == pygame.JOYBUTTONDOWN:
+        if event.button == 0:  return 'select'
+        if event.button == 1:  return 'back'
+        if event.button == 7:  return 'select'  # Start == select
+        if event.button == 6:  return 'back'    # Select == back
+    if event.type == pygame.JOYHATMOTION:
+        x, y = event.value
+        if y == 1:  return 'up'
+        if y == -1: return 'down'
+        if x == -1: return 'left'
+        if x == 1:  return 'right'
+    if event.type == pygame.JOYAXISMOTION:
+        T = _GAMEPAD_AXIS_THRESHOLD
+        if event.axis == 1:
+            if event.value < -T: return 'up'
+            if event.value > T:  return 'down'
+        if event.axis == 0:
+            if event.value < -T: return 'left'
+            if event.value > T:  return 'right'
+    return None
+
+
+# ── Persistent settings configuration ─────────────────────────────────
+try:
+    _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+except NameError:
+    _THIS_DIR = os.getcwd()
+_CONFIG_PATH = os.path.join(_THIS_DIR, "gbc_config.json")
+
+def _load_config():
+    """Load user settings from the JSON config file. Returns {} on any error."""
+    try:
+        with open(_CONFIG_PATH, 'r') as f:
+            return json.load(f)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return {}
+
+def _save_config(cfg):
+    """Write the settings dictionary to the config file."""
+    try:
+        with open(_CONFIG_PATH, 'w') as f:
+            json.dump(cfg, f, indent=2)
+    except OSError:
+        pass
 
 
 class Registers:
@@ -471,7 +645,7 @@ class CPU:
         if opcode == 0x20:  # JR NZ - 3.3%
             offset = self.fetch_byte()
             if self.reg.get_flag(FLAG_Z) == 0:
-                if offset & 0x80: offset -= 256
+                offset = _sign_extend_byte(offset)
                 self.reg.pc = (self.reg.pc + offset) & 0xFFFF; return 12
             return 8
         if opcode == 0x19:  # ADD HL,DE - 2.7%
@@ -490,7 +664,7 @@ class CPU:
         if opcode == 0x28:  # JR Z - 1.6%
             offset = self.fetch_byte()
             if self.reg.get_flag(FLAG_Z) == 1:
-                if offset & 0x80: offset -= 256
+                offset = _sign_extend_byte(offset)
                 self.reg.pc = (self.reg.pc + offset) & 0xFFFF; return 12
             return 8
         if opcode == 0xC9:  # RET - 1.5%
@@ -605,7 +779,7 @@ class CPU:
             self.reg.set_flag(FLAG_H, 0); self.reg.set_flag(FLAG_C, new_c); return 4
         if opcode == 0x18:
             offset = self.fetch_byte()
-            if offset & 0x80: offset -= 256
+            offset = _sign_extend_byte(offset)
             new_pc = (self.reg.pc + offset) & 0xFFFF
             self.trace_branch("JR", self.current_opcode_pc, new_pc, opcode)
             self.reg.pc = new_pc; return 12
@@ -630,7 +804,7 @@ class CPU:
         if opcode == 0x20:
             offset = self.fetch_byte()
             if self._check_cond(0):
-                if offset & 0x80: offset -= 256
+                offset = _sign_extend_byte(offset)
                 new_pc = (self.reg.pc + offset) & 0xFFFF
                 self.trace_branch("JR NZ", self.current_opcode_pc, new_pc, opcode)
                 self.reg.pc = new_pc; return 12
@@ -653,7 +827,7 @@ class CPU:
         if opcode == 0x28:
             offset = self.fetch_byte()
             if self._check_cond(1):
-                if offset & 0x80: offset -= 256
+                offset = _sign_extend_byte(offset)
                 new_pc = (self.reg.pc + offset) & 0xFFFF
                 self.trace_branch("JR Z", self.current_opcode_pc, new_pc, opcode)
                 self.reg.pc = new_pc; return 12
@@ -677,7 +851,7 @@ class CPU:
         if opcode == 0x30:
             offset = self.fetch_byte()
             if self._check_cond(2):
-                if offset & 0x80: offset -= 256
+                offset = _sign_extend_byte(offset)
                 new_pc = (self.reg.pc + offset) & 0xFFFF
                 self.trace_branch("JR NC", self.current_opcode_pc, new_pc, opcode)
                 self.reg.pc = new_pc; return 12
@@ -703,7 +877,7 @@ class CPU:
         if opcode == 0x38:
             offset = self.fetch_byte()
             if self._check_cond(3):
-                if offset & 0x80: offset -= 256
+                offset = _sign_extend_byte(offset)
                 new_pc = (self.reg.pc + offset) & 0xFFFF
                 self.trace_branch("JR C", self.current_opcode_pc, new_pc, opcode)
                 self.reg.pc = new_pc; return 12
@@ -866,7 +1040,7 @@ class CPU:
             self._push(self.reg.pc); self.reg.pc = 0x20; return 16
         if opcode == 0xE8:
             offset = self.fetch_byte()
-            if offset & 0x80: offset -= 256
+            offset = _sign_extend_byte(offset)
             result = self.reg.sp + offset
             self.reg.set_flag(FLAG_Z, 0); self.reg.set_flag(FLAG_N, 0)
             self.reg.set_flag(FLAG_H, (self.reg.sp & 0xF) + (offset & 0xF) > 0xF)
@@ -899,7 +1073,7 @@ class CPU:
             self._push(self.reg.pc); self.reg.pc = 0x30; return 16
         if opcode == 0xF8:
             offset = self.fetch_byte()
-            if offset & 0x80: offset -= 256
+            offset = _sign_extend_byte(offset)
             result = self.reg.sp + offset
             self.reg.set_flag(FLAG_Z, 0); self.reg.set_flag(FLAG_N, 0)
             self.reg.set_flag(FLAG_H, (self.reg.sp & 0xF) + (offset & 0xF) > 0xF)
@@ -1045,6 +1219,62 @@ class CPU:
         return cycles
 
 
+class LinkCable:
+    """TCP-based link cable connecting two emulator instances for local multiplayer."""
+
+    def __init__(self):
+        self.sock = None
+        self.server_sock = None
+        self._buf = bytearray()
+
+    def start_server(self, port):
+        self.server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.server_sock.bind(('127.0.0.1', port))
+        self.server_sock.listen(1)
+        self.server_sock.settimeout(30)
+        try:
+            self.sock, _ = self.server_sock.accept()
+            self.sock.setblocking(True)
+        except socket.timeout:
+            self.sock = None
+
+    def connect(self, host, port):
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.settimeout(30)
+        try:
+            self.sock.connect((host, port))
+            self.sock.setblocking(True)
+        except (socket.timeout, ConnectionRefusedError):
+            self.sock = None
+
+    def transfer(self, sb_out):
+        """Send one byte, receive the partner's byte, return it."""
+        if self.sock is None:
+            return 0xFF
+        try:
+            self.sock.sendall(bytes([sb_out]))
+            resp = self.sock.recv(1)
+            return resp[0] if resp else 0xFF
+        except OSError:
+            self.sock = None
+            return 0xFF
+
+    def close(self):
+        if self.sock:
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+            self.sock = None
+        if self.server_sock:
+            try:
+                self.server_sock.close()
+            except OSError:
+                pass
+            self.server_sock = None
+
+
 class MMU:
     """Memory Management Unit handling the 64KB address space with MBC1/MBC5."""
     def __init__(self):
@@ -1056,6 +1286,7 @@ class MMU:
         self.rom_bank = 1
         self.ram_bank = 0
         self.mbc1_mode = 0
+        self.mbc1_upper_bank = 0
         self.has_ram = False
         self.has_battery = False
         self.num_rom_banks = 2
@@ -1067,6 +1298,7 @@ class MMU:
         self.rom_path = None
         self.serial_data = 0x00
         self.serial_control = 0x00
+        self.link_cable = None
         self.vram_bank1 = bytearray(0x2000)
         self.vram_bank_select = 0
         self.is_cgb = False
@@ -1082,6 +1314,7 @@ class MMU:
         self.dma_remaining = 0  # remaining CPU T-cycles of the transfer
         self.dma_src = 0       # source page high byte
         self.dma_buffer = bytearray()
+        self.gdma_stall = 0
         # MBC3 RTC (real-time clock, battery-backed)
         self.has_rtc = False
         self.rtc_s = 0
@@ -1229,6 +1462,12 @@ class MMU:
                 if 0x08 <= self.ram_bank <= 0x0C:
                     return self._rtc_read(self.ram_bank)
                 return 0xFF
+            if self.mbc_type in (0x01, 0x02, 0x03):
+                if not self.ram_enabled or not self.has_ram or len(self.ram_data) == 0:
+                    return 0xFF
+                effective_bank = 0 if not self.mbc1_mode else self.ram_bank
+                offset = effective_bank * 0x2000 + (address - 0xA000)
+                return self.ram_data[offset] if offset < len(self.ram_data) else 0xFF
             if self.has_ram and self.ram_enabled and len(self.ram_data) > 0:
                 offset = self.ram_bank * 0x2000 + (address - 0xA000)
                 return self.ram_data[offset] if offset < len(self.ram_data) else 0xFF
@@ -1270,7 +1509,7 @@ class MMU:
             new_state = self.joypad_buttons | (1 << bit)
         if new_state != self.joypad_buttons and pressed:
             if_reg = self.memory[0xFF0F]
-            self.memory[0xFF0F] = if_reg | 0x10
+            self.memory[0xFF0F] = if_reg | IF_JOYPAD
         self.joypad_buttons = new_state
 
     def read_word(self, address):
@@ -1299,6 +1538,13 @@ class MMU:
                             self.ram_data[offset] = value
                 elif 0x08 <= self.ram_bank <= 0x0C:
                     self._rtc_write(self.ram_bank, value)
+            elif self.mbc_type in (0x01, 0x02, 0x03):
+                if not self.ram_enabled or not self.has_ram or len(self.ram_data) == 0:
+                    return
+                effective_bank = 0 if not self.mbc1_mode else self.ram_bank
+                offset = effective_bank * 0x2000 + (address - 0xA000)
+                if offset < len(self.ram_data):
+                    self.ram_data[offset] = value
             elif self.has_ram and self.ram_enabled and len(self.ram_data) > 0:
                 offset = self.ram_bank * 0x2000 + (address - 0xA000)
                 if offset < len(self.ram_data):
@@ -1391,13 +1637,16 @@ class MMU:
         self.write_byte((address + 1) & 0xFFFF, (value >> 8) & 0xFF)
 
     def _serial_transfer(self):
+        if self.link_cable is not None:
+            self.serial_data = self.link_cable.transfer(self.serial_data)
         self.serial_control &= 0x7F
-        self.memory[0xFF0F] |= 0x08
+        self.memory[0xFF0F] |= IF_SERIAL
 
     def _hdma_transfer(self):
         src = ((self.memory[0xFF51] << 8) | self.memory[0xFF52]) & 0xFFF0
         dst = (((self.memory[0xFF53] << 8) | self.memory[0xFF54]) & 0x1FF0) | 0x8000
-        length = ((self.memory[0xFF55] & 0x7F) + 1) * 16
+        blocks = (self.memory[0xFF55] & 0x7F) + 1
+        length = blocks * 16
         for i in range(length):
             val = self.read_byte(src + i)
             addr = 0x8000 + ((dst + i) & 0x1FFF)
@@ -1406,6 +1655,7 @@ class MMU:
             else:
                 self.memory[addr] = val
         self.memory[0xFF55] = 0xFF
+        self.gdma_stall = (blocks * 2 + 1) * 4
 
     def _hdma_hblank_step(self):
         if not self.hdma_active:
@@ -1482,10 +1732,11 @@ class MMU:
             elif mbc in (0x01, 0x02, 0x03):
                 pass
         elif 0x4000 <= address <= 0x5FFF and mbc in (0x01, 0x02, 0x03):
+            self.mbc1_upper_bank = value & 0x03
             if self.mbc1_mode:
-                self.ram_bank = value & 0x03
+                self.ram_bank = self.mbc1_upper_bank
             else:
-                self.rom_bank = (self.rom_bank & 0x1F) | ((value & 0x03) << 5)
+                self.rom_bank = (self.rom_bank & 0x1F) | (self.mbc1_upper_bank << 5)
                 self._remap_rom_bank()
         elif 0x4000 <= address <= 0x5FFF and mbc in (0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E):
             self.ram_bank = value & 0x0F
@@ -1495,7 +1746,16 @@ class MMU:
             if v <= 0x03 or (0x08 <= v <= 0x0C):
                 self.ram_bank = v
         elif 0x6000 <= address <= 0x7FFF and mbc in (0x01, 0x02, 0x03):
-            self.mbc1_mode = value & 0x01
+            mode = value & 0x01
+            if mode != self.mbc1_mode:
+                self.mbc1_mode = mode
+                if mode:
+                    self.ram_bank = self.mbc1_upper_bank
+                    self.rom_bank = self.rom_bank & 0x1F
+                else:
+                    self.rom_bank = (self.rom_bank & 0x1F) | (self.mbc1_upper_bank << 5)
+                    self.ram_bank = 0
+                self._remap_rom_bank()
         elif 0x6000 <= address <= 0x7FFF and mbc in (0x0F, 0x10, 0x11, 0x12, 0x13):
             # MBC3 latch: write 0x00 then 0x01 to copy RTC -> latched registers
             if self.rtc_latch_state == 0x00 and value == 0x01:
@@ -1516,34 +1776,25 @@ class MMU:
         delta = int(now - self.rtc_last_time)
         if delta <= 0:
             return
-        self.rtc_last_time += delta
-        if delta > 86400:
-            delta = 86400  # cap at 1 day per call to avoid runaway after sleep
-        for _ in range(delta):
-            self._rtc_tick()
-
-    def _rtc_tick(self):
-        """Increment RTC by one second with proper carry/overflow."""
-        if not self.has_rtc or (self.rtc_dh & 0x40):
-            return
-        self.rtc_s += 1
-        if self.rtc_s < 60:
-            return
-        self.rtc_s = 0
-        self.rtc_m += 1
-        if self.rtc_m < 60:
-            return
-        self.rtc_m = 0
-        self.rtc_h += 1
-        if self.rtc_h < 24:
-            return
-        self.rtc_h = 0
-        days = ((self.rtc_dh & 0x01) << 8) | self.rtc_dl
-        days = (days + 1) & 0x1FF
-        self.rtc_dl = days & 0xFF
-        self.rtc_dh = (self.rtc_dh & 0xC0) | ((days >> 8) & 0x01)
-        if days == 0:  # wrapped past 511 days
-            self.rtc_dh |= 0x80
+        self.rtc_last_time = now
+        # Bulk-advance: seconds -> minutes -> hours -> days -> day-carry
+        # This replaces the old per-second loop which was capped at 86400.
+        self.rtc_s += delta
+        carry = self.rtc_s // 60
+        self.rtc_s %= 60
+        self.rtc_m += carry
+        carry = self.rtc_m // 60
+        self.rtc_m %= 60
+        self.rtc_h += carry
+        carry = self.rtc_h // 24
+        self.rtc_h %= 24
+        total_days = self.rtc_dl | ((self.rtc_dh & 0x01) << 8)
+        total_days += carry
+        if total_days > 511:
+            total_days %= 512
+            self.rtc_dh |= 0x80  # day carry bit
+        self.rtc_dl = total_days & 0xFF
+        self.rtc_dh = (self.rtc_dh & 0xC0) | ((total_days >> 8) & 0x01)
 
     def _rtc_latch(self):
         """Snapshot current RTC state into the latched registers."""
@@ -1745,7 +1996,7 @@ class PPU:
         else:
             self._update_stat_mode(1)
             if ly == 144:
-                mem[0xFF0F] |= 0x01
+                mem[0xFF0F] |= IF_VBLANK
             self._check_lyc(ly)
         return 0
 
@@ -1837,7 +2088,7 @@ class PPU:
         )
         # Fire only on rising edge (0->1)
         if current_irq and not self.prev_stat_irq:
-            mem[0xFF0F] |= 0x02
+            mem[0xFF0F] |= IF_LCD
         self.prev_stat_irq = current_irq
 
     def _render_scanline(self, ly, lcdc):
@@ -2292,7 +2543,7 @@ class Timers:
         tma = mem[0xFF06]
         for _ in range(overflows):
             if tima > 0xFF - 1:
-                mem[0xFF0F] |= 0x04
+                mem[0xFF0F] |= IF_TIMER
                 tima = tma
             else:
                 tima += 1
@@ -2338,12 +2589,17 @@ _APU_BOOT_VALUES = {
 
 
 class APU:
-    """DMG Audio Processing Unit: two square waves, wave channel, noise channel.
+    """Game Boy Audio Processing Unit: two square waves, wave channel, noise channel.
 
     Drives a 44.1 kHz signed-16-bit stereo PCM stream that the host audio
     backend consumes. The frame sequencer runs at 512 Hz (one tick every
     8192 CPU cycles) and clocks the length counters, envelopes, and the
     channel-1 sweep.
+
+    CGB differences from DMG:
+    - Wave RAM reads always return the addressed byte even when CH3 is active.
+    - Wave RAM writes while CH3 is active go to the byte CH3 is currently accessing.
+    - Frame sequencer is reset to step 0 on APU power-on.
     """
 
     SAMPLE_RATE = 44100
@@ -2351,14 +2607,17 @@ class APU:
     FRAME_SEQ_PERIOD = 8192  # CPU cycles per frame-sequencer tick (= 4194304 / 512)
     SOFT_BUFFER_CAP = 65536  # bytes (~370 ms stereo at 44.1 kHz); emergency drop threshold
 
-    def __init__(self, mmu):
+    def __init__(self, mmu, is_cgb=False):
         self.mmu = mmu
+        self.is_cgb = is_cgb
         self.power = True
         self.buffer = bytearray()
 
-        # Frame sequencer
-        self.frame_seq_counter = self.FRAME_SEQ_PERIOD
-        self.frame_seq_step = 0
+        # Frame sequencer — derived from a base-clock counter so that it stays
+        # synchronised with DIV bit 12.  We track the falling edge of bit 12
+        # (i.e. 1→0 transition) which happens every 8192 base-clock cycles.
+        self.fs_div = 0           # base-clock counter; bit-12 falling edge → frame-seq tick
+        self.frame_seq_step = 0   # 0-7 step index
 
         # Fractional sample timer: produce one sample every CPU_CLOCK / SAMPLE_RATE cycles
         self.sample_accum = 0
@@ -2457,8 +2716,9 @@ class APU:
                 self._power_off()
             elif not self.power and new_power:
                 self.power = True
-                self.frame_seq_step = 0
-                self.frame_seq_counter = self.FRAME_SEQ_PERIOD
+                if self.is_cgb:
+                    self.frame_seq_step = 0
+                    self.fs_div = 0
             self.power = new_power
             self._refresh_nr52()
             return
@@ -2470,7 +2730,10 @@ class APU:
 
         # Wave RAM
         if 0xFF30 <= addr <= 0xFF3F:
-            self.wave_ram[addr - 0xFF30] = value
+            if self.is_cgb and self.ch3_enabled:
+                self.wave_ram[self.ch3_wave_pos >> 1] = value
+            elif not self.ch3_enabled:
+                self.wave_ram[addr - 0xFF30] = value
             mem[addr] = value
             return
 
@@ -2601,6 +2864,8 @@ class APU:
             return 0xFF
         mem = self.mmu.memory
         if 0xFF30 <= addr <= 0xFF3F:
+            if not self.is_cgb and self.ch3_enabled:
+                return 0xFF
             return self.wave_ram[addr - 0xFF30]
         # NRx2 (envelope) registers read back the last written value, not the live
         # envelope volume — the running volume is internal and not exposed.
@@ -2649,17 +2914,24 @@ class APU:
         self.ch3_vol_shift = 4
         self.ch3_wave_pos = 0
         self.ch4_lfsr = 0x7FFF
-        self.frame_seq_counter = self.FRAME_SEQ_PERIOD
-        self.frame_seq_step = 0
+        # On DMG the frame sequencer is free-running even when the APU is
+        # off; on CGB it resets on power-off.
+        if self.is_cgb:
+            self.fs_div = 0
+            self.frame_seq_step = 0
 
     # ── Channel triggers ─────────────────────────────────────────────
+
+    def _next_fs_clocks_length(self):
+        """Return True if the next frame-sequencer tick will clock length counters."""
+        return (self.frame_seq_step + 1) & 7 in (0, 2, 4, 6)
 
     def _trigger_ch1(self):
         if self.ch1_dac:
             self.ch1_enabled = True
         if self.ch1_length == 0:
-            self.ch1_length = 64
-        period = max((2048 - self.ch1_freq) * 4, 4)
+            self.ch1_length = 63 if self._next_fs_clocks_length() else 64
+        period = max((MAX_FREQUENCY - self.ch1_freq) * 4, 4)
         self.ch1_freq_timer = period
         self.ch1_duty_step = 0
         self.ch1_volume = self.ch1_env_initial
@@ -2675,8 +2947,8 @@ class APU:
         if self.ch2_dac:
             self.ch2_enabled = True
         if self.ch2_length == 0:
-            self.ch2_length = 64
-        period = max((2048 - self.ch2_freq) * 4, 4)
+            self.ch2_length = 63 if self._next_fs_clocks_length() else 64
+        period = max((MAX_FREQUENCY - self.ch2_freq) * 4, 4)
         self.ch2_freq_timer = period
         self.ch2_duty_step = 0
         self.ch2_volume = self.ch2_env_initial
@@ -2687,8 +2959,8 @@ class APU:
         if self.ch3_dac:
             self.ch3_enabled = True
         if self.ch3_length == 0:
-            self.ch3_length = 256
-        period = max((2048 - self.ch3_freq) * 2, 2)
+            self.ch3_length = 255 if self._next_fs_clocks_length() else 256
+        period = max((MAX_FREQUENCY - self.ch3_freq) * 2, 2)
         self.ch3_freq_timer = period
         self.ch3_wave_pos = 0
         self._refresh_nr52()
@@ -2697,7 +2969,7 @@ class APU:
         if self.ch4_dac:
             self.ch4_enabled = True
         if self.ch4_length == 0:
-            self.ch4_length = 64
+            self.ch4_length = 63 if self._next_fs_clocks_length() else 64
         period = max(_NOISE_DIVISORS[self.ch4_divisor_code] << self.ch4_shift, 8)
         self.ch4_freq_timer = period
         self.ch4_volume = self.ch4_env_initial
@@ -2709,7 +2981,7 @@ class APU:
         shift = self.ch1_sweep_shift
         delta = self.ch1_sweep_shadow >> shift
         new_freq = self.ch1_sweep_shadow - delta if self.ch1_sweep_direction else self.ch1_sweep_shadow + delta
-        if new_freq > 2047:
+        if new_freq > MAX_FREQUENCY - 1:
             self.ch1_enabled = False
             self.ch1_sweep_enabled = False
             self._refresh_nr52()
@@ -2720,7 +2992,7 @@ class APU:
             # Overflow check the second time per spec
             delta2 = new_freq >> shift
             check2 = new_freq - delta2 if self.ch1_sweep_direction else new_freq + delta2
-            if check2 > 2047:
+            if check2 > MAX_FREQUENCY - 1:
                 self.ch1_enabled = False
                 self.ch1_sweep_enabled = False
                 self._refresh_nr52()
@@ -2773,33 +3045,33 @@ class APU:
             self._ch1_sweep_calc(apply_result=True)
 
     def _clock_envelope(self):
-        if self.ch1_env_period:
-            self.ch1_env_timer -= 1
-            if self.ch1_env_timer <= 0:
-                self.ch1_env_timer = self.ch1_env_period
-                v = self.ch1_volume
-                if self.ch1_env_direction and v < 15:
-                    self.ch1_volume = v + 1
-                elif not self.ch1_env_direction and v > 0:
-                    self.ch1_volume = v - 1
-        if self.ch2_env_period:
-            self.ch2_env_timer -= 1
-            if self.ch2_env_timer <= 0:
-                self.ch2_env_timer = self.ch2_env_period
-                v = self.ch2_volume
-                if self.ch2_env_direction and v < 15:
-                    self.ch2_volume = v + 1
-                elif not self.ch2_env_direction and v > 0:
-                    self.ch2_volume = v - 1
-        if self.ch4_env_period:
-            self.ch4_env_timer -= 1
-            if self.ch4_env_timer <= 0:
-                self.ch4_env_timer = self.ch4_env_period
-                v = self.ch4_volume
-                if self.ch4_env_direction and v < 15:
-                    self.ch4_volume = v + 1
-                elif not self.ch4_env_direction and v > 0:
-                    self.ch4_volume = v - 1
+        period = self.ch1_env_period or 8
+        self.ch1_env_timer -= 1
+        if self.ch1_env_timer <= 0:
+            self.ch1_env_timer = period
+            v = self.ch1_volume
+            if self.ch1_env_direction and v < 15:
+                self.ch1_volume = v + 1
+            elif not self.ch1_env_direction and v > 0:
+                self.ch1_volume = v - 1
+        period = self.ch2_env_period or 8
+        self.ch2_env_timer -= 1
+        if self.ch2_env_timer <= 0:
+            self.ch2_env_timer = period
+            v = self.ch2_volume
+            if self.ch2_env_direction and v < 15:
+                self.ch2_volume = v + 1
+            elif not self.ch2_env_direction and v > 0:
+                self.ch2_volume = v - 1
+        period = self.ch4_env_period or 8
+        self.ch4_env_timer -= 1
+        if self.ch4_env_timer <= 0:
+            self.ch4_env_timer = period
+            v = self.ch4_volume
+            if self.ch4_env_direction and v < 15:
+                self.ch4_volume = v + 1
+            elif not self.ch4_env_direction and v > 0:
+                self.ch4_volume = v - 1
 
     # ── Per-step channel timers ─────────────────────────────────────
 
@@ -2808,7 +3080,7 @@ class APU:
         if self.ch1_enabled:
             t = self.ch1_freq_timer - cycles
             if t <= 0:
-                period = max((2048 - self.ch1_freq) * 4, 4)
+                period = max((MAX_FREQUENCY - self.ch1_freq) * 4, 4)
                 advances = (-t) // period + 1
                 self.ch1_duty_step = (self.ch1_duty_step + advances) & 7
                 t = period - ((-t) % period)
@@ -2817,7 +3089,7 @@ class APU:
         if self.ch2_enabled:
             t = self.ch2_freq_timer - cycles
             if t <= 0:
-                period = max((2048 - self.ch2_freq) * 4, 4)
+                period = max((MAX_FREQUENCY - self.ch2_freq) * 4, 4)
                 advances = (-t) // period + 1
                 self.ch2_duty_step = (self.ch2_duty_step + advances) & 7
                 t = period - ((-t) % period)
@@ -2826,7 +3098,7 @@ class APU:
         if self.ch3_enabled:
             t = self.ch3_freq_timer - cycles
             if t <= 0:
-                period = max((2048 - self.ch3_freq) * 2, 2)
+                period = max((MAX_FREQUENCY - self.ch3_freq) * 2, 2)
                 advances = (-t) // period + 1
                 self.ch3_wave_pos = (self.ch3_wave_pos + advances) & 31
                 t = period - ((-t) % period)
@@ -2892,12 +3164,12 @@ class APU:
         if pr & 0x80: right += s4
         # left/right ranges across the four channels: roughly +-(15+15+8+15) = +-53.
         # Master vol+1 is 1..8; scale factor ~70 keeps int16 headroom.
-        left = left * (self.vol_left + 1) * 70
-        right = right * (self.vol_right + 1) * 70
-        if left > 32767: left = 32767
-        elif left < -32768: left = -32768
-        if right > 32767: right = 32767
-        elif right < -32768: right = -32768
+        left = left * (self.vol_left + 1) * AUDIO_SCALE_FACTOR
+        right = right * (self.vol_right + 1) * AUDIO_SCALE_FACTOR
+        if left > INT16_MAX: left = INT16_MAX
+        elif left < INT16_MIN: left = INT16_MIN
+        if right > INT16_MAX: right = INT16_MAX
+        elif right < INT16_MIN: right = INT16_MIN
         lv = left & 0xFFFF
         rv = right & 0xFFFF
         self.buffer.extend((lv & 0xFF, (lv >> 8) & 0xFF, rv & 0xFF, (rv >> 8) & 0xFF))
@@ -2916,12 +3188,13 @@ class APU:
                 del self.buffer[:len(self.buffer) - self.SOFT_BUFFER_CAP]
             return
 
-        # Frame sequencer (512 Hz)
-        fsc = self.frame_seq_counter - cycles
-        while fsc <= 0:
-            fsc += self.FRAME_SEQ_PERIOD
+        # Frame sequencer (512 Hz) — tick on each falling edge of bit 12.
+        old_fs = self.fs_div
+        self.fs_div = old_fs + cycles
+        old_b12 = (old_fs >> 12) & 1
+        new_b12 = (self.fs_div >> 12) & 1
+        if new_b12 < old_b12:
             self._frame_seq_tick()
-        self.frame_seq_counter = fsc
 
         # Channel waveform timers
         self._step_channels(cycles)
@@ -2978,13 +3251,13 @@ def get_font(size, bold=True):
     if key not in _font_cache:
         try:
             _font_cache[key] = pygame.font.SysFont("Courier New", size, bold=bold)
-        except:
+        except (pygame.error, OSError):
             _font_cache[key] = pygame.font.Font(None, size)
     return _font_cache[key]
 
 
 class EmulatorMenu:
-    def __init__(self):
+    def __init__(self, bootrom_path=None):
         self.selected = 0
         self.main_items = ["Load ROM", "Settings", "Exit to OS"]
         self.roms = []
@@ -2995,6 +3268,7 @@ class EmulatorMenu:
         self.settings_cursor = 0
         self.exit_cursor = 0
         self.window_scale = 4
+        self.bootrom_path = bootrom_path
         self.fps_limit_idx = 0
         self.audio_idx = 0
         self.volume_idx = 4
@@ -3003,6 +3277,15 @@ class EmulatorMenu:
         self.shader_idx = 0
         self.status_line = ""
         self.status_ttl = 0
+        # Load persisted settings from config file
+        cfg = _load_config()
+        self.window_scale = cfg.get("window_scale", self.window_scale)
+        self.fps_limit_idx = _opt_index(FPS_LIMIT_OPTIONS, cfg.get("fps_limit", 59.73), 0)
+        self.audio_idx = _opt_index(AUDIO_OPTIONS, cfg.get("audio_enabled", True), 0)
+        self.volume_idx = _opt_index(VOLUME_OPTIONS, cfg.get("volume", 1.0), 4)
+        self.palette_idx = _opt_index(PALETTE_LIST, cfg.get("palette", 0), 0)
+        self.filter_idx = _opt_index(FILTER_OPTIONS, cfg.get("smooth_scale", False), 0)
+        self.shader_idx = _opt_index(SHADER_LIST, cfg.get("shader", 0), 0)
         self._sync_settings_items()
         if pygame is None:
             print("=" * 55)
@@ -3018,6 +3301,7 @@ class EmulatorMenu:
             pygame.mixer.pre_init(44100, -16, 2, 1024)
             pygame.init()
             logging.warning("Audio init failed — running silent (dummy audio driver).")
+        _init_joysticks()
         self.screen = pygame.display.set_mode((MENU_W, MENU_H))
         pygame.display.set_caption("Python GBC Emulator")
         self.logo = None
@@ -3074,6 +3358,15 @@ class EmulatorMenu:
             f"Filter: {FILTER_OPTIONS[self.filter_idx][0]}",
             f"Shader: {SHADER_LIST[self.shader_idx][0]}",
         ]
+        _save_config(dict(
+            window_scale=self.window_scale,
+            fps_limit=FPS_LIMIT_OPTIONS[self.fps_limit_idx][1],
+            audio_enabled=AUDIO_OPTIONS[self.audio_idx][1],
+            volume=VOLUME_OPTIONS[self.volume_idx][1],
+            palette=self.palette_idx,
+            smooth_scale=FILTER_OPTIONS[self.filter_idx][1],
+            shader=self.shader_idx,
+        ))
 
     def _status(self, msg):
         self.status_line = msg
@@ -3084,7 +3377,7 @@ class EmulatorMenu:
         s = f.render(text, True, colour)
         x = (MENU_W - s.get_width()) // 2
         if shadow:
-            shadow_color = (8, 24, 32)
+            shadow_color = (0, 0, 0)
             s_shadow = f.render(text, True, shadow_color)
             self.screen.blit(s_shadow, (x + 2, y + 2))
         self.screen.blit(s, (x, y))
@@ -3103,6 +3396,7 @@ class EmulatorMenu:
 
     def run(self):
         clock = pygame.time.Clock()
+        pygame.key.set_repeat(200, 50)
         page = "main"
         while True:
             page = self._handle(page)
@@ -3127,7 +3421,7 @@ class EmulatorMenu:
         for candidate in ("gbclogo.png", os.path.join(here, "gbclogo.png")):
             if os.path.isfile(candidate):
                 try:
-                    raw = pygame.image.load(candidate).convert()
+                    raw = pygame.image.load(candidate).convert_alpha()
                 except (OSError, pygame.error):
                     continue
                 scaled = pygame.transform.smoothscale(raw, (160, 160))
@@ -3154,14 +3448,20 @@ class EmulatorMenu:
             if event.type == pygame.QUIT:
                 pygame.quit()
                 sys.exit()
-            if event.type != pygame.KEYDOWN:
+            if event.type == pygame.KEYDOWN:
+                action = event.key
+            elif event.type in (pygame.JOYBUTTONDOWN, pygame.JOYHATMOTION, pygame.JOYAXISMOTION):
+                action = _gamepad_menu_action(event)
+            else:
+                continue
+            if action is None:
                 continue
             if page == "main":
-                if event.key == pygame.K_UP:
+                if action == pygame.K_UP:
                     self.selected = (self.selected - 1) % len(self.main_items)
-                elif event.key == pygame.K_DOWN:
+                elif action == pygame.K_DOWN:
                     self.selected = (self.selected + 1) % len(self.main_items)
-                elif event.key == pygame.K_RETURN:
+                elif action == pygame.K_RETURN or action == 'select':
                     if self.selected == 0:
                         self._scan_roms()
                         self.rom_cursor = 0
@@ -3174,21 +3474,21 @@ class EmulatorMenu:
                     elif self.selected == 2:
                         self.exit_cursor = 0
                         return "confirm_exit"
-                elif event.key == pygame.K_ESCAPE:
+                elif action == pygame.K_ESCAPE or action == 'back':
                     self.exit_cursor = 0
                     return "confirm_exit"
             elif page == "load_rom":
-                if event.key == pygame.K_UP:
+                if action == pygame.K_UP:
                     if self.rom_cursor > 0:
                         self.rom_cursor -= 1
                         if self.rom_cursor < self.rom_scroll:
                             self.rom_scroll = self.rom_cursor
-                elif event.key == pygame.K_DOWN:
+                elif action == pygame.K_DOWN:
                     if self.rom_cursor < len(self.roms) - 1:
                         self.rom_cursor += 1
                         if self.rom_cursor >= self.rom_scroll + self.max_visible:
                             self.rom_scroll = self.rom_cursor - self.max_visible + 1
-                elif event.key == pygame.K_RETURN:
+                elif action == pygame.K_RETURN or action == 'select':
                     if self.roms:
                         path = self.roms[self.rom_cursor]
                         self._status(f"Loading: {os.path.basename(path)}")
@@ -3204,29 +3504,40 @@ class EmulatorMenu:
                                 palette=PALETTE_LIST[self.palette_idx][1],
                                 smooth_scale=FILTER_OPTIONS[self.filter_idx][1],
                                 shader=SHADER_LIST[self.shader_idx][1],
+                                bootrom_path=self.bootrom_path,
                             )
                             gb.run()
+                            # Sync menu settings indices from pause-menu changes
+                            si = gb._set_idx
+                            self.window_scale = WINDOW_SCALE_OPTIONS[si['scale']][1]
+                            self.fps_limit_idx = si['fps']
+                            self.audio_idx = si['audio']
+                            self.volume_idx = si['volume']
+                            self.palette_idx = si['palette']
+                            self.filter_idx = si['filter']
+                            self.shader_idx = si['shader']
                         except FileNotFoundError:
                             self._status(f"ROM not found: {os.path.basename(path)}")
-                        except Exception as e:
+                        except (OSError, pygame.error, RuntimeError, MemoryError) as e:
                             self._status(f"Error loading ROM: {e}")
                         self.screen = pygame.display.set_mode((MENU_W, MENU_H))
                         pygame.event.clear()
+                        _init_joysticks()
                         return "main"
-                elif event.key == pygame.K_ESCAPE:
+                elif action == pygame.K_ESCAPE or action == 'back':
                     self.selected = 0
                     return "main"
-                elif event.key == pygame.K_F5:
+                elif action == pygame.K_F5:
                     self._scan_roms()
                     self.rom_cursor = 0
                     self.rom_scroll = 0
                     self._status("ROM list refreshed")
             elif page == "settings":
-                if event.key == pygame.K_UP:
+                if action == pygame.K_UP:
                     self.settings_cursor = (self.settings_cursor - 1) % len(self.settings_items)
-                elif event.key == pygame.K_DOWN:
+                elif action == pygame.K_DOWN:
                     self.settings_cursor = (self.settings_cursor + 1) % len(self.settings_items)
-                elif event.key == pygame.K_RETURN:
+                elif action == pygame.K_RETURN or action == 'select':
                     if self.settings_cursor == 0:
                         scales = [2, 3, 4, 5]
                         try:
@@ -3247,19 +3558,19 @@ class EmulatorMenu:
                     elif self.settings_cursor == 6:
                         self.shader_idx = (self.shader_idx + 1) % len(SHADER_LIST)
                     self._sync_settings_items()
-                elif event.key == pygame.K_ESCAPE:
+                elif action == pygame.K_ESCAPE or action == 'back':
                     self.selected = 1
                     return "main"
             elif page == "confirm_exit":
-                if event.key in (pygame.K_UP, pygame.K_DOWN, pygame.K_LEFT, pygame.K_RIGHT):
+                if action in (pygame.K_UP, pygame.K_DOWN, pygame.K_LEFT, pygame.K_RIGHT, 'up', 'down', 'left', 'right'):
                     self.exit_cursor ^= 1
-                elif event.key == pygame.K_RETURN:
+                elif action == pygame.K_RETURN or action == 'select':
                     if self.exit_cursor == 1:
                         pygame.quit()
                         sys.exit()
                     self.selected = 0
                     return "main"
-                elif event.key == pygame.K_ESCAPE:
+                elif action == pygame.K_ESCAPE or action == 'back':
                     self.selected = 0
                     return "main"
         return page
@@ -3272,7 +3583,6 @@ class EmulatorMenu:
             subtitle_y = 235
             menu_y = 290
         else:
-            self._centre_text("Python GBC Emulator", 60, MENU_HI, 48, shadow=True)
             title_y = 120
             subtitle_y = 160
             menu_y = 200
@@ -3302,6 +3612,16 @@ class EmulatorMenu:
                 self.screen.blit(s, (30, y))
                 if idx == self.rom_cursor:
                     pygame.draw.rect(self.screen, colour, (28, y + 20, 580, 1))
+                    # Show ROM header info for the selected entry
+                    info = getattr(self, '_rom_info_cache', {}).get(rom_path)
+                    if info is None:
+                        info = _parse_rom_header(rom_path) or "Could not read header"
+                        self._rom_info_cache = getattr(self, '_rom_info_cache', {})
+                        self._rom_info_cache[rom_path] = info
+                    if info:
+                        fi = get_font(18)
+                        si = fi.render(info, True, MENU_DIM)
+                        self.screen.blit(si, (40, 90 + len(visible) * 30 + 15))
         self._centre_text("Enter: Load  |  F5: Refresh  |  Esc: Back", MENU_H - 30, MENU_DIM, 18)
 
     def _render_settings(self):
@@ -3321,12 +3641,14 @@ class GameBoy:
     """The main emulator orchestrator class."""
     def __init__(self, rom_path=None, window_scale=4, fps_limit=59.73,
                  audio_enabled=True, volume=1.0, palette=PALETTE_DMG,
-                 smooth_scale=False, shader=None, bootrom_path=None):
+                 smooth_scale=False, shader=None, bootrom_path=None,
+                 link_cable=None):
         self.mmu = MMU()
+        self.mmu.link_cable = link_cable
         self.cpu = CPU(self.mmu)
         self.ppu = PPU(self.mmu)
         self.timers = Timers(self.mmu)
-        self.apu = APU(self.mmu)
+        self.apu = APU(self.mmu, self.mmu.is_cgb)
         self.mmu.apu = self.apu
         self.mmu.ppu = self.ppu
         self.mmu.div_reset_callback = self.timers.reset_div
@@ -3352,6 +3674,7 @@ class GameBoy:
             if self.mmu.is_cgb:
                 self.ppu.is_cgb = True
                 self.ppu._cgb_init_palettes()
+                self.apu.is_cgb = True
             if not self.mmu.bootrom_enabled:
                 # Set post-boot register state only if no boot ROM will run
                 if self.mmu.is_cgb:
@@ -3397,6 +3720,7 @@ class GameBoy:
             self.window_scale = window_scale
             self.screen = pygame.display.set_mode((SCREEN_WIDTH * self.window_scale, SCREEN_HEIGHT * self.window_scale))
             pygame.display.set_caption(f"Python GBC Emulator - {os.path.basename(rom_path) if rom_path else 'No ROM'}")
+            _init_joysticks()
         elif not rom_path:
             logging.warning("pygame not available — running headless is not useful without a ROM.")
 
@@ -3410,10 +3734,10 @@ class GameBoy:
         self.pause_cursor = 0
         self.pause_settings_cursor = 0
         self.pause_exit_cursor = 0
-        self._pause_msg = ""
+        self._pause_msg = ''
         self._pause_msg_ttl = 0
         self._set_idx = {
-            'scale':   _opt_index([(s, s) for s in WINDOW_SCALE_OPTIONS], window_scale, 2),
+            'scale':   _opt_index(WINDOW_SCALE_OPTIONS, window_scale, 2),
             'fps':     _opt_index(FPS_LIMIT_OPTIONS, fps_limit, 0),
             'audio':   0 if audio_enabled else 1,
             'volume':  _opt_index(VOLUME_OPTIONS, volume, 4),
@@ -3537,7 +3861,6 @@ class GameBoy:
             mmu.wram_banks[mmu.svbk - 1][:] = mmu.memory[0xD000:0xE000]
             # Flush APU to silence (state captures the buffer's tail).
             apu.drain()
-            import struct
             parts = []
             parts.append(self.SAVE_STATE_MAGIC)
             parts.append(struct.pack('<BBBB', self.SAVE_STATE_VERSION, slot, 0, 0))
@@ -3589,14 +3912,16 @@ class GameBoy:
                                      1 if ppu.lcd_was_on else 0, 1 if ppu.is_cgb else 0,
                                      ppu.window_line_counter & 0xFF,
                                      (ppu.window_line_counter >> 8) & 0xFF,
-                                     0, 0, 0, 0))
+                                     0, 0, 0,
+                                     1 if ppu.prev_stat_irq else 0))
             parts.append(ppu.bg_palette_data)
             parts.append(ppu.obj_palette_data)
             # APU: pack a flat list of 1-byte values for each boolean / small int.
             apu_values = [
                 1 if apu.power else 0,
+                1 if apu.is_cgb else 0,
                 apu.frame_seq_step & 0x07,
-                (apu.frame_seq_counter >> 8) & 0xFF,
+                (apu.fs_div >> 8) & 0xFF,
                 apu.vol_left & 0x07, apu.vol_right & 0x07,
                 apu.pan_left, apu.pan_right,
                 apu.sample_accum & 0xFF, (apu.sample_accum >> 8) & 0xFF,
@@ -3661,7 +3986,6 @@ class GameBoy:
         if not path or not os.path.isfile(path):
             return False
         try:
-            import struct
             with open(path, 'rb') as f:
                 data = f.read()
             pos = 0
@@ -3779,6 +4103,7 @@ class GameBoy:
             ppu.cgb_opri = cgb_opri & 1
             ppu.lcd_was_on = bool(lcd_was_on)
             ppu.is_cgb = bool(is_cgb_ppu)
+            ppu.prev_stat_irq = bool(_w3)
             ppu.window_line_counter = win_lo | (win_hi << 8)
             ppu.bg_palette_data[:] = data[pos:pos+64]
             pos += 64
@@ -3789,14 +4114,15 @@ class GameBoy:
                 ppu._update_cgb_bg_color(i)
                 ppu._update_cgb_obj_color(i)
             # APU
-            apu_size = 13 + 16 + 12 + 10 + 12 + 14
+            apu_size = 13 + 16 + 12 + 10 + 12 + 14 + 1  # +1 for is_cgb
             apu_bytes = data[pos:pos+apu_size]
             pos += apu_size
             ap = apu_bytes
             ai = 0
             apu.power = bool(ap[ai]); ai += 1
+            apu.is_cgb = bool(ap[ai]); ai += 1
             apu.frame_seq_step = ap[ai] & 0x07; ai += 1
-            apu.frame_seq_counter = (ap[ai] & 0xFF) << 8; ai += 1
+            apu.fs_div = (ap[ai] & 0xFF) << 8; ai += 1
             apu.vol_left = ap[ai] & 0x07; apu.vol_right = ap[ai+1] & 0x07; ai += 2
             apu.pan_left = ap[ai]; apu.pan_right = ap[ai+1]; ai += 2
             apu.sample_accum = ap[ai] | (ap[ai+1] << 8); ai += 2
@@ -3872,10 +4198,14 @@ class GameBoy:
             return False
 
     def _pump_audio(self):
-        """Feed the mixer from the pending-audio deque (channel + one queue slot)."""
+        """Feed the mixer from the pending-audio deque (channel + one queue slot).
+        Drops stale queued buffers when the queue backs up to avoid drift."""
         if not self.audio_enabled:
             return
         ch = self.audio_channel
+        # If the queue is backing up, drop the oldest buffers to stay in sync.
+        while len(self._audio_pending) > 4:
+            self._audio_pending.popleft()
         while self._audio_pending:
             if not ch.get_busy():
                 ch.play(self._audio_pending.popleft())
@@ -3901,6 +4231,10 @@ class GameBoy:
         self._audio_refs.append(sound)
         if len(self._audio_refs) > 8:
             self._audio_refs = self._audio_refs[-4:]
+        # Warn if the audio queue is backing up (emulator running faster than mixer)
+        if len(self._audio_pending) >= 12:
+            logging.debug("Audio queue nearly full (%d entries); mixer may be behind",
+                          len(self._audio_pending))
         self._pump_audio()
         return n_samples
 
@@ -3917,10 +4251,12 @@ class GameBoy:
             target = self._av_start + self._sync_frames / self.fps_limit
         delay = target - now
         if delay > 0:
-            time.sleep(min(delay, 1.0 / 30))
-        elif delay < -0.5:
-            self._av_start = now - (self._sync_frames / self.fps_limit if self.fps_limit > 0 else 0)
+            time.sleep(delay * 0.95)
+        elif delay < -2.0:
+            # Fallen >2 seconds behind — reset the sync clock to avoid a lurch.
+            self._av_start = now
             self._sync_samples = 0
+            self._sync_frames = 0
 
     def step_all(self):
         """Execute one CPU step and propagate cycles to PPU, timers, and APU in a
@@ -3936,6 +4272,9 @@ class GameBoy:
                 self.mmu.dma_buffer = bytearray()
         else:
             cpu_cycles = self.cpu.step()
+            if self.mmu.gdma_stall > 0:
+                cpu_cycles += self.mmu.gdma_stall
+                self.mmu.gdma_stall = 0
         # CGB double-speed (KEY1): the CPU and the DIV/TIMA timer run at 2x the
         # base clock, but the PPU and APU stay on the base clock. Feed the latter
         # half the CPU cycles, carrying the odd cycle across calls so no dot is
@@ -3964,11 +4303,14 @@ class GameBoy:
         self._av_start = time.perf_counter()
         self._sync_samples = 0
         self._sync_frames = 0
+        self._cycle_carry = 0
 
         while self.running:
-            cycles_this_frame = 0
+            cycles_this_frame = self._cycle_carry
+            self._cycle_carry = 0
             while cycles_this_frame < CYCLES_PER_FRAME:
                 cycles_this_frame += self.step_all()
+            self._cycle_carry = cycles_this_frame - CYCLES_PER_FRAME
 
             samples_this_frame = 0
             if pygame:
@@ -3983,9 +4325,11 @@ class GameBoy:
             self._pace_frame(samples_this_frame)
 
         self._save_sav()
+        if self.mmu.link_cable is not None:
+            self.mmu.link_cable.close()
 
     def handle_events(self):
-        """Process window events and Joypad inputs."""
+        """Process window events and Joypad / Gamepad inputs."""
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 self.running = False
@@ -4022,6 +4366,24 @@ class GameBoy:
             elif event.type == pygame.KEYUP:
                 if event.key in KEY_TO_JOYPAD_BIT:
                     self.mmu.set_joypad_button(KEY_TO_JOYPAD_BIT[event.key], False)
+            # Gamepad input
+            elif event.type == pygame.JOYBUTTONDOWN:
+                bit = _GAMEPAD_BUTTON_MAP.get(event.button)
+                if bit is not None:
+                    self.mmu.set_joypad_button(bit, True)
+                if event.button == 7:  # Start -> pause
+                    self._open_pause_menu()
+                    return
+            elif event.type == pygame.JOYBUTTONUP:
+                bit = _GAMEPAD_BUTTON_MAP.get(event.button)
+                if bit is not None:
+                    self.mmu.set_joypad_button(bit, False)
+            elif event.type == pygame.JOYHATMOTION:
+                for bit, pressed in _joystick_dpad_from_hat(event):
+                    self.mmu.set_joypad_button(bit, pressed)
+            elif event.type == pygame.JOYAXISMOTION:
+                for bit, pressed in _joystick_dpad_from_axis(event):
+                    self.mmu.set_joypad_button(bit, pressed)
 
     # ── In-game pause menu ────────────────────────────────────────────
     PAUSE_ITEMS = ["Resume", "Save State", "Load State", "Settings", "Exit to Menu"]
@@ -4040,7 +4402,7 @@ class GameBoy:
     def _pause_settings_items(self):
         si = self._set_idx
         return [
-            f"Window Scale: {WINDOW_SCALE_OPTIONS[si['scale']]}x",
+            f"Window Scale: {WINDOW_SCALE_OPTIONS[si['scale']][0]}",
             f"Frame Rate: {FPS_LIMIT_OPTIONS[si['fps']][0]}",
             f"Audio: {AUDIO_OPTIONS[si['audio']][0]}",
             f"Volume: {VOLUME_OPTIONS[si['volume']][0]}",
@@ -4049,22 +4411,25 @@ class GameBoy:
             f"Shader: {SHADER_LIST[si['shader']][0]}",
         ]
 
-    def _cycle_pause_setting(self, cursor):
-        """Advance the setting under the cursor and apply it to the live emulator.
+    def _cycle_pause_setting(self, cursor, direction=1):
+        """Cycle the setting under the cursor forward (1) or backward (-1).
         Returns True if the window was resized (so the backdrop must be recaptured)."""
         si = self._set_idx
         resized = False
         if cursor == 0:
-            si['scale'] = (si['scale'] + 1) % len(WINDOW_SCALE_OPTIONS)
-            self.window_scale = WINDOW_SCALE_OPTIONS[si['scale']]
+            n = len(WINDOW_SCALE_OPTIONS)
+            si['scale'] = (si['scale'] + direction) % n
+            self.window_scale = WINDOW_SCALE_OPTIONS[si['scale']][1]
             self.screen = pygame.display.set_mode(
                 (SCREEN_WIDTH * self.window_scale, SCREEN_HEIGHT * self.window_scale))
             resized = True
         elif cursor == 1:
-            si['fps'] = (si['fps'] + 1) % len(FPS_LIMIT_OPTIONS)
+            n = len(FPS_LIMIT_OPTIONS)
+            si['fps'] = (si['fps'] + direction) % n
             self.fps_limit = FPS_LIMIT_OPTIONS[si['fps']][1]
         elif cursor == 2:
-            si['audio'] = (si['audio'] + 1) % len(AUDIO_OPTIONS)
+            n = len(AUDIO_OPTIONS)
+            si['audio'] = (si['audio'] + direction) % n
             self._audio_on = AUDIO_OPTIONS[si['audio']][1]
             if self._audio_on:
                 self._init_audio()
@@ -4077,18 +4442,32 @@ class GameBoy:
                         pass
                 self.audio_enabled = False
         elif cursor == 3:
-            si['volume'] = (si['volume'] + 1) % len(VOLUME_OPTIONS)
+            n = len(VOLUME_OPTIONS)
+            si['volume'] = (si['volume'] + direction) % n
             self._set_volume(VOLUME_OPTIONS[si['volume']][1])
         elif cursor == 4:
-            si['palette'] = (si['palette'] + 1) % len(PALETTE_LIST)
+            n = len(PALETTE_LIST)
+            si['palette'] = (si['palette'] + direction) % n
             self.ppu.set_palette(PALETTE_LIST[si['palette']][1])
         elif cursor == 5:
-            si['filter'] = (si['filter'] + 1) % len(FILTER_OPTIONS)
+            n = len(FILTER_OPTIONS)
+            si['filter'] = (si['filter'] + direction) % n
             self.smooth_scale = FILTER_OPTIONS[si['filter']][1]
         elif cursor == 6:
-            si['shader'] = (si['shader'] + 1) % len(SHADER_LIST)
+            n = len(SHADER_LIST)
+            si['shader'] = (si['shader'] + direction) % n
             self.shader = SHADER_LIST[si['shader']][1]
             self._prev_shader_frame = None
+        # Persist settings so they survive restart
+        _save_config(dict(
+            window_scale=WINDOW_SCALE_OPTIONS[si['scale']][1],
+            fps_limit=FPS_LIMIT_OPTIONS[si['fps']][1],
+            audio_enabled=AUDIO_OPTIONS[si['audio']][1],
+            volume=VOLUME_OPTIONS[si['volume']][1],
+            palette=si['palette'],
+            smooth_scale=FILTER_OPTIONS[si['filter']][1],
+            shader=si['shader'],
+        ))
         return resized
 
     def _capture_pause_backdrop(self):
@@ -4132,6 +4511,8 @@ class GameBoy:
         if self.running:
             pressed = pygame.key.get_pressed()
             for key, bit in KEY_TO_JOYPAD_BIT.items():
+                if key in (pygame.K_RETURN, pygame.K_ESCAPE):
+                    continue
                 self.mmu.set_joypad_button(bit, bool(pressed[key]))
         pygame.event.clear()
         self._av_start = time.perf_counter()
@@ -4144,38 +4525,48 @@ class GameBoy:
                 self.running = False
                 self.paused = False
                 return page, backdrop
-            if event.type != pygame.KEYDOWN:
+            if event.type == pygame.KEYDOWN:
+                action = event.key
+            elif event.type in (pygame.JOYBUTTONDOWN, pygame.JOYHATMOTION, pygame.JOYAXISMOTION):
+                action = _gamepad_menu_action(event)
+            else:
+                continue
+            if action is None:
                 continue
             if page == "pause":
-                if event.key == pygame.K_UP:
+                if action in (pygame.K_UP, 'up'):
                     self.pause_cursor = (self.pause_cursor - 1) % len(self.PAUSE_ITEMS)
-                elif event.key == pygame.K_DOWN:
+                elif action in (pygame.K_DOWN, 'down'):
                     self.pause_cursor = (self.pause_cursor + 1) % len(self.PAUSE_ITEMS)
-                elif event.key == pygame.K_RETURN:
+                elif action == pygame.K_RETURN or action == 'select':
                     page, backdrop = self._activate_pause_item(page, backdrop)
-                elif event.key == pygame.K_ESCAPE:
+                elif action == pygame.K_ESCAPE or action == 'back':
                     self.paused = False
             elif page == "settings":
                 items = self._pause_settings_items()
-                if event.key == pygame.K_UP:
+                if action in (pygame.K_UP, 'up'):
                     self.pause_settings_cursor = (self.pause_settings_cursor - 1) % len(items)
-                elif event.key == pygame.K_DOWN:
+                elif action in (pygame.K_DOWN, 'down'):
                     self.pause_settings_cursor = (self.pause_settings_cursor + 1) % len(items)
-                elif event.key in (pygame.K_RETURN, pygame.K_LEFT, pygame.K_RIGHT):
-                    if self._cycle_pause_setting(self.pause_settings_cursor):
+                elif action == pygame.K_RETURN or action == 'select' or action in (pygame.K_RIGHT, 'right'):
+                    if self._cycle_pause_setting(self.pause_settings_cursor, 1):
                         backdrop = self._capture_pause_backdrop()
-                elif event.key == pygame.K_ESCAPE:
+                elif action in (pygame.K_LEFT, 'left'):
+                    if self._cycle_pause_setting(self.pause_settings_cursor, -1):
+                        backdrop = self._capture_pause_backdrop()
+                elif action == pygame.K_ESCAPE or action == 'back':
                     page = "pause"
             elif page == "confirm_exit":
-                if event.key in (pygame.K_UP, pygame.K_DOWN, pygame.K_LEFT, pygame.K_RIGHT):
+                if action in (pygame.K_UP, pygame.K_DOWN, pygame.K_LEFT, pygame.K_RIGHT,
+                              'up', 'down', 'left', 'right'):
                     self.pause_exit_cursor ^= 1
-                elif event.key == pygame.K_RETURN:
+                elif action == pygame.K_RETURN or action == 'select':
                     if self.pause_exit_cursor == 1:
                         self.running = False
                         self.paused = False
                     else:
                         page = "pause"
-                elif event.key == pygame.K_ESCAPE:
+                elif action == pygame.K_ESCAPE or action == 'back':
                     page = "pause"
         return page, backdrop
 
@@ -4305,11 +4696,46 @@ if __name__ == "__main__":
     parser.add_argument("rom", nargs="?", help="Path to the .gb or .gbc ROM file")
     parser.add_argument("--nomenu", action="store_true", help="Skip menu, boot directly into ROM")
     parser.add_argument("--bootrom", help="Path to boot ROM (DMG 256B or CGB ~2304B)")
+    link_group = parser.add_argument_group("link cable (local multiplayer)")
+    link_group.add_argument("--link-server", type=int, metavar="PORT",
+                            help="Listen for a link cable connection on PORT")
+    link_group.add_argument("--link-connect", metavar="HOST:PORT",
+                            help="Connect to a link cable server at HOST:PORT")
     args = parser.parse_args()
 
+    link_cable = None
+    if args.link_server is not None and args.link_connect is not None:
+        parser.error("Cannot use both --link-server and --link-connect")
+    if args.link_server is not None:
+        link_cable = LinkCable()
+        print(f"Link cable: listening on port {args.link_server}...")
+        link_cable.start_server(args.link_server)
+        if link_cable.sock is None:
+            print("Link cable: no connection (timeout). Running without link.")
+            link_cable = None
+        else:
+            print("Link cable: connected!")
+    elif args.link_connect is not None:
+        host, _, port_str = args.link_connect.partition(":")
+        try:
+            port = int(port_str)
+        except ValueError:
+            parser.error("--link-connect must be HOST:PORT")
+        link_cable = LinkCable()
+        print(f"Link cable: connecting to {host}:{port}...")
+        link_cable.connect(host, port)
+        if link_cable.sock is None:
+            print("Link cable: connection failed. Running without link.")
+            link_cable = None
+        else:
+            print("Link cable: connected!")
+
     if args.nomenu and args.rom:
-        emulator = GameBoy(args.rom, bootrom_path=args.bootrom)
+        emulator = GameBoy(args.rom, bootrom_path=args.bootrom, link_cable=link_cable)
         emulator.run()
     else:
-        menu = EmulatorMenu()
+        if link_cable is not None:
+            link_cable.close()
+            print("Note: link cable requires --nomenu. Run with --nomenu for multiplayer.")
+        menu = EmulatorMenu(bootrom_path=args.bootrom)
         menu.run()

@@ -16,12 +16,20 @@ ENV/
 roms/
 *.gb
 *.gbc
+*.gba
+*.z64
+*.n64
 *.sav
 *.sram
+*.ss0
+*.ss1
+gbc_config.json
 
 # Screenshots / images
 *.png
 !gbclogo.png
+*.ppm
+*.bmp
 
 # Logs
 *.log
