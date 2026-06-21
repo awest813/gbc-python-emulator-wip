@@ -3216,8 +3216,6 @@ class APU:
             while self.sample_accum >= sn:
                 self.sample_accum -= sn
                 self.buffer.extend(b'\x00\x00\x00\x00')
-            if len(self.buffer) > self.SOFT_BUFFER_CAP:
-                del self.buffer[:len(self.buffer) - self.SOFT_BUFFER_CAP]
             return
 
         # Frame sequencer (512 Hz) — tick on each falling edge of bit 12.
@@ -3227,8 +3225,9 @@ class APU:
         if ((new_fs >> 12) & 1) < ((old_fs >> 12) & 1):
             self._frame_seq_tick()
 
-        # Channel waveform timers
-        self._step_channels(cycles)
+        # Channel waveform timers (skip when all channels silent)
+        if self.ch1_enabled or self.ch2_enabled or self.ch3_enabled or self.ch4_enabled:
+            self._step_channels(cycles)
 
         # Sample emission
         self.sample_accum += cycles * sd
@@ -3236,14 +3235,13 @@ class APU:
             self.sample_accum -= sn
             self._mix_sample()
 
-        # Hard-cap the buffer so a stalled audio backend can't blow memory.
-        if len(self.buffer) > self.SOFT_BUFFER_CAP:
-            del self.buffer[:len(self.buffer) - self.SOFT_BUFFER_CAP]
-
     def drain(self):
         """Returns and clears the accumulated PCM bytes (signed-16 stereo LE)."""
-        data = bytes(self.buffer)
-        del self.buffer[:]
+        buf = self.buffer
+        if len(buf) > self.SOFT_BUFFER_CAP:
+            del buf[:len(buf) - self.SOFT_BUFFER_CAP]
+        data = bytes(buf)
+        del buf[:]
         return data
 
     def peek_samples_for_cycles(self, cycles):
