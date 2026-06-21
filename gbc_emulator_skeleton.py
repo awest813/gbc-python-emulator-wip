@@ -2556,10 +2556,13 @@ class Timers:
         div_counter = self.div_counter + cycles
         self.div_counter = div_counter
         mem[0xFF04] = (div_counter >> 8) & 0xFF
-
         tac = mem[0xFF07]
         if not (tac & 0x04):
             return
+        self._tima_step(cycles, tac)
+
+    def _tima_step(self, cycles, tac):
+        mem = self.mmu.memory
         step_cyc = self._TIMA_RATES[tac & 0x03]
         tima_accum = self.tima_accum + cycles
         if tima_accum < step_cyc:
@@ -4315,7 +4318,15 @@ class GameBoy:
         else:
             dot_cycles = cpu_cycles
         self.ppu.step(dot_cycles)
-        self.timers.step(cpu_cycles)
+        # Timers: DIV update is inlined (always runs); TIMA only when TAC enabled
+        mem = mmu.memory
+        timers = self.timers
+        div = timers.div_counter + cpu_cycles
+        timers.div_counter = div
+        mem[0xFF04] = (div >> 8) & 0xFF
+        tac = mem[0xFF07]
+        if tac & 0x04:
+            timers._tima_step(cpu_cycles, tac)
         self.apu.step(dot_cycles)
         if self._has_rtc:
             self._rtc_cycle_accum += cpu_cycles
