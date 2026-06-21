@@ -711,385 +711,387 @@ class CPU:
 
     def _exec_low(self, opcode):
         # 0x00-0x3F: less common opcodes.
+        reg = self.reg; mmu = self.mmu
         if opcode == 0x00:
             return 4
         if opcode == 0x01:
-            self.reg.bc = self.fetch_word(); return 12
+            reg.bc = self.fetch_word(); return 12
         if opcode == 0x02:
-            self.mmu.write_byte(self.reg.bc, self.reg.a); return 8
+            mmu.write_byte(reg.bc, reg.a); return 8
         if opcode == 0x03:
-            self.reg.bc = (self.reg.bc + 1) & 0xFFFF; return 8
+            reg.bc = (reg.bc + 1) & 0xFFFF; return 8
         if opcode == 0x04:
-            self.reg.b = self._inc_r8(self.reg.b); return 4
+            reg.b = self._inc_r8(reg.b); return 4
         if opcode == 0x05:
-            self.reg.b = self._dec_r8(self.reg.b); return 4
+            reg.b = self._dec_r8(reg.b); return 4
         if opcode == 0x06:
-            self.reg.b = self.fetch_byte(); return 8
+            reg.b = self.fetch_byte(); return 8
         if opcode == 0x07:
-            a = self.reg.a; carry = (a >> 7) & 1
-            self.reg.a = ((a << 1) | carry) & 0xFF
-            self.reg.set_flag(FLAG_Z, 0); self.reg.set_flag(FLAG_N, 0)
-            self.reg.set_flag(FLAG_H, 0); self.reg.set_flag(FLAG_C, carry); return 4
+            a = reg.a; carry = (a >> 7) & 1
+            reg.a = ((a << 1) | carry) & 0xFF
+            reg.set_flag(FLAG_Z, 0); reg.set_flag(FLAG_N, 0)
+            reg.set_flag(FLAG_H, 0); reg.set_flag(FLAG_C, carry); return 4
         if opcode == 0x08:
             addr = self.fetch_word()
-            self.mmu.write_word(addr, self.reg.sp); return 20
+            mmu.write_word(addr, reg.sp); return 20
         if opcode == 0x09:
-            self._add_hl_rr(self.reg.bc); return 8
+            self._add_hl_rr(reg.bc); return 8
         if opcode == 0x0A:
-            self.reg.a = self.mmu.read_byte(self.reg.bc); return 8
+            reg.a = mmu.read_byte(reg.bc); return 8
         if opcode == 0x0B:
-            self.reg.bc = (self.reg.bc - 1) & 0xFFFF; return 8
+            reg.bc = (reg.bc - 1) & 0xFFFF; return 8
         if opcode == 0x0C:
-            self.reg.c = self._inc_r8(self.reg.c); return 4
+            reg.c = self._inc_r8(reg.c); return 4
         if opcode == 0x0D:
-            self.reg.c = self._dec_r8(self.reg.c); return 4
+            reg.c = self._dec_r8(reg.c); return 4
         if opcode == 0x0E:
-            self.reg.c = self.fetch_byte(); return 8
+            reg.c = self.fetch_byte(); return 8
         if opcode == 0x0F:
-            a = self.reg.a; carry = a & 1
-            self.reg.a = ((a >> 1) | (carry << 7)) & 0xFF
-            self.reg.set_flag(FLAG_Z, 0); self.reg.set_flag(FLAG_N, 0)
-            self.reg.set_flag(FLAG_H, 0); self.reg.set_flag(FLAG_C, carry); return 4
+            a = reg.a; carry = a & 1
+            reg.a = ((a >> 1) | (carry << 7)) & 0xFF
+            reg.set_flag(FLAG_Z, 0); reg.set_flag(FLAG_N, 0)
+            reg.set_flag(FLAG_H, 0); reg.set_flag(FLAG_C, carry); return 4
         if opcode == 0x10:
             self.fetch_byte()  # consume 0x00 padding
-            if self.mmu.is_cgb and (self.mmu.key1 & 0x01):
-                self.mmu.key1 ^= 0x80  # toggle double-speed
-                self.mmu.key1 &= ~0x01  # clear prepare flag
+            if mmu.is_cgb and (mmu.key1 & 0x01):
+                mmu.key1 ^= 0x80  # toggle double-speed
+                mmu.key1 &= ~0x01  # clear prepare flag
             else:
-                self.mmu.memory[0xFF40] &= 0x7F  # disable LCD
+                mmu.memory[0xFF40] &= 0x7F  # disable LCD
                 self.halted = True  # wakes on any pending interrupt (joypad)
             return 4  # STOP
         if opcode == 0x11:
-            self.reg.de = self.fetch_word(); return 12
+            reg.de = self.fetch_word(); return 12
         if opcode == 0x12:
-            self.mmu.write_byte(self.reg.de, self.reg.a); return 8
+            mmu.write_byte(reg.de, reg.a); return 8
         if opcode == 0x13:
-            self.reg.de = (self.reg.de + 1) & 0xFFFF; return 8
+            reg.de = (reg.de + 1) & 0xFFFF; return 8
         if opcode == 0x14:
-            self.reg.d = self._inc_r8(self.reg.d); return 4
+            reg.d = self._inc_r8(reg.d); return 4
         if opcode == 0x15:
-            self.reg.d = self._dec_r8(self.reg.d); return 4
+            reg.d = self._dec_r8(reg.d); return 4
         if opcode == 0x16:
-            self.reg.d = self.fetch_byte(); return 8
+            reg.d = self.fetch_byte(); return 8
         if opcode == 0x17:
-            a = self.reg.a; old_c = self.reg.get_flag(FLAG_C)
+            a = reg.a; old_c = reg.get_flag(FLAG_C)
             new_c = (a >> 7) & 1
-            self.reg.a = ((a << 1) | old_c) & 0xFF
-            self.reg.set_flag(FLAG_Z, 0); self.reg.set_flag(FLAG_N, 0)
-            self.reg.set_flag(FLAG_H, 0); self.reg.set_flag(FLAG_C, new_c); return 4
+            reg.a = ((a << 1) | old_c) & 0xFF
+            reg.set_flag(FLAG_Z, 0); reg.set_flag(FLAG_N, 0)
+            reg.set_flag(FLAG_H, 0); reg.set_flag(FLAG_C, new_c); return 4
         if opcode == 0x18:
             offset = self.fetch_byte()
             offset = _sign_extend_byte(offset)
-            new_pc = (self.reg.pc + offset) & 0xFFFF
+            new_pc = (reg.pc + offset) & 0xFFFF
             self.trace_branch("JR", self.current_opcode_pc, new_pc, opcode)
-            self.reg.pc = new_pc; return 12
+            reg.pc = new_pc; return 12
         if opcode == 0x19:
-            self._add_hl_rr(self.reg.de); return 8
+            self._add_hl_rr(reg.de); return 8
         if opcode == 0x1A:
-            self.reg.a = self.mmu.read_byte(self.reg.de); return 8
+            reg.a = mmu.read_byte(reg.de); return 8
         if opcode == 0x1B:
-            self.reg.de = (self.reg.de - 1) & 0xFFFF; return 8
+            reg.de = (reg.de - 1) & 0xFFFF; return 8
         if opcode == 0x1C:
-            self.reg.e = self._inc_r8(self.reg.e); return 4
+            reg.e = self._inc_r8(reg.e); return 4
         if opcode == 0x1D:
-            self.reg.e = self._dec_r8(self.reg.e); return 4
+            reg.e = self._dec_r8(reg.e); return 4
         if opcode == 0x1E:
-            self.reg.e = self.fetch_byte(); return 8
+            reg.e = self.fetch_byte(); return 8
         if opcode == 0x1F:
-            a = self.reg.a; old_c = self.reg.get_flag(FLAG_C)
+            a = reg.a; old_c = reg.get_flag(FLAG_C)
             new_c = a & 1
-            self.reg.a = ((a >> 1) | (old_c << 7)) & 0xFF
-            self.reg.set_flag(FLAG_Z, 0); self.reg.set_flag(FLAG_N, 0)
-            self.reg.set_flag(FLAG_H, 0); self.reg.set_flag(FLAG_C, new_c); return 4
+            reg.a = ((a >> 1) | (old_c << 7)) & 0xFF
+            reg.set_flag(FLAG_Z, 0); reg.set_flag(FLAG_N, 0)
+            reg.set_flag(FLAG_H, 0); reg.set_flag(FLAG_C, new_c); return 4
         if opcode == 0x20:
             offset = self.fetch_byte()
             if self._check_cond(0):
                 offset = _sign_extend_byte(offset)
-                new_pc = (self.reg.pc + offset) & 0xFFFF
+                new_pc = (reg.pc + offset) & 0xFFFF
                 self.trace_branch("JR NZ", self.current_opcode_pc, new_pc, opcode)
-                self.reg.pc = new_pc; return 12
+                reg.pc = new_pc; return 12
             return 8
         if opcode == 0x21:
-            self.reg.hl = self.fetch_word(); return 12
+            reg.hl = self.fetch_word(); return 12
         if opcode == 0x22:
-            self.mmu.write_byte(self.reg.hl, self.reg.a)
-            self.reg.hl = (self.reg.hl + 1) & 0xFFFF; return 8
+            mmu.write_byte(reg.hl, reg.a)
+            reg.hl = (reg.hl + 1) & 0xFFFF; return 8
         if opcode == 0x23:
-            self.reg.hl = (self.reg.hl + 1) & 0xFFFF; return 8
+            reg.hl = (reg.hl + 1) & 0xFFFF; return 8
         if opcode == 0x24:
-            self.reg.h = self._inc_r8(self.reg.h); return 4
+            reg.h = self._inc_r8(reg.h); return 4
         if opcode == 0x25:
-            self.reg.h = self._dec_r8(self.reg.h); return 4
+            reg.h = self._dec_r8(reg.h); return 4
         if opcode == 0x26:
-            self.reg.h = self.fetch_byte(); return 8
+            reg.h = self.fetch_byte(); return 8
         if opcode == 0x27:
             self._daa(); return 4
         if opcode == 0x28:
             offset = self.fetch_byte()
             if self._check_cond(1):
                 offset = _sign_extend_byte(offset)
-                new_pc = (self.reg.pc + offset) & 0xFFFF
+                new_pc = (reg.pc + offset) & 0xFFFF
                 self.trace_branch("JR Z", self.current_opcode_pc, new_pc, opcode)
-                self.reg.pc = new_pc; return 12
+                reg.pc = new_pc; return 12
             return 8
         if opcode == 0x29:
-            self._add_hl_rr(self.reg.hl); return 8
+            self._add_hl_rr(reg.hl); return 8
         if opcode == 0x2A:
-            self.reg.a = self.mmu.read_byte(self.reg.hl)
-            self.reg.hl = (self.reg.hl + 1) & 0xFFFF; return 8
+            reg.a = mmu.read_byte(reg.hl)
+            reg.hl = (reg.hl + 1) & 0xFFFF; return 8
         if opcode == 0x2B:
-            self.reg.hl = (self.reg.hl - 1) & 0xFFFF; return 8
+            reg.hl = (reg.hl - 1) & 0xFFFF; return 8
         if opcode == 0x2C:
-            self.reg.l = self._inc_r8(self.reg.l); return 4
+            reg.l = self._inc_r8(reg.l); return 4
         if opcode == 0x2D:
-            self.reg.l = self._dec_r8(self.reg.l); return 4
+            reg.l = self._dec_r8(reg.l); return 4
         if opcode == 0x2E:
-            self.reg.l = self.fetch_byte(); return 8
+            reg.l = self.fetch_byte(); return 8
         if opcode == 0x2F:
-            self.reg.a ^= 0xFF
-            self.reg.set_flag(FLAG_N, 1); self.reg.set_flag(FLAG_H, 1); return 4
+            reg.a ^= 0xFF
+            reg.set_flag(FLAG_N, 1); reg.set_flag(FLAG_H, 1); return 4
         if opcode == 0x30:
             offset = self.fetch_byte()
             if self._check_cond(2):
                 offset = _sign_extend_byte(offset)
-                new_pc = (self.reg.pc + offset) & 0xFFFF
+                new_pc = (reg.pc + offset) & 0xFFFF
                 self.trace_branch("JR NC", self.current_opcode_pc, new_pc, opcode)
-                self.reg.pc = new_pc; return 12
+                reg.pc = new_pc; return 12
             return 8
         if opcode == 0x31:
-            self.reg.sp = self.fetch_word(); return 12
+            reg.sp = self.fetch_word(); return 12
         if opcode == 0x32:
-            self.mmu.write_byte(self.reg.hl, self.reg.a)
-            self.reg.hl = (self.reg.hl - 1) & 0xFFFF; return 8
+            mmu.write_byte(reg.hl, reg.a)
+            reg.hl = (reg.hl - 1) & 0xFFFF; return 8
         if opcode == 0x33:
-            self.reg.sp = (self.reg.sp + 1) & 0xFFFF; return 8
+            reg.sp = (reg.sp + 1) & 0xFFFF; return 8
         if opcode == 0x34:
-            val = self.mmu.read_byte(self.reg.hl)
-            self.mmu.write_byte(self.reg.hl, self._inc_r8(val)); return 12
+            val = mmu.read_byte(reg.hl)
+            mmu.write_byte(reg.hl, self._inc_r8(val)); return 12
         if opcode == 0x35:
-            val = self.mmu.read_byte(self.reg.hl)
-            self.mmu.write_byte(self.reg.hl, self._dec_r8(val)); return 12
+            val = mmu.read_byte(reg.hl)
+            mmu.write_byte(reg.hl, self._dec_r8(val)); return 12
         if opcode == 0x36:
-            self.mmu.write_byte(self.reg.hl, self.fetch_byte()); return 12
+            mmu.write_byte(reg.hl, self.fetch_byte()); return 12
         if opcode == 0x37:
-            self.reg.set_flag(FLAG_N, 0); self.reg.set_flag(FLAG_H, 0)
-            self.reg.set_flag(FLAG_C, 1); return 4
+            reg.set_flag(FLAG_N, 0); reg.set_flag(FLAG_H, 0)
+            reg.set_flag(FLAG_C, 1); return 4
         if opcode == 0x38:
             offset = self.fetch_byte()
             if self._check_cond(3):
                 offset = _sign_extend_byte(offset)
-                new_pc = (self.reg.pc + offset) & 0xFFFF
+                new_pc = (reg.pc + offset) & 0xFFFF
                 self.trace_branch("JR C", self.current_opcode_pc, new_pc, opcode)
-                self.reg.pc = new_pc; return 12
+                reg.pc = new_pc; return 12
             return 8
         if opcode == 0x39:
-            self._add_hl_rr(self.reg.sp); return 8
+            self._add_hl_rr(reg.sp); return 8
         if opcode == 0x3A:
-            self.reg.a = self.mmu.read_byte(self.reg.hl)
-            self.reg.hl = (self.reg.hl - 1) & 0xFFFF; return 8
+            reg.a = mmu.read_byte(reg.hl)
+            reg.hl = (reg.hl - 1) & 0xFFFF; return 8
         if opcode == 0x3B:
-            self.reg.sp = (self.reg.sp - 1) & 0xFFFF; return 8
+            reg.sp = (reg.sp - 1) & 0xFFFF; return 8
         if opcode == 0x3C:
-            self.reg.a = self._inc_r8(self.reg.a); return 4
+            reg.a = self._inc_r8(reg.a); return 4
         if opcode == 0x3D:
-            self.reg.a = self._dec_r8(self.reg.a); return 4
+            reg.a = self._dec_r8(reg.a); return 4
         if opcode == 0x3E:
-            self.reg.a = self.fetch_byte(); return 8
+            reg.a = self.fetch_byte(); return 8
         # 0x3F
-        carry = self.reg.get_flag(FLAG_C)
-        self.reg.set_flag(FLAG_N, 0); self.reg.set_flag(FLAG_H, 0)
-        self.reg.set_flag(FLAG_C, carry ^ 1)
+        carry = reg.get_flag(FLAG_C)
+        reg.set_flag(FLAG_N, 0); reg.set_flag(FLAG_H, 0)
+        reg.set_flag(FLAG_C, carry ^ 1)
         return 4
 
     def _exec_high(self, opcode):
         # 0xC0-0xFF: control flow and stack opcodes.
+        reg = self.reg; mmu = self.mmu
         if opcode == 0xC0:
             if self._check_cond(0):
                 new_pc = self._pop()
                 self.trace_branch("RET NZ", self.current_opcode_pc, new_pc, opcode)
-                self.reg.pc = new_pc; return 20
+                reg.pc = new_pc; return 20
             return 8
         if opcode == 0xC1:
-            self.reg.bc = self._pop(); return 12
+            reg.bc = self._pop(); return 12
         if opcode == 0xC2:
             addr = self.fetch_word()
             if self._check_cond(0):
                 self.trace_branch("JP NZ", self.current_opcode_pc, addr, opcode)
-                self.reg.pc = addr; return 16
+                reg.pc = addr; return 16
             return 12
         if opcode == 0xC3:
             new_pc = self.fetch_word()
             self.trace_branch("JP", self.current_opcode_pc, new_pc, opcode)
-            self.reg.pc = new_pc; return 16
+            reg.pc = new_pc; return 16
         if opcode == 0xC4:
             addr = self.fetch_word()
             if self._check_cond(0):
                 self.trace_branch("CALL NZ", self.current_opcode_pc, addr, opcode)
-                self._push(self.reg.pc)
-                self.reg.pc = addr; return 24
+                self._push(reg.pc)
+                reg.pc = addr; return 24
             return 12
         if opcode == 0xC5:
-            self._push(self.reg.bc); return 16
+            self._push(reg.bc); return 16
         if opcode == 0xC6:
             self._alu_a_op(0, self.fetch_byte()); return 8
         if opcode == 0xC7:
             self.trace_branch("RST 00", self.current_opcode_pc, 0x00, opcode)
-            self._push(self.reg.pc); self.reg.pc = 0x00; return 16
+            self._push(reg.pc); reg.pc = 0x00; return 16
         if opcode == 0xC8:
             if self._check_cond(1):
                 new_pc = self._pop()
                 self.trace_branch("RET Z", self.current_opcode_pc, new_pc, opcode)
-                self.reg.pc = new_pc; return 20
+                reg.pc = new_pc; return 20
             return 8
         if opcode == 0xC9:
             new_pc = self._pop()
             self.trace_branch("RET", self.current_opcode_pc, new_pc, opcode)
-            self.reg.pc = new_pc; return 16
+            reg.pc = new_pc; return 16
         if opcode == 0xCA:
             addr = self.fetch_word()
             if self._check_cond(1):
                 self.trace_branch("JP Z", self.current_opcode_pc, addr, opcode)
-                self.reg.pc = addr; return 16
+                reg.pc = addr; return 16
             return 12
         if opcode == 0xCC:
             addr = self.fetch_word()
             if self._check_cond(1):
                 self.trace_branch("CALL Z", self.current_opcode_pc, addr, opcode)
-                self._push(self.reg.pc)
-                self.reg.pc = addr; return 24
+                self._push(reg.pc)
+                reg.pc = addr; return 24
             return 12
         if opcode == 0xCD:
             addr = self.fetch_word()
             self.trace_branch("CALL", self.current_opcode_pc, addr, opcode)
-            self._push(self.reg.pc)
-            self.reg.pc = addr; return 24
+            self._push(reg.pc)
+            reg.pc = addr; return 24
         if opcode == 0xCE:
             self._alu_a_op(1, self.fetch_byte()); return 8
         if opcode == 0xCF:
             self.trace_branch("RST 08", self.current_opcode_pc, 0x08, opcode)
-            self._push(self.reg.pc); self.reg.pc = 0x08; return 16
+            self._push(reg.pc); reg.pc = 0x08; return 16
         if opcode == 0xD0:
             if self._check_cond(2):
                 new_pc = self._pop()
                 self.trace_branch("RET NC", self.current_opcode_pc, new_pc, opcode)
-                self.reg.pc = new_pc; return 20
+                reg.pc = new_pc; return 20
             return 8
         if opcode == 0xD1:
-            self.reg.de = self._pop(); return 12
+            reg.de = self._pop(); return 12
         if opcode == 0xD2:
             addr = self.fetch_word()
             if self._check_cond(2):
                 self.trace_branch("JP NC", self.current_opcode_pc, addr, opcode)
-                self.reg.pc = addr; return 16
+                reg.pc = addr; return 16
             return 12
         if opcode == 0xD4:
             addr = self.fetch_word()
             if self._check_cond(2):
                 self.trace_branch("CALL NC", self.current_opcode_pc, addr, opcode)
-                self._push(self.reg.pc)
-                self.reg.pc = addr; return 24
+                self._push(reg.pc)
+                reg.pc = addr; return 24
             return 12
         if opcode == 0xD5:
-            self._push(self.reg.de); return 16
+            self._push(reg.de); return 16
         if opcode == 0xD6:
             self._alu_a_op(2, self.fetch_byte()); return 8
         if opcode == 0xD7:
             self.trace_branch("RST 10", self.current_opcode_pc, 0x10, opcode)
-            self._push(self.reg.pc); self.reg.pc = 0x10; return 16
+            self._push(reg.pc); reg.pc = 0x10; return 16
         if opcode == 0xD8:
             if self._check_cond(3):
                 new_pc = self._pop()
                 self.trace_branch("RET C", self.current_opcode_pc, new_pc, opcode)
-                self.reg.pc = new_pc; return 20
+                reg.pc = new_pc; return 20
             return 8
         if opcode == 0xD9:
             new_pc = self._pop()
             self.trace_branch("RETI", self.current_opcode_pc, new_pc, opcode)
-            self.reg.pc = new_pc
+            reg.pc = new_pc
             self.interrupts_master_enabled = True; return 16
         if opcode == 0xDA:
             addr = self.fetch_word()
             if self._check_cond(3):
                 self.trace_branch("JP C", self.current_opcode_pc, addr, opcode)
-                self.reg.pc = addr; return 16
+                reg.pc = addr; return 16
             return 12
         if opcode == 0xDC:
             addr = self.fetch_word()
             if self._check_cond(3):
                 self.trace_branch("CALL C", self.current_opcode_pc, addr, opcode)
-                self._push(self.reg.pc)
-                self.reg.pc = addr; return 24
+                self._push(reg.pc)
+                reg.pc = addr; return 24
             return 12
         if opcode == 0xDE:
             self._alu_a_op(3, self.fetch_byte()); return 8
         if opcode == 0xDF:
             self.trace_branch("RST 18", self.current_opcode_pc, 0x18, opcode)
-            self._push(self.reg.pc); self.reg.pc = 0x18; return 16
+            self._push(reg.pc); reg.pc = 0x18; return 16
         if opcode == 0xE0:
-            self.mmu.write_byte(0xFF00 | self.fetch_byte(), self.reg.a); return 12
+            mmu.write_byte(0xFF00 | self.fetch_byte(), reg.a); return 12
         if opcode == 0xE1:
-            self.reg.hl = self._pop(); return 12
+            reg.hl = self._pop(); return 12
         if opcode == 0xE2:
-            self.mmu.write_byte(0xFF00 | self.reg.c, self.reg.a); return 8
+            mmu.write_byte(0xFF00 | reg.c, reg.a); return 8
         if opcode == 0xE5:
-            self._push(self.reg.hl); return 16
+            self._push(reg.hl); return 16
         if opcode == 0xE6:
             self._alu_a_op(4, self.fetch_byte()); return 8
         if opcode == 0xE7:
             self.trace_branch("RST 20", self.current_opcode_pc, 0x20, opcode)
-            self._push(self.reg.pc); self.reg.pc = 0x20; return 16
+            self._push(reg.pc); reg.pc = 0x20; return 16
         if opcode == 0xE8:
             offset = self.fetch_byte()
             offset = _sign_extend_byte(offset)
-            result = self.reg.sp + offset
-            self.reg.set_flag(FLAG_Z, 0); self.reg.set_flag(FLAG_N, 0)
-            self.reg.set_flag(FLAG_H, (self.reg.sp & 0xF) + (offset & 0xF) > 0xF)
-            self.reg.set_flag(FLAG_C, (self.reg.sp & 0xFF) + (offset & 0xFF) > 0xFF)
-            self.reg.sp = result & 0xFFFF; return 16
+            result = reg.sp + offset
+            reg.set_flag(FLAG_Z, 0); reg.set_flag(FLAG_N, 0)
+            reg.set_flag(FLAG_H, (reg.sp & 0xF) + (offset & 0xF) > 0xF)
+            reg.set_flag(FLAG_C, (reg.sp & 0xFF) + (offset & 0xFF) > 0xFF)
+            reg.sp = result & 0xFFFF; return 16
         if opcode == 0xE9:
-            self.trace_branch("JP HL", self.current_opcode_pc, self.reg.hl, opcode)
-            self.reg.pc = self.reg.hl; return 4
+            self.trace_branch("JP HL", self.current_opcode_pc, reg.hl, opcode)
+            reg.pc = reg.hl; return 4
         if opcode == 0xEA:
-            self.mmu.write_byte(self.fetch_word(), self.reg.a); return 16
+            mmu.write_byte(self.fetch_word(), reg.a); return 16
         if opcode == 0xEE:
             self._alu_a_op(5, self.fetch_byte()); return 8
         if opcode == 0xEF:
             self.trace_branch("RST 28", self.current_opcode_pc, 0x28, opcode)
-            self._push(self.reg.pc); self.reg.pc = 0x28; return 16
+            self._push(reg.pc); reg.pc = 0x28; return 16
         if opcode == 0xF0:
-            self.reg.a = self.mmu.read_byte(0xFF00 | self.fetch_byte()); return 12
+            reg.a = mmu.read_byte(0xFF00 | self.fetch_byte()); return 12
         if opcode == 0xF1:
-            self.reg.af = self._pop(); return 12
+            reg.af = self._pop(); return 12
         if opcode == 0xF2:
-            self.reg.a = self.mmu.read_byte(0xFF00 | self.reg.c); return 8
+            reg.a = mmu.read_byte(0xFF00 | reg.c); return 8
         if opcode == 0xF3:
             self.interrupts_master_enabled = False; return 4
         if opcode == 0xF5:
-            self._push(self.reg.af); return 16
+            self._push(reg.af); return 16
         if opcode == 0xF6:
             self._alu_a_op(6, self.fetch_byte()); return 8
         if opcode == 0xF7:
             self.trace_branch("RST 30", self.current_opcode_pc, 0x30, opcode)
-            self._push(self.reg.pc); self.reg.pc = 0x30; return 16
+            self._push(reg.pc); reg.pc = 0x30; return 16
         if opcode == 0xF8:
             offset = self.fetch_byte()
             offset = _sign_extend_byte(offset)
-            result = self.reg.sp + offset
-            self.reg.set_flag(FLAG_Z, 0); self.reg.set_flag(FLAG_N, 0)
-            self.reg.set_flag(FLAG_H, (self.reg.sp & 0xF) + (offset & 0xF) > 0xF)
-            self.reg.set_flag(FLAG_C, (self.reg.sp & 0xFF) + (offset & 0xFF) > 0xFF)
-            self.reg.hl = result & 0xFFFF; return 12
+            result = reg.sp + offset
+            reg.set_flag(FLAG_Z, 0); reg.set_flag(FLAG_N, 0)
+            reg.set_flag(FLAG_H, (reg.sp & 0xF) + (offset & 0xF) > 0xF)
+            reg.set_flag(FLAG_C, (reg.sp & 0xFF) + (offset & 0xFF) > 0xFF)
+            reg.hl = result & 0xFFFF; return 12
         if opcode == 0xF9:
-            self.reg.sp = self.reg.hl; return 8
+            reg.sp = reg.hl; return 8
         if opcode == 0xFA:
-            self.reg.a = self.mmu.read_byte(self.fetch_word()); return 16
+            reg.a = mmu.read_byte(self.fetch_word()); return 16
         if opcode == 0xFB:
             self.ime_pending = True; return 4
         if opcode == 0xFE:
             self._alu_a_op(7, self.fetch_byte()); return 8
         if opcode == 0xFF:
             self.trace_branch("RST 38", self.current_opcode_pc, 0x38, opcode)
-            self._push(self.reg.pc); self.reg.pc = 0x38; return 16
+            self._push(reg.pc); reg.pc = 0x38; return 16
         if opcode in self.INVALID_OPS:
             # Hardware-illegal opcode (locks up a real DMG/CGB); treat as NOP.
             self.invalid_opcode_count += 1
@@ -1100,91 +1102,6 @@ class CPU:
 
     def execute_cb(self, cb_opcode):
         """Executes prefixed CB instructions."""
-
-        def _rlc(val):
-            carry = (val >> 7) & 1
-            result = ((val << 1) | carry) & 0xFF
-            self.reg.set_flag(FLAG_Z, result == 0)
-            self.reg.set_flag(FLAG_N, 0)
-            self.reg.set_flag(FLAG_H, 0)
-            self.reg.set_flag(FLAG_C, carry)
-            return result
-
-        def _rrc(val):
-            carry = val & 1
-            result = ((val >> 1) | (carry << 7)) & 0xFF
-            self.reg.set_flag(FLAG_Z, result == 0)
-            self.reg.set_flag(FLAG_N, 0)
-            self.reg.set_flag(FLAG_H, 0)
-            self.reg.set_flag(FLAG_C, carry)
-            return result
-
-        def _rl(val):
-            old_c = self.reg.get_flag(FLAG_C)
-            carry = (val >> 7) & 1
-            result = ((val << 1) | old_c) & 0xFF
-            self.reg.set_flag(FLAG_Z, result == 0)
-            self.reg.set_flag(FLAG_N, 0)
-            self.reg.set_flag(FLAG_H, 0)
-            self.reg.set_flag(FLAG_C, carry)
-            return result
-
-        def _rr(val):
-            old_c = self.reg.get_flag(FLAG_C)
-            carry = val & 1
-            result = ((val >> 1) | (old_c << 7)) & 0xFF
-            self.reg.set_flag(FLAG_Z, result == 0)
-            self.reg.set_flag(FLAG_N, 0)
-            self.reg.set_flag(FLAG_H, 0)
-            self.reg.set_flag(FLAG_C, carry)
-            return result
-
-        def _sla(val):
-            carry = (val >> 7) & 1
-            result = (val << 1) & 0xFF
-            self.reg.set_flag(FLAG_Z, result == 0)
-            self.reg.set_flag(FLAG_N, 0)
-            self.reg.set_flag(FLAG_H, 0)
-            self.reg.set_flag(FLAG_C, carry)
-            return result
-
-        def _sra(val):
-            carry = val & 1
-            result = (val >> 1) | (val & 0x80)
-            self.reg.set_flag(FLAG_Z, result == 0)
-            self.reg.set_flag(FLAG_N, 0)
-            self.reg.set_flag(FLAG_H, 0)
-            self.reg.set_flag(FLAG_C, carry)
-            return result
-
-        def _srl(val):
-            carry = val & 1
-            result = val >> 1
-            self.reg.set_flag(FLAG_Z, result == 0)
-            self.reg.set_flag(FLAG_N, 0)
-            self.reg.set_flag(FLAG_H, 0)
-            self.reg.set_flag(FLAG_C, carry)
-            return result
-
-        def _swap(val):
-            result = ((val & 0x0F) << 4) | ((val & 0xF0) >> 4)
-            self.reg.set_flag(FLAG_Z, result == 0)
-            self.reg.set_flag(FLAG_N, 0)
-            self.reg.set_flag(FLAG_H, 0)
-            self.reg.set_flag(FLAG_C, 0)
-            return result
-
-        def _bit(val, bit):
-            self.reg.set_flag(FLAG_Z, (val & (1 << bit)) == 0)
-            self.reg.set_flag(FLAG_N, 0)
-            self.reg.set_flag(FLAG_H, 1)
-
-        def _res(val, bit):
-            return val & ~(1 << bit)
-
-        def _set(val, bit):
-            return val | (1 << bit)
-
         reg_idx = cb_opcode & 0x7
         bit_pos = (cb_opcode >> 3) & 0x7
         op_group = (cb_opcode >> 6) & 0x3
@@ -1199,17 +1116,20 @@ class CPU:
             is_hl = False
 
         if op_group == 0:
-            ops = [_rlc, _rrc, _rl, _rr, _sla, _sra, _swap, _srl]
+            ops = (self._cb_rlc, self._cb_rrc, self._cb_rl, self._cb_rr,
+                   self._cb_sla, self._cb_sra, self._cb_swap, self._cb_srl)
             result = ops[bit_pos](val)
             cycles = 16 if is_hl else 8
         elif op_group == 1:
-            _bit(val, bit_pos)
+            self.reg.set_flag(FLAG_Z, self._cb_bit(val, bit_pos))
+            self.reg.set_flag(FLAG_N, 0)
+            self.reg.set_flag(FLAG_H, 1)
             return 12 if is_hl else 8
         elif op_group == 2:
-            result = _res(val, bit_pos)
+            result = self._cb_res(val, bit_pos)
             cycles = 16 if is_hl else 8
         else:
-            result = _set(val, bit_pos)
+            result = self._cb_set(val, bit_pos)
             cycles = 16 if is_hl else 8
 
         if is_hl:
@@ -1217,6 +1137,94 @@ class CPU:
         else:
             self._set_r8(reg_idx, result)
         return cycles
+
+    # ── CB-prefix rotate / shift helpers (extracted from execute_cb to
+    #    avoid recreating inner functions 900+ times per frame) ────────
+
+    def _cb_rlc(self, val):
+        carry = (val >> 7) & 1
+        result = ((val << 1) | carry) & 0xFF
+        self.reg.set_flag(FLAG_Z, result == 0)
+        self.reg.set_flag(FLAG_N, 0)
+        self.reg.set_flag(FLAG_H, 0)
+        self.reg.set_flag(FLAG_C, carry)
+        return result
+
+    def _cb_rrc(self, val):
+        carry = val & 1
+        result = ((val >> 1) | (carry << 7)) & 0xFF
+        self.reg.set_flag(FLAG_Z, result == 0)
+        self.reg.set_flag(FLAG_N, 0)
+        self.reg.set_flag(FLAG_H, 0)
+        self.reg.set_flag(FLAG_C, carry)
+        return result
+
+    def _cb_rl(self, val):
+        old_c = self.reg.get_flag(FLAG_C)
+        carry = (val >> 7) & 1
+        result = ((val << 1) | old_c) & 0xFF
+        self.reg.set_flag(FLAG_Z, result == 0)
+        self.reg.set_flag(FLAG_N, 0)
+        self.reg.set_flag(FLAG_H, 0)
+        self.reg.set_flag(FLAG_C, carry)
+        return result
+
+    def _cb_rr(self, val):
+        old_c = self.reg.get_flag(FLAG_C)
+        carry = val & 1
+        result = ((val >> 1) | (old_c << 7)) & 0xFF
+        self.reg.set_flag(FLAG_Z, result == 0)
+        self.reg.set_flag(FLAG_N, 0)
+        self.reg.set_flag(FLAG_H, 0)
+        self.reg.set_flag(FLAG_C, carry)
+        return result
+
+    def _cb_sla(self, val):
+        carry = (val >> 7) & 1
+        result = (val << 1) & 0xFF
+        self.reg.set_flag(FLAG_Z, result == 0)
+        self.reg.set_flag(FLAG_N, 0)
+        self.reg.set_flag(FLAG_H, 0)
+        self.reg.set_flag(FLAG_C, carry)
+        return result
+
+    def _cb_sra(self, val):
+        carry = val & 1
+        result = (val >> 1) | (val & 0x80)
+        self.reg.set_flag(FLAG_Z, result == 0)
+        self.reg.set_flag(FLAG_N, 0)
+        self.reg.set_flag(FLAG_H, 0)
+        self.reg.set_flag(FLAG_C, carry)
+        return result
+
+    def _cb_srl(self, val):
+        carry = val & 1
+        result = val >> 1
+        self.reg.set_flag(FLAG_Z, result == 0)
+        self.reg.set_flag(FLAG_N, 0)
+        self.reg.set_flag(FLAG_H, 0)
+        self.reg.set_flag(FLAG_C, carry)
+        return result
+
+    def _cb_swap(self, val):
+        result = ((val & 0x0F) << 4) | ((val & 0xF0) >> 4)
+        self.reg.set_flag(FLAG_Z, result == 0)
+        self.reg.set_flag(FLAG_N, 0)
+        self.reg.set_flag(FLAG_H, 0)
+        self.reg.set_flag(FLAG_C, 0)
+        return result
+
+    @staticmethod
+    def _cb_bit(val, bit):
+        return (val & (1 << bit)) == 0
+
+    @staticmethod
+    def _cb_res(val, bit):
+        return val & ~(1 << bit)
+
+    @staticmethod
+    def _cb_set(val, bit):
+        return val | (1 << bit)
 
 
 class LinkCable:
@@ -1973,13 +1981,12 @@ class PPU:
         dot = self.scanline_dot + cycles_passed
 
         while dot >= 456:
-            remaining = 456 - self.scanline_dot
-            dot -= remaining
             self._advance_dots(456)
             self._finish_scanline()
             self.scanline_dot = 0
             if not (mem[0xFF40] & 0x80):
                 return
+            dot -= 456
             dot += self._begin_scanline()
 
         if dot > 0:
@@ -2415,6 +2422,10 @@ class PPU:
     def _render_sprites(self, ly):
         mem = self.mmu.memory
         lcdc = mem[0xFF40]
+        # LCDC bit 1: OBJ display enable.  Skip the entire 40-entry OAM scan
+        # when sprites are disabled — saves ~11,520 OAM reads/frame.
+        if not (lcdc & 0x02):
+            return
         sprite_height = 16 if (lcdc & 0x04) else 8
         sprites = []
         for i in range(40):
@@ -3417,7 +3428,10 @@ class EmulatorMenu:
             clock.tick(60)
 
     def _load_logo(self):
-        here = os.path.dirname(os.path.abspath(__file__))
+        try:
+            here = os.path.dirname(os.path.abspath(__file__))
+        except NameError:
+            here = os.getcwd()
         for candidate in ("gbclogo.png", os.path.join(here, "gbclogo.png")):
             if os.path.isfile(candidate):
                 try:
