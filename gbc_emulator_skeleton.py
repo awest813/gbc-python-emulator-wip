@@ -600,22 +600,21 @@ class CPU:
             self.interrupts_master_enabled = True
             self.ime_pending = False
 
-        pc = self.reg.pc
+        reg = self.reg
+        pc = reg.pc
         if self.halt_bug_pending:
             self.halt_bug_pending = False
             opcode = mem[pc]
-            # PC NOT advanced (HALT bug)
         else:
             opcode = mem[pc]
-            self.reg.pc = pc + 1
+            reg.pc = pc + 1
         self.current_opcode_pc = pc
         cycles = self.execute(opcode)
-        cycles += self._handle_interrupts()
+        if self.interrupts_master_enabled:
+            cycles += self._handle_interrupts()
         return cycles
 
     def _handle_interrupts(self):
-        if not self.interrupts_master_enabled:
-            return 0
         mem = self.mem
         pending = mem[0xFFFF] & mem[0xFF0F]
         if pending == 0:
@@ -1979,10 +1978,20 @@ class PPU:
             self.lcd_was_on = True
 
         dot = self.scanline_dot + cycles_passed
+        mode3_end = 80 + self.mode3_duration
+        sd = self.scanline_dot
 
         while dot >= 456:
-            self._advance_dots(456)
+            ly = mem[0xFF44]
+            if ly < 144:
+                if sd < 80:
+                    self._enter_mode3(ly, lcdc)
+                if sd < mode3_end:
+                    self._update_stat_mode(0)
+                    if self.mmu.hdma_active:
+                        self.mmu._hdma_hblank_step()
             self._finish_scanline()
+            sd = 0
             self.scanline_dot = 0
             if not (mem[0xFF40] & 0x80):
                 return
@@ -1990,7 +1999,15 @@ class PPU:
             dot += self._begin_scanline()
 
         if dot > 0:
-            self._advance_dots(dot)
+            ly = mem[0xFF44]
+            if ly < 144:
+                mode3_end = 80 + self.mode3_duration
+                if sd < 80 <= dot:
+                    self._enter_mode3(ly, lcdc)
+                if sd < mode3_end <= dot:
+                    self._update_stat_mode(0)
+                    if self.mmu.hdma_active:
+                        self.mmu._hdma_hblank_step()
             self.scanline_dot = dot
 
     def _begin_scanline(self):
@@ -3188,10 +3205,11 @@ class APU:
     # ── Main step ───────────────────────────────────────────────────
 
     def step(self, cycles):
+        sn = self.sample_num
+        sd = self.sample_den
         if not self.power:
             # APU off: still produce silence so the audio buffer keeps flowing.
-            self.sample_accum += cycles * self.sample_den
-            sn = self.sample_num
+            self.sample_accum += cycles * sd
             while self.sample_accum >= sn:
                 self.sample_accum -= sn
                 self.buffer.extend(b'\x00\x00\x00\x00')
@@ -3201,18 +3219,16 @@ class APU:
 
         # Frame sequencer (512 Hz) — tick on each falling edge of bit 12.
         old_fs = self.fs_div
-        self.fs_div = old_fs + cycles
-        old_b12 = (old_fs >> 12) & 1
-        new_b12 = (self.fs_div >> 12) & 1
-        if new_b12 < old_b12:
+        new_fs = old_fs + cycles
+        self.fs_div = new_fs
+        if ((new_fs >> 12) & 1) < ((old_fs >> 12) & 1):
             self._frame_seq_tick()
 
         # Channel waveform timers
         self._step_channels(cycles)
 
         # Sample emission
-        self.sample_accum += cycles * self.sample_den
-        sn = self.sample_num
+        self.sample_accum += cycles * sd
         while self.sample_accum >= sn:
             self.sample_accum -= sn
             self._mix_sample()
@@ -3715,6 +3731,7 @@ class GameBoy:
 
         self.speed_remainder = 0  # carries the odd base-clock dot in double-speed mode
         self._rtc_cycle_accum = 0  # throttle MBC3 RTC wall-clock updates to once per frame
+        self._has_rtc = self.mmu.has_rtc  # cached flag for step_all hot path
         self._status_msg = ''
         self._status_ttl = 0
         self.fps_limit = fps_limit
@@ -4052,6 +4069,7 @@ class GameBoy:
             mmu.has_ram = bool(has_ram)
             mmu.has_battery = bool(has_battery)
             mmu.has_rtc = bool(has_rtc)
+            self._has_rtc = mmu.has_rtc
             mmu.is_cgb = bool(is_cgb)
             mmu.joypad_buttons = joypad
             mmu.serial_data = serial_data
@@ -4273,27 +4291,24 @@ class GameBoy:
             self._sync_frames = 0
 
     def step_all(self):
-        """Execute one CPU step and propagate cycles to PPU, timers, and APU in a
-        single Python function call.  Avoids extra function-call dispatches per
-        opcode, which is a measurable win when the per-opcode path is otherwise tight."""
+        """Execute one CPU step and propagate cycles to PPU, timers, and APU."""
+        mmu = self.mmu
         # OAM DMA: consumes CPU T-cycles without executing instructions
-        if self.mmu.dma_remaining > 0:
-            chunk = min(self.mmu.dma_remaining, 4)
-            self.mmu.dma_remaining -= chunk
+        dma = mmu.dma_remaining
+        if dma > 0:
+            chunk = dma if dma < 4 else 4
+            mmu.dma_remaining = dma - chunk
             cpu_cycles = chunk
-            if self.mmu.dma_remaining == 0:
-                self.mmu.memory[0xFE00:0xFEA0] = self.mmu.dma_buffer
-                self.mmu.dma_buffer = bytearray()
+            if mmu.dma_remaining == 0:
+                mmu.memory[0xFE00:0xFEA0] = mmu.dma_buffer
+                mmu.dma_buffer = bytearray()
         else:
             cpu_cycles = self.cpu.step()
-            if self.mmu.gdma_stall > 0:
-                cpu_cycles += self.mmu.gdma_stall
-                self.mmu.gdma_stall = 0
-        # CGB double-speed (KEY1): the CPU and the DIV/TIMA timer run at 2x the
-        # base clock, but the PPU and APU stay on the base clock. Feed the latter
-        # half the CPU cycles, carrying the odd cycle across calls so no dot is
-        # lost. In normal speed this is a straight pass-through (dot == cpu).
-        if self.mmu.key1 & 0x80:
+            if mmu.gdma_stall > 0:
+                cpu_cycles += mmu.gdma_stall
+                mmu.gdma_stall = 0
+        # CGB double-speed (KEY1)
+        if mmu.key1 & 0x80:
             self.speed_remainder += cpu_cycles
             dot_cycles = self.speed_remainder >> 1
             self.speed_remainder &= 1
@@ -4302,11 +4317,11 @@ class GameBoy:
         self.ppu.step(dot_cycles)
         self.timers.step(cpu_cycles)
         self.apu.step(dot_cycles)
-        if self.mmu.has_rtc:
+        if self._has_rtc:
             self._rtc_cycle_accum += cpu_cycles
             if self._rtc_cycle_accum >= CYCLES_PER_FRAME:
                 self._rtc_cycle_accum -= CYCLES_PER_FRAME
-                self.mmu._rtc_update()
+                mmu._rtc_update()
         return dot_cycles
 
     def run(self):
