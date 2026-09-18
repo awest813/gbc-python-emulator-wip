@@ -1481,10 +1481,13 @@ class MMU:
         self.hdma_src = 0
         self.hdma_dst = 0
         self.hdma_remaining = 0
-        # OAM DMA (0xFF46): timed transfer over 640 dot-cycles
+        # OAM DMA (0xFF46): 160 bytes, one per 4 CPU T-cycles. CPU keeps
+        # running from HRAM while the DMA unit owns the rest of the bus.
         self.dma_remaining = 0  # remaining CPU T-cycles of the transfer
         self.dma_src = 0       # source page high byte
-        self.dma_buffer = bytearray()
+        self.dma_index = 0     # bytes copied so far (0..160)
+        self.dma_cycle_acc = 0
+        self.dma_buffer = bytearray()  # leftover for older save-state paths
         self.gdma_stall = 0
         # MBC3 RTC (real-time clock, battery-backed)
         self.has_rtc = False
@@ -1550,6 +1553,9 @@ class MMU:
         logging.info(f"Loaded ROM: {len(rom_data)} bytes [{mbc_name}, {self.num_rom_banks} ROM banks, {self.num_ram_banks} RAM banks{' CGB' if self.is_cgb else ''}]")
 
     def read_byte(self, address):
+        # During OAM DMA the CPU can only see HRAM / IE (FF80-FFFF).
+        if self.dma_remaining > 0 and address < 0xFF80:
+            return 0xFF
         # Boot ROM shadows cartridge ROM at 0x0000-N while enabled
         if self.bootrom_enabled and address < len(self.bootrom):
             return self.bootrom[address]
@@ -1721,6 +1727,9 @@ class MMU:
 
     def write_byte(self, address, value):
         value &= 0xFF
+        # During OAM DMA the CPU may only write HRAM / IE.
+        if self.dma_remaining > 0 and address < 0xFF80:
+            return
         # Fast path: WRAM (C000-DFFF) and HRAM/IE (FF80-FFFF)
         if 0xC000 <= address < 0xE000:
             self.memory[address] = value
@@ -1888,13 +1897,52 @@ class MMU:
             self.memory[0xFF55] = remaining_blocks & 0x7F
 
     def _dma_transfer(self, value):
-        # Pre-cache source bytes; the actual OAM copy & timing happen in step_all
-        src_base = value << 8
-        self.dma_src = value
-        self.dma_buffer = bytearray(160)
-        for i in range(160):
-            self.dma_buffer[i] = self.read_byte(src_base + i)
-        self.dma_remaining = 640  # CPU T-cycles at single speed (640 dot-cycles)
+        """Start OAM DMA: 160 bytes from page `value`, one byte per 4 T-cycles."""
+        self.dma_src = value & 0xFF
+        self.dma_index = 0
+        self.dma_cycle_acc = 0
+        self.dma_remaining = OAM_DMA_CYCLES
+
+    def _dma_read_source(self, address):
+        """Bus-master read used by the OAM DMA unit (not subject to the CPU lock)."""
+        address &= 0xFFFF
+        if address < 0x8000:
+            if self.bootrom_enabled and address < len(self.bootrom):
+                return self.bootrom[address]
+            return self.memory[address]
+        if address < 0xA000:
+            if self.vram_bank_select:
+                return self.vram_bank1[address - 0x8000]
+            return self.memory[address]
+        if address < 0xC000:
+            saved, self.dma_remaining = self.dma_remaining, 0
+            try:
+                return self.read_byte(address)
+            finally:
+                self.dma_remaining = saved
+        if address < 0xE000:
+            return self.memory[address]
+        if address < 0xFE00:
+            return self.memory[address - 0x2000]
+        return 0xFF
+
+    def _dma_advance(self, cpu_cycles):
+        """Copy one OAM byte every 4 CPU T-cycles."""
+        remaining = self.dma_remaining
+        if remaining <= 0 or cpu_cycles <= 0:
+            return
+        self.dma_cycle_acc += cpu_cycles
+        src_base = self.dma_src << 8
+        mem = self.memory
+        while self.dma_cycle_acc >= 4 and self.dma_index < 160:
+            self.dma_cycle_acc -= 4
+            mem[0xFE00 + self.dma_index] = self._dma_read_source(src_base + self.dma_index)
+            self.dma_index += 1
+            remaining -= 4
+        if self.dma_index >= 160:
+            remaining = 0
+            self.dma_cycle_acc = 0
+        self.dma_remaining = remaining if remaining > 0 else 0
 
     def _remap_rom_bank(self):
         bank = self.rom_bank % self.num_rom_banks
@@ -2638,6 +2686,17 @@ class PPU:
                     continue
             fb[idx] = pr[off + c]
 
+    def _dmg_sprite_plot8(self, fb, bg_pri, fb_row, spr_x, bg_priority, dmg_obj_rgb, colors):
+        """Unrolled DMG sprite row for sprites fully within the 160px scanline."""
+        base = fb_row + spr_x
+        for sx, c in enumerate(colors):
+            if c == 0:
+                continue
+            idx = base + sx
+            if bg_priority and bg_pri[idx] != 0:
+                continue
+            fb[idx] = dmg_obj_rgb[c]
+
     def _render_sprites(self, ly):
         mem = self.mmu.memory
         lcdc = mem[0xFF40]
@@ -2713,6 +2772,10 @@ class PPU:
                 flipped = (colors[7], colors[6], colors[5], colors[4],
                              colors[3], colors[2], colors[1], colors[0])
                 self._cgb_sprite_plot8(fb, bg_pri, fb_row, spr_x, lcdc, bg_priority, pr, pal, flipped)
+            elif on_screen:
+                row = (colors[7], colors[6], colors[5], colors[4],
+                       colors[3], colors[2], colors[1], colors[0]) if x_flip else colors
+                self._dmg_sprite_plot8(fb, bg_pri, fb_row, spr_x, bg_priority, dmg_obj_rgb, row)
             elif x_flip:
                 for sx in range(8):
                     pixel_x = spr_x + sx
@@ -2751,7 +2814,15 @@ class Timers:
         self.tima_accum = 0
 
     def reset_div(self):
+        old = self.div_counter
         self.div_counter = 0
+        apu = getattr(self.mmu, 'apu', None)
+        if apu is not None:
+            bit = 13 if (self.mmu.key1 & 0x80) else 12
+            if (old >> bit) & 1:
+                if apu.power or not apu.is_cgb:
+                    apu._frame_seq_tick()
+            apu.fs_div = 0
 
     def step(self, cycles):
         mem = self.mmu.memory
@@ -2819,6 +2890,17 @@ _APU_BOOT_VALUES = {
     0xFF20: 0xFF, 0xFF21: 0x00, 0xFF22: 0x00, 0xFF23: 0xBF,
     0xFF24: 0x77, 0xFF25: 0xF3, 0xFF26: 0xF1,
 }
+
+
+def _bit_falling_edges(old, new, bit):
+    """How many times `bit` of a rising counter fell in (old, new]."""
+    if new <= old:
+        return 0
+    period = 1 << (bit + 1)
+    first = ((old // period) + 1) * period
+    if first > new:
+        return 0
+    return (new - first) // period + 1
 
 
 class APU:
@@ -2956,9 +3038,21 @@ class APU:
             self._refresh_nr52()
             return
 
-        # When powered off, ignore writes to most registers (length-only writes
-        # are allowed on DMG but we keep this simple and drop them).
-        if not self.power and addr != 0xFF26 and not (0xFF30 <= addr <= 0xFF3F):
+        # When powered off, ignore writes to most registers. DMG still accepts
+        # length-counter loads on NRx1, and wave RAM is always reachable.
+        if not self.power and addr != 0xFF26:
+            if 0xFF30 <= addr <= 0xFF3F:
+                self.wave_ram[addr - 0xFF30] = value
+                mem[addr] = value
+            elif not self.is_cgb:
+                if addr == 0xFF11:
+                    self.ch1_length = 64 - (value & 0x3F)
+                elif addr == 0xFF16:
+                    self.ch2_length = 64 - (value & 0x3F)
+                elif addr == 0xFF1B:
+                    self.ch3_length = 256 - (value & 0xFF)
+                elif addr == 0xFF20:
+                    self.ch4_length = 64 - (value & 0x3F)
             return
 
         # Wave RAM
@@ -3088,17 +3182,17 @@ class APU:
         """Return the current value of an APU register, computing dynamic
         fields (current channel volume, sweep state) on the fly."""
         if not self.power:
+            if 0xFF30 <= addr <= 0xFF3F:
+                return self.wave_ram[addr - 0xFF30]
             if 0xFF10 <= addr <= 0xFF25:
                 return 0xFF
             if addr == 0xFF26:
                 return 0x70
-            if 0xFF30 <= addr <= 0xFF3F:
-                return 0xFF
             return 0xFF
         mem = self.mmu.memory
         if 0xFF30 <= addr <= 0xFF3F:
             if not self.is_cgb and self.ch3_enabled:
-                return 0xFF
+                return self.wave_ram[self.ch3_wave_pos >> 1]
             return self.wave_ram[addr - 0xFF30]
         # NRx2 (envelope) registers read back the last written value, not the live
         # envelope volume — the running volume is internal and not exposed.
@@ -3413,9 +3507,23 @@ class APU:
 
     # ── Main step ───────────────────────────────────────────────────
 
-    def step(self, cycles):
+    def step(self, cycles, div_old=None, div_new=None, double_speed=False):
         sn = self.sample_num
         sd = self.sample_den
+        if div_old is not None:
+            bit = 13 if double_speed else 12
+            ticks = _bit_falling_edges(div_old, div_new, bit)
+            self.fs_div = div_new
+        else:
+            old_fs = self.fs_div
+            new_fs = old_fs + cycles
+            self.fs_div = new_fs
+            ticks = _bit_falling_edges(old_fs, new_fs, 12)
+        # DMG keeps the sequencer running while the APU is off; CGB does not.
+        if self.power or not self.is_cgb:
+            for _ in range(ticks):
+                self._frame_seq_tick()
+
         if not self.power:
             # APU off: still produce silence so the audio buffer keeps flowing.
             self.sample_accum += cycles * sd
@@ -3424,13 +3532,6 @@ class APU:
                 self.sample_accum -= n * sn
                 self.buffer.extend(b'\x00\x00\x00\x00' * n)
             return
-
-        # Frame sequencer (512 Hz) — tick on each falling edge of bit 12.
-        old_fs = self.fs_div
-        new_fs = old_fs + cycles
-        self.fs_div = new_fs
-        if ((new_fs >> 12) & 1) < ((old_fs >> 12) & 1):
-            self._frame_seq_tick()
 
         active = self.ch1_enabled or self.ch2_enabled or self.ch3_enabled or self.ch4_enabled
         if active:
@@ -4326,6 +4427,8 @@ class GameBoy:
             timers = self.timers
             # Cancel any in-flight OAM DMA so it doesn't run during load.
             mmu.dma_remaining = 0
+            mmu.dma_index = 0
+            mmu.dma_cycle_acc = 0
             mmu.dma_buffer = bytearray()
             # Sync CGB WRAM bank back to main memory so it round-trips.
             mmu.wram_banks[mmu.svbk - 1][:] = mmu.memory[0xD000:0xE000]
@@ -4530,6 +4633,8 @@ class GameBoy:
             mmu.hdma_active = bool(hdma_active)
             mmu.dma_src = dma_src
             mmu.dma_remaining = 0
+            mmu.dma_index = 0
+            mmu.dma_cycle_acc = 0
             mmu.dma_buffer = bytearray()
             # RTC current
             fmt = '<BBBBBB d'
@@ -4751,6 +4856,8 @@ class GameBoy:
                     m3 = MODE3_START_DOT + ppu.mode3_duration
                     if sd < m3:
                         remain = min(remain, m3 - sd)
+        if self.mmu.dma_remaining > 0:
+            remain = min(remain, 4)
         tac = mem[0xFF07]
         if tac & 0x04:
             rate = self.timers._TIMA_RATES[tac & 0x03]
@@ -4769,26 +4876,18 @@ class GameBoy:
     def step_all(self):
         """Execute one CPU step and propagate cycles to PPU, timers, and APU."""
         mmu = self.mmu
-        # OAM DMA: consumes CPU T-cycles without executing instructions
-        dma = mmu.dma_remaining
-        if dma > 0:
-            chunk = dma if dma < 4 else 4
-            mmu.dma_remaining = dma - chunk
-            cpu_cycles = chunk
-            if mmu.dma_remaining == 0:
-                mmu.memory[0xFE00:0xFEA0] = mmu.dma_buffer
-                mmu.dma_buffer = bytearray()
+        cpu = self.cpu
+        mem = mmu.memory
+        if (cpu.halted and mmu.gdma_stall == 0
+                and not (mem[0xFFFF] & mem[0xFF0F])):
+            cpu_cycles = self._halt_cpu_cycles()
         else:
-            cpu = self.cpu
-            mem = mmu.memory
-            if (cpu.halted and mmu.gdma_stall == 0
-                    and not (mem[0xFFFF] & mem[0xFF0F])):
-                cpu_cycles = self._halt_cpu_cycles()
-            else:
-                cpu_cycles = cpu.step()
-                if mmu.gdma_stall > 0:
-                    cpu_cycles += mmu.gdma_stall
-                    mmu.gdma_stall = 0
+            cpu_cycles = cpu.step()
+            if mmu.gdma_stall > 0:
+                cpu_cycles += mmu.gdma_stall
+                mmu.gdma_stall = 0
+        if mmu.dma_remaining > 0:
+            mmu._dma_advance(cpu_cycles)
         # CGB double-speed (KEY1)
         if mmu.key1 & 0x80:
             self.speed_remainder += cpu_cycles
@@ -4798,15 +4897,16 @@ class GameBoy:
             dot_cycles = cpu_cycles
         self.ppu.step(dot_cycles)
         # Timers: DIV update is inlined (always runs); TIMA only when TAC enabled
-        mem = mmu.memory
         timers = self.timers
-        div = timers.div_counter + cpu_cycles
+        old_div = timers.div_counter
+        div = old_div + cpu_cycles
         timers.div_counter = div
         mem[0xFF04] = (div >> 8) & 0xFF
         tac = mem[0xFF07]
         if tac & 0x04:
             timers._tima_step(cpu_cycles, tac)
-        self.apu.step(dot_cycles)
+        self.apu.step(dot_cycles, div_old=old_div, div_new=div,
+                      double_speed=bool(mmu.key1 & 0x80))
         if self._has_rtc:
             self._rtc_cycle_accum += cpu_cycles
             if self._rtc_cycle_accum >= CYCLES_PER_FRAME:
@@ -5053,6 +5153,8 @@ class GameBoy:
         mem[0xFFFF] = 0x00
         mem[0xFF44] = 0x00
         self.mmu.dma_remaining = 0
+        self.mmu.dma_index = 0
+        self.mmu.dma_cycle_acc = 0
         self.mmu.hdma_active = False
         self.mmu.gdma_stall = 0
         ppu = self.ppu
