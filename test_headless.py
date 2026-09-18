@@ -417,15 +417,12 @@ def test_apu_frame_sync(ns):
         total == expected,
     )
 
-    apu.frame_seq_counter = apu.FRAME_SEQ_PERIOD
+    apu.fs_div = 0
     apu.frame_seq_step = 0
-    ticks = 0
-    fsc = apu.frame_seq_counter
-    fsc -= CYCLES_PER_FRAME
-    while fsc <= 0:
-        fsc += apu.FRAME_SEQ_PERIOD
-        ticks += 1
-    check("frame sequencer ticks per video frame (8-9)", 8 <= ticks <= 9)
+    apu.step(CYCLES_PER_FRAME)
+    check("frame sequencer wraps 8 ticks per video frame", apu.frame_seq_step == 0)
+    check("bit-12 falling edges in one frame",
+          ns["_bit_falling_edges"](0, CYCLES_PER_FRAME, 12) == 8)
 
 
 def test_gameboy_frame_audio(ns):
@@ -552,6 +549,100 @@ def test_apu_registers(ns):
     check("noise LFSR period is 127 in 7-bit (width) mode", lfsr_period(1) == 127)
 
 
+def test_oam_dma(ns):
+    """OAM DMA copies one byte per 4 T-cycles and leaves the CPU on HRAM."""
+    GameBoy = ns["GameBoy"]
+    gb = GameBoy(rom_path=None, audio_enabled=False)
+    mem = gb.mmu.memory
+    mem[0xC000] = 16
+    mem[0xC001] = 8
+    mem[0xC002] = 1
+    mem[0xC003] = 0
+    mem[0xC010] = 0xAB
+    for i in range(4, 160):
+        if i != 0x10:
+            mem[0xC000 + i] = 0xFF
+    mem[0xFF80] = 0x00  # NOP
+    mem[0xFF81] = 0x18  # JR
+    mem[0xFF82] = 0xFD
+    gb.cpu.reg.pc = 0xFF80
+    gb.mmu.write_byte(0xFF46, 0xC0)
+    check("DMA starts with 640 T-cycles remaining", gb.mmu.dma_remaining == 640)
+    check("OAM is still empty before the first byte", mem[0xFE00] == 0)
+    gb.step_all()
+    check("first DMA byte lands after one M-cycle", mem[0xFE00] == 16)
+    check("later OAM bytes wait their turn", mem[0xFE01] == 0)
+    check("CPU can still fetch HRAM during DMA", gb.mmu.read_byte(0xFF80) == 0x00)
+    check("CPU cannot read WRAM during DMA", gb.mmu.read_byte(0xC000) == 0xFF)
+    check("CPU cannot write WRAM during DMA",
+          (gb.mmu.write_byte(0xC000, 0x99) or True) and mem[0xC000] == 16)
+    steps = 0
+    while gb.mmu.dma_remaining > 0 and steps < 200:
+        gb.step_all()
+        steps += 1
+    check("DMA completes in well under a frame", gb.mmu.dma_remaining == 0)
+    check("DMA copies sprite X", mem[0xFE01] == 8)
+    check("DMA copies a later source byte", mem[0xFE10] == 0xAB)
+    check("WRAM is readable again after DMA", gb.mmu.read_byte(0xC000) == 16)
+
+    # Sprite loaded via DMA actually draws.
+    _fill_tile(mem, 1, 3)
+    mem[0xFF40] = 0x93
+    mem[0xFF48] = 0xE4
+    gb.ppu.is_cgb = False
+    gb.ppu._render_scanline(0, mem[0xFF40])
+    shade = gb.ppu._PALETTE_SHADES[mem[0xFF48]][3]
+    check("DMA-loaded sprite draws",
+          fb_px(gb.ppu.framebuffer, 0) == as_rgb(gb.ppu.shades[shade]))
+
+
+def test_apu_power_and_div(ns):
+    """DMG length/wave access while off, CGB FS freeze, DIV-reset extra tick."""
+    MMU, APU = ns["MMU"], ns["APU"]
+    m = MMU()
+    apu = APU(m, is_cgb=False)
+    apu.write_register(0xFF26, 0x00)
+    apu.write_register(0xFF11, 0x3F)
+    check("DMG accepts NR11 length while APU is off", apu.ch1_length == 1)
+    apu.write_register(0xFF30, 0xA5)
+    check("wave RAM is writable while APU is off", apu.read_register(0xFF30) == 0xA5)
+
+    apu.wave_ram[0] = 0x12
+    apu.wave_ram[1] = 0x34
+    apu.power = True
+    apu.ch3_enabled = True
+    apu.ch3_wave_pos = 2
+    check("DMG wave read while CH3 active returns current sample byte",
+          apu.read_register(0xFF30) == 0x34)
+
+    apu.power = False
+    apu.is_cgb = False
+    apu.frame_seq_step = 0
+    apu.fs_div = 0
+    apu.step(8192)
+    check("DMG frame sequencer runs while APU is off", apu.frame_seq_step == 1)
+
+    m2 = MMU()
+    apu2 = APU(m2, is_cgb=True)
+    apu2.write_register(0xFF26, 0x00)
+    apu2.write_register(0xFF11, 0x3F)
+    check("CGB ignores NR11 length while APU is off", apu2.ch1_length == 0)
+    apu2.frame_seq_step = 0
+    apu2.fs_div = 0
+    apu2.step(8192 * 4)
+    check("CGB frame sequencer is frozen while APU is off", apu2.frame_seq_step == 0)
+
+    gb = ns["GameBoy"](rom_path=None, audio_enabled=False)
+    gb.apu.is_cgb = False
+    gb.mmu.is_cgb = False
+    gb.apu.power = True
+    gb.apu.frame_seq_step = 3
+    gb.timers.div_counter = 0x1000
+    gb.timers.reset_div()
+    check("DIV reset clocks FS when bit 12 was high", gb.apu.frame_seq_step == 4)
+    check("DIV reset clears the APU DIV shadow", gb.apu.fs_div == 0)
+
+
 def main():
     ns = load_module()
     print("opcode checks:");           test_opcodes(ns)
@@ -563,6 +654,8 @@ def main():
     print("apu frame sync:");          test_apu_frame_sync(ns)
     print("apu registers:");           test_apu_registers(ns)
     print("gameboy frame audio:");     test_gameboy_frame_audio(ns)
+    print("oam dma sprite load:");     test_oam_dma(ns)
+    print("apu power and DIV:");       test_apu_power_and_div(ns)
     print("double-speed timing:");     test_double_speed(ns)
     print("\nALL CHECKS PASSED")
 
