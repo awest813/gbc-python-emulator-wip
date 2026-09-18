@@ -403,14 +403,28 @@ def test_unsupported_cart_header(ns):
     with tempfile.NamedTemporaryFile(suffix=".gb", delete=False) as tf:
         rom = bytearray(0x200)
         rom[0x0143] = 0x00
-        rom[0x0147] = 0x22  # MBC7
+        rom[0x0147] = 0xFC  # Pocket Camera — still not emulated
         rom[0x0148] = 0x00
         rom[0x0149] = 0x00
         tf.write(rom)
         path = tf.name
     try:
         info = _parse_rom_header(path)
-        check("MBC7 header is labelled unsupported", "unsupported" in info.lower())
+        check("camera header is labelled unsupported", "unsupported" in info.lower())
+    finally:
+        os.unlink(path)
+    with tempfile.NamedTemporaryFile(suffix=".gb", delete=False) as tf:
+        rom = bytearray(0x200)
+        rom[0x0143] = 0x80
+        rom[0x0147] = 0x22  # MBC7 now emulated
+        rom[0x0148] = 0x00
+        rom[0x0149] = 0x00
+        tf.write(rom)
+        path = tf.name
+    try:
+        info = ns["_parse_rom_header"](path)
+        check("MBC7 header is not labelled unsupported", "unsupported" not in info.lower())
+        check("MBC7 header names the mapper", "MBC7" in info)
     finally:
         os.unlink(path)
 

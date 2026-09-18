@@ -1,8 +1,8 @@
 # Python GBC Emulator
 
 A Game Boy / Game Boy Color emulator written in Python, featuring a built-in
-menu system, ROM browser, MBC1/MBC2/MBC3/MBC5 cartridge support, and full
-CGB compatibility.
+menu system, ROM browser, MBC1/MBC2/MBC3/MBC5/MBC6/MBC7 cartridge support,
+Super Game Boy palettes, and full CGB compatibility.
 
 ![status](https://img.shields.io/badge/status-playable-brightgreen)
 ![license](https://img.shields.io/badge/license-MIT-blue)
@@ -25,18 +25,27 @@ CGB compatibility.
   frame sequencer for length / envelope / sweep, master volume and
   per-channel stereo panning, streamed to the host at 44.1 kHz.  Full
   CGB audio behaviour (wave RAM access rules, frame-sequencer reset).
-- **Serial port** — FF01/FF02 register support with serial interrupt
-  generation and TCP link cable for local two-player multiplayer.
+- **Serial port** — FF01/FF02 with cycle-accurate bit-clocking (512 T-cycles
+  per bit, or 16 in CGB fast mode), serial interrupt after 8 bits, and a
+  TCP link cable for local two-player multiplayer.
 - **Timers** — DIV, TIMA, TMA, TAC with all four programmable rates and
   correct overflow → interrupt signalling.
-- **Cartridge** — MBC1, MBC2 (4-bit RAM), MBC3 (with RTC), and MBC5
-  (ROM / RAM banking, battery-backed RAM with automatic `.sav` file
-  load on boot and save on exit). CGB mode auto-detected from header
-  byte 0x0143. Boot ROM support (DMG 256B / CGB ~2304B).
+- **Cartridge** — MBC1, MBC2 (4-bit RAM), MBC3 (with RTC), MBC5,
+  MBC6 (dual 8 KB ROM/flash windows + SRAM) and MBC7 (EEPROM +
+  accelerometer; D-pad tilts *Kirby Tilt 'n' Tumble*). Battery-backed
+  RAM / EEPROM / flash with automatic `.sav` load on boot and save on
+  exit. CGB mode auto-detected from header byte 0x0143; SGB mode from
+  byte 0x0146 when the cart is not CGB.
+- **SGB** — Packet transfer via P1, PAL01/23/03/12, PAL_SET / PAL_TRN,
+  ATTR_BLK/LIN/DIV/CHR, ATTR_SET / ATTR_TRN, MASK_EN and MLT_REQ
+  (SGB detection + 2/4-player IDs). The 20×18 attribute map recolors
+  the DMG picture with SNES RGB555 palettes.
 - **DMA** — OAM DMA (FF46), CGB H-Blank DMA (FF51-FF55), and CGB GDMA.
 - **CGB extras** — VRAM bank 1 (FF4F), WRAM bank 1-7 (FF70), CGB BG/OBJ
-  palettes (FF68-FF6C), KEY1 double-speed (FF4D), and all write-protection
-  rules (STAT read-only bits 0-2 / 6, unused bits forced to 1).
+  palettes (FF68-FF6C), KEY1 double-speed (FF4D) including one extra
+  T-cycle wait-state per cartridge ROM/RAM access, and all
+  write-protection rules (STAT read-only bits 0-2 / 6, unused bits
+  forced to 1). Boot ROM support (DMG 256B / CGB ~2304B).
 - **Save states** — Snapshot full emulator state (including cartridge SRAM)
   to `<rom>.ss<slot>` with F6 / F8 (save) and F7 / F9 (load).
 - **Menu system** — ROM browser, window-scale selector, keyboard controls,
@@ -237,7 +246,8 @@ gbc_emulator_skeleton.py   Deprecated CLI alias that forwards to gbc_emulator.py
 test_headless.py           Self-contained smoke test (synthetic ROM, no display)
 test_save_state.py         Save-state round-trip test (synthetic CGB ROM)
 test_controls.py           Joypad sources, SOCD, key bindings, WRAM fast-path
-ci_test.py                 Runs the three portable tests (used by GitHub Actions)
+test_hw_features.py        SGB packets, MBC6/7, serial bit-clock, CGB wait-states
+ci_test.py                 Runs the portable tests (used by GitHub Actions)
 requirements.txt           Dependency list (pygame, numpy)
 run.bat                    Windows launcher (installs deps if missing, then runs)
 run.sh                     Linux / macOS launcher (bash, installs deps if missing)
@@ -278,8 +288,15 @@ D-pad cleaning, customisable key bindings, and WRAM/HRAM write fast-paths:
 python test_controls.py
 ```
 
-All three portable tests are self-contained (no display, no local ROMs) and exit
+All four portable tests are self-contained (no display, no local ROMs) and exit
 non-zero on failure, so they work as CI checks.
+
+A fourth portable test covers Super Game Boy packets, MBC6/MBC7 mappers,
+cycle-accurate serial bit-clocking, and CGB double-speed cartridge wait-states:
+
+```bash
+python test_hw_features.py
+```
 
 A single wrapper script runs all tests sequentially:
 
@@ -301,23 +318,19 @@ interpreter on modest hardware.
 
 ### Known Limitations
 
-- CGB double-speed mode (KEY1) runs the CPU and the DIV / TIMA timers
-  at 2× the base clock while the PPU and APU stay on the base clock, so
-  display and audio timing remain correct. The cartridge bus access-time
-  penalty (one extra wait state per cartridge read at 2× speed) is not
-  emulated — in practice this only affects a few test ROMs.
-- SGB (Super Game Boy) features are not emulated.
-- MBC6 and MBC7 mappers are recognised in the ROM browser (labelled
-  *unsupported*) but not emulated; games that require them (e.g. *Kirby
-  Tilt 'n' Tumble*) will not work.
+- SGB border graphics (`CHR_TRN` / `PCT_TRN`) are accepted but not drawn;
+  the emulated picture stays at 160×144.
+- MBC7 tilt is mapped from the D-pad (and analog stick) rather than a
+  real accelerometer. EEPROM programming is immediate (no busy delay).
 - Link-cable multiplayer is CLI-only (`--link-server PORT` /
-  `--link-connect HOST:PORT` with a ROM path). Transfers complete in one
-  shot rather than bit-clocking over ~128 µs, so picky serial titles may
-  desync. A stalled partner times out instead of freezing the emulator.
-- Save states (slots 0 and 1) include cartridge SRAM. Battery-backed
-  `.sav` files are written on exit. MBC3 RTC is stored after SRAM in
-  VBA-M's 44-byte format (unix timestamp included) so day/night continues
-  while the emulator is closed. Older 48-byte custom trailers still load.
+  `--link-connect HOST:PORT` with a ROM path). Bytes are exchanged at
+  transfer start, then shifted locally one bit at a time. A stalled
+  partner times out instead of freezing the emulator.
+- Save states (slots 0 and 1) include cartridge SRAM, MBC6 flash, SGB
+  palettes, and in-flight serial state. Battery-backed `.sav` files are
+  written on exit. MBC3 RTC is stored after SRAM in VBA-M's 44-byte
+  format so day/night continues while the emulator is closed. Older
+  48-byte custom trailers still load.
 
 ## License
 

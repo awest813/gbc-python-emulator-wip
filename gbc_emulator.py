@@ -1,11 +1,12 @@
 """
 Game Boy / Game Boy Color emulator written in Python.
 
-Supports MBC1/MBC2/MBC3/MBC5 cartridges, BG / Window / Sprite rendering, and
-includes a built-in menu with ROM browser. Performance-tuned via precomputed
-tile / palette LUTs, unrolled scanline writers, a combined per-opcode
-dispatcher, and fast-path WRAM/HRAM memory access. Keyboard bindings are
-customisable.
+Supports MBC1/MBC2/MBC3/MBC5/MBC6/MBC7 cartridges, Super Game Boy palettes,
+cycle-accurate serial bit-clocking, CGB double-speed cart wait-states,
+BG / Window / Sprite rendering, and a built-in menu with ROM browser.
+Performance-tuned via precomputed tile / palette LUTs, unrolled scanline
+writers, a combined per-opcode dispatcher, and fast-path WRAM/HRAM memory
+access. Keyboard bindings are customisable.
 
 Usage:
     python gbc_emulator.py                  # launch the menu
@@ -79,6 +80,16 @@ MAX_SPRITES_PER_LINE  = 10
 TOTAL_OAM_SPRITES     = 40
 OAM_SIZE              = 160  # bytes
 OAM_DMA_CYCLES        = 640  # CPU T-cycles (160 bytes × 4)
+
+# Serial bit-clock: 8192 Hz (512 T-cycles/bit) or CGB fast 262144 Hz (16 T-cycles/bit).
+SERIAL_BIT_CYCLES_NORMAL = 512
+SERIAL_BIT_CYCLES_FAST   = 16
+
+# MBC7 accelerometer: 16-bit samples centred at 0x81D0; 1g ≈ 0x70.
+MBC7_ACCEL_CENTER = 0x81D0
+MBC7_ACCEL_G      = 0x70
+MBC6_FLASH_SIZE   = 0x100000  # 1 MiB MX29F008
+MBC7_EEPROM_SIZE  = 256       # 93LC56, 128 × 16-bit words
 
 # APU constants
 CH_PULSE_MAX_LENGTH = 64
@@ -229,12 +240,13 @@ def _clamp_choice(value, allowed, default):
 
 
 # Cartridge types with working mapper emulation. Others are recognised in the
-# ROM browser but will not run correctly (MBC6/7, camera, HuC, TAMA5, …).
+# ROM browser but will not run correctly (camera, HuC, TAMA5, …).
 _SUPPORTED_CART_TYPES = frozenset({
     0x00, 0x01, 0x02, 0x03,
     0x05, 0x06,
     0x0F, 0x10, 0x11, 0x12, 0x13,
     0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E,
+    0x20, 0x22,
 })
 _WINDOW_SCALES = (2, 3, 4, 5)
 
@@ -795,6 +807,9 @@ class CPU:
     def fetch_byte(self):
         """Fetches the next byte at PC and increments PC."""
         pc = self.reg.pc
+        mmu = self.mmu
+        if mmu.key1 & 0x80:
+            mmu._add_cart_wait(pc)
         val = self.mem[pc]
         self.reg.pc = (pc + 1) & 0xFFFF
         return val
@@ -802,6 +817,10 @@ class CPU:
     def fetch_word(self):
         """Fetches the next 16-bit word at PC and increments PC twice."""
         pc = self.reg.pc
+        mmu = self.mmu
+        if mmu.key1 & 0x80:
+            mmu._add_cart_wait(pc)
+            mmu._add_cart_wait((pc + 1) & 0xFFFF)
         mem = self.mem
         val = mem[pc] | (mem[(pc + 1) & 0xFFFF] << 8)
         self.reg.pc = (pc + 2) & 0xFFFF
@@ -810,6 +829,7 @@ class CPU:
     def step(self):
         """Fetches, decodes, and executes a single instruction."""
         mem = self.mem
+        mmu = self.mmu
         if self.halted:
             if mem[0xFFFF] & mem[0xFF0F]:
                 self.halted = False
@@ -823,6 +843,8 @@ class CPU:
 
         reg = self.reg
         pc = reg.pc
+        if mmu.key1 & 0x80:
+            mmu._add_cart_wait(pc)
         if self.halt_bug_pending:
             self.halt_bug_pending = False
             opcode = mem[pc]
@@ -832,6 +854,10 @@ class CPU:
         if self.trace_enabled:
             self.current_opcode_pc = pc
         cycles = self.execute(opcode)
+        wait = mmu.cart_wait_cycles
+        if wait:
+            mmu.cart_wait_cycles = 0
+            cycles += wait
         if self.interrupts_master_enabled:
             cycles += self._handle_interrupts()
         return cycles
@@ -1556,6 +1582,54 @@ class MMU:
         # Boot ROM
         self.bootrom = bytearray()
         self.bootrom_enabled = False
+        # CGB double-speed: extra T-cycle per cartridge bus access.
+        self.cart_wait_cycles = 0
+        # Serial shift register (bit-clocked; not an instant transfer).
+        self.serial_bits_left = 0
+        self.serial_cycle_accum = 0
+        self.serial_incoming = 0xFF
+        # Super Game Boy
+        self.is_sgb = False
+        self.sgb_in_packet = False
+        self.sgb_bit_count = 0
+        self.sgb_packet = bytearray(16)
+        self.sgb_cmd = 0
+        self.sgb_cmd_data = bytearray()
+        self.sgb_packets_left = 0
+        self.sgb_player_count = 1
+        self.sgb_current_player = 0
+        self.sgb_mask = 0
+        self.sgb_pal_rgb = [0] * 16
+        self.sgb_attr = bytearray(20 * 18)
+        self.sgb_sys_pal = bytearray(512 * 8)
+        self.sgb_atf = bytearray(45 * 90)
+        self._sgb_init_default_palettes()
+        # MBC6
+        self.mbc6_rom_bank_a = 0
+        self.mbc6_rom_bank_b = 1
+        self.mbc6_ram_bank_a = 0
+        self.mbc6_ram_bank_b = 0
+        self.mbc6_flash_a = False
+        self.mbc6_flash_b = False
+        self.mbc6_flash_enable = False
+        self.mbc6_flash_we = False
+        self.flash_data = bytearray()
+        self.flash_mode = 'ready'
+        self.flash_cmd = 0
+        # MBC7
+        self.mbc7_ram_enable2 = False
+        self.mbc7_latch_ready = False
+        self.mbc7_latch_x = 0x8000
+        self.mbc7_latch_y = 0x8000
+        self.eeprom_pins = 0
+        self.eeprom_cs = False
+        self.eeprom_clk = False
+        self.eeprom_do = 1
+        self.eeprom_state = 0  # 0 wait-start, 1 command, 2 dummy, 3 read, 4 write
+        self.eeprom_bits = 0
+        self.eeprom_shift = 0
+        self.eeprom_addr = 0
+        self.eeprom_write_en = False
 
     def load_bootrom(self, bootrom_data):
         """Install a boot ROM that will shadow cartridge reads at 0x0000-N.
@@ -1579,17 +1653,30 @@ class MMU:
         self.num_rom_banks = rom_size_map.get(rom_size_code, 2)
         self.num_ram_banks = ram_size_map.get(ram_size_code, 0)
 
-        mbc_ram_types = {0x02, 0x03, 0x05, 0x06, 0x0F, 0x10, 0x12, 0x13, 0x1A, 0x1B, 0x1D, 0x1E}
-        mbc_battery_types = {0x03, 0x06, 0x0F, 0x10, 0x13, 0x1B, 0x1E}
+        mbc_ram_types = {0x02, 0x03, 0x05, 0x06, 0x0F, 0x10, 0x12, 0x13, 0x1A, 0x1B, 0x1D, 0x1E, 0x20, 0x22}
+        mbc_battery_types = {0x03, 0x06, 0x0F, 0x10, 0x13, 0x1B, 0x1E, 0x20, 0x22}
         self.has_ram = self.mbc_type in mbc_ram_types or self.num_ram_banks > 0
         self.has_battery = self.mbc_type in mbc_battery_types
         # MBC3 RTC is present on types 0x0F (timer+batt) and 0x10 (timer+ram+batt)
         self.has_rtc = self.mbc_type in (0x0F, 0x10)
         cgb_flag = self.rom_data[0x0143] if len(self.rom_data) > 0x0143 else 0x00
+        sgb_flag = self.rom_data[0x0146] if len(self.rom_data) > 0x0146 else 0x00
         self.is_cgb = bool(cgb_flag & 0x80)
+        # SGB only when the cart is not CGB-exclusive/compatible (CGB wins).
+        self.is_sgb = (not self.is_cgb) and (sgb_flag == 0x03)
         if self.mbc_type in (0x05, 0x06):
             # MBC2 has 512 nibbles = 256 bytes of 4-bit RAM
             self.ram_data = bytearray(256)
+        elif self.mbc_type == 0x22:
+            self.ram_data = bytearray(MBC7_EEPROM_SIZE)
+            self.has_ram = True
+        elif self.mbc_type == 0x20:
+            ram_bytes = self.num_ram_banks * 0x2000 if self.num_ram_banks else 0x8000
+            self.ram_data = bytearray(ram_bytes)
+            self.flash_data = bytearray(b'\xFF' * MBC6_FLASH_SIZE)
+            self.has_ram = True
+            self.mbc6_rom_bank_a = 0
+            self.mbc6_rom_bank_b = 1
         elif self.has_ram and self.num_ram_banks > 0:
             self.ram_data = bytearray(self.num_ram_banks * 0x2000)
 
@@ -1599,9 +1686,11 @@ class MMU:
                     0x10:"MBC3+TIMER+RAM+BATT", 0x11:"MBC3", 0x12:"MBC3+RAM",
                     0x13:"MBC3+RAM+BATT", 0x19:"MBC5", 0x1A:"MBC5+RAM",
                     0x1B:"MBC5+RAM+BATT", 0x1C:"MBC5+RUMBLE", 0x1D:"MBC5+RUMBLE+RAM",
-                    0x1E:"MBC5+RUMBLE+RAM+BATT"}.get(self.mbc_type, f"UNKNOWN(0x{self.mbc_type:02X})")
+                    0x1E:"MBC5+RUMBLE+RAM+BATT",
+                    0x20:"MBC6", 0x22:"MBC7"}.get(self.mbc_type, f"UNKNOWN(0x{self.mbc_type:02X})")
         extra = "" if self.mbc_type in _SUPPORTED_CART_TYPES else " — mapper not emulated"
-        logging.info(f"Loaded ROM: {len(rom_data)} bytes [{mbc_name}, {self.num_rom_banks} ROM banks, {self.num_ram_banks} RAM banks{' CGB' if self.is_cgb else ''}{extra}]")
+        mode = " CGB" if self.is_cgb else (" SGB" if self.is_sgb else "")
+        logging.info(f"Loaded ROM: {len(rom_data)} bytes [{mbc_name}, {self.num_rom_banks} ROM banks, {self.num_ram_banks} RAM banks{mode}{extra}]")
         if extra:
             logging.warning("This cartridge type is not emulated; the game will not run correctly.")
 
@@ -1678,6 +1767,11 @@ class MMU:
             return self.memory[address]
         # Cartridge RAM (0xA000-0xBFFF)
         if 0xA000 <= address <= 0xBFFF:
+            self._add_cart_wait(address)
+            if self.mbc_type == 0x22:
+                return self._mbc7_read_reg(address)
+            if self.mbc_type == 0x20:
+                return self._mbc6_read_ram(address)
             if self.mbc_type in (0x05, 0x06):
                 if not self.ram_enabled or len(self.ram_data) == 0:
                     return 0xFF
@@ -1707,20 +1801,26 @@ class MMU:
             return 0xFF
         # ROM (0x0000-0x7FFF)
         if address < 0x8000:
+            self._add_cart_wait(address)
             return self._read_rom(address)
 
     def _read_joypad(self):
         sel = self.memory[0xFF00] & 0x30
+        if self.sgb_player_count > 1 and sel == 0x30:
+            return 0xC0 | 0x30 | (0x0F - self.sgb_current_player)
         line_dir = 0x0F
         line_act = 0x0F
-        if not (self.joypad_buttons & 0x01): line_dir &= ~0x01
-        if not (self.joypad_buttons & 0x02): line_dir &= ~0x02
-        if not (self.joypad_buttons & 0x04): line_dir &= ~0x04
-        if not (self.joypad_buttons & 0x08): line_dir &= ~0x08
-        if not (self.joypad_buttons & 0x10): line_act &= ~0x01
-        if not (self.joypad_buttons & 0x20): line_act &= ~0x02
-        if not (self.joypad_buttons & 0x40): line_act &= ~0x04
-        if not (self.joypad_buttons & 0x80): line_act &= ~0x08
+        buttons = self.joypad_buttons
+        if self.sgb_player_count > 1 and self.sgb_current_player != 0:
+            buttons = 0xFF  # only player 1 is wired to the host keyboard/gamepad
+        if not (buttons & 0x01): line_dir &= ~0x01
+        if not (buttons & 0x02): line_dir &= ~0x02
+        if not (buttons & 0x04): line_dir &= ~0x04
+        if not (buttons & 0x08): line_dir &= ~0x08
+        if not (buttons & 0x10): line_act &= ~0x01
+        if not (buttons & 0x20): line_act &= ~0x02
+        if not (buttons & 0x40): line_act &= ~0x04
+        if not (buttons & 0x80): line_act &= ~0x08
         if not (sel & 0x10) and not (sel & 0x20):
             result = line_dir & line_act
         elif not (sel & 0x10):
@@ -1787,9 +1887,15 @@ class MMU:
             self.memory[address] = value
             return
         if address < 0x8000:
+            self._add_cart_wait(address)
             self._handle_mbc_write(address, value)
         elif 0xA000 <= address <= 0xBFFF:
-            if self.mbc_type in (0x05, 0x06):
+            self._add_cart_wait(address)
+            if self.mbc_type == 0x22:
+                self._mbc7_write_reg(address, value)
+            elif self.mbc_type == 0x20:
+                self._mbc6_write_ram(address, value)
+            elif self.mbc_type in (0x05, 0x06):
                 if not self.ram_enabled or len(self.ram_data) == 0:
                     return
                 # MBC2: only lower 4 bits of address matter (256 entries), lower 4 bits stored
@@ -1819,7 +1925,11 @@ class MMU:
         elif 0xE000 <= address <= 0xFDFF:
             self.memory[0xC000 + (address - 0xE000)] = value
         elif address == 0xFF00:
-            self.memory[0xFF00] = (self.memory[0xFF00] & 0x0F) | (value & 0x30) | 0xC0
+            old = self.memory[0xFF00] & 0x30
+            new = value & 0x30
+            self.memory[0xFF00] = (self.memory[0xFF00] & 0x0F) | new | 0xC0
+            if not self.is_cgb:
+                self._sgb_write_joyp(old, new)
         elif address == 0xFF04:
             self.memory[0xFF04] = 0x00
             if self.div_reset_callback:
@@ -1832,8 +1942,12 @@ class MMU:
             self.serial_data = value
         elif address == 0xFF02:
             self.serial_control = value & 0x83
-            if (value & 0x81) == 0x81:
-                self._serial_transfer()
+            if value & 0x80:
+                if value & 0x01:
+                    self._serial_start()
+            else:
+                # Bit 7 is hardware-clear-only; ignore attempts to abort.
+                pass
         elif 0xFF10 <= address <= 0xFF3F:
             if self.apu is not None:
                 self.apu.write_register(address, value)
@@ -1903,17 +2017,52 @@ class MMU:
         self.write_byte(address, value & 0xFF)
         self.write_byte((address + 1) & 0xFFFF, (value >> 8) & 0xFF)
 
-    def _serial_transfer(self):
+    def _serial_start(self):
+        """Begin an internal-clock 8-bit transfer; incoming bits default to 1."""
+        self.serial_bits_left = 8
+        self.serial_cycle_accum = 0
         if self.link_cable is not None:
-            self.serial_data = self.link_cable.transfer(self.serial_data)
-        self.serial_control &= 0x7F
-        self.memory[0xFF0F] |= IF_SERIAL
+            self.serial_incoming = self.link_cable.transfer(self.serial_data)
+        else:
+            self.serial_incoming = 0xFF
+
+    def _serial_bit_period(self):
+        if self.is_cgb and (self.serial_control & 0x02):
+            return SERIAL_BIT_CYCLES_FAST
+        return SERIAL_BIT_CYCLES_NORMAL
+
+    def _serial_step(self, cpu_cycles):
+        """Shift one bit every 512 (or 16, CGB fast) CPU T-cycles."""
+        if self.serial_bits_left <= 0 or not (self.serial_control & 0x81) == 0x81:
+            return
+        period = self._serial_bit_period()
+        self.serial_cycle_accum += cpu_cycles
+        while self.serial_bits_left > 0 and self.serial_cycle_accum >= period:
+            self.serial_cycle_accum -= period
+            in_bit = (self.serial_incoming >> 7) & 1
+            self.serial_incoming = ((self.serial_incoming << 1) | 1) & 0xFF
+            self.serial_data = ((self.serial_data << 1) | in_bit) & 0xFF
+            self.serial_bits_left -= 1
+        if self.serial_bits_left <= 0:
+            self.serial_control &= 0x7F
+            self.serial_bits_left = 0
+            self.memory[0xFF0F] |= IF_SERIAL
+
+    def _add_cart_wait(self, address):
+        """One extra T-cycle per cartridge access in CGB double-speed."""
+        if not (self.key1 & 0x80):
+            return
+        if self.bootrom_enabled and address < len(self.bootrom):
+            return
+        if address < 0x8000 or 0xA000 <= address <= 0xBFFF:
+            self.cart_wait_cycles += 1
 
     def _hdma_transfer(self):
         src = ((self.memory[0xFF51] << 8) | self.memory[0xFF52]) & 0xFFF0
         dst = (((self.memory[0xFF53] << 8) | self.memory[0xFF54]) & 0x1FF0) | 0x8000
         blocks = (self.memory[0xFF55] & 0x7F) + 1
         length = blocks * 16
+        saved_wait = self.cart_wait_cycles
         for i in range(length):
             val = self.read_byte(src + i)
             addr = 0x8000 + ((dst + i) & 0x1FFF)
@@ -1921,6 +2070,7 @@ class MMU:
                 self.vram_bank1[addr - 0x8000] = val
             else:
                 self.memory[addr] = val
+        self.cart_wait_cycles = saved_wait
         self.memory[0xFF55] = 0xFF
         self.gdma_stall = (blocks * 2 + 1) * 4
 
@@ -1928,6 +2078,7 @@ class MMU:
         if not self.hdma_active:
             return
         chunk = min(16, self.hdma_remaining)
+        saved_wait = self.cart_wait_cycles
         for i in range(chunk):
             val = self.read_byte(self.hdma_src + i)
             addr = 0x8000 + ((self.hdma_dst + i) & 0x1FFF)
@@ -1935,6 +2086,7 @@ class MMU:
                 self.vram_bank1[addr - 0x8000] = val
             else:
                 self.memory[addr] = val
+        self.cart_wait_cycles = saved_wait
         self.hdma_src += 16
         self.hdma_dst += 16
         self.hdma_remaining -= chunk
@@ -2006,6 +2158,8 @@ class MMU:
             else:
                 offset = address
             return rom[offset] if offset < n else 0xFF
+        if self.mbc_type == 0x20:
+            return self._mbc6_read_window(address)
         if self.mbc_type == 0x00:
             return rom[address] if address < n else 0xFF
         banks = self.num_rom_banks if self.num_rom_banks else 1
@@ -2014,7 +2168,12 @@ class MMU:
         return rom[offset] if offset < n else 0xFF
 
     def _remap_rom_bank(self):
-        bank = self.rom_bank % self.num_rom_banks
+        if self.mbc_type == 0x20:
+            for i in range(0x4000):
+                self.memory[0x4000 + i] = self._mbc6_read_window(0x4000 + i)
+            return
+        banks = self.num_rom_banks if self.num_rom_banks else 1
+        bank = self.rom_bank % banks
         src_offset = bank * 0x4000
         end = min(src_offset + 0x4000, len(self.rom_data))
         length = end - src_offset
@@ -2025,6 +2184,12 @@ class MMU:
 
     def _handle_mbc_write(self, address, value):
         mbc = self.mbc_type
+        if mbc == 0x20:
+            self._mbc6_write_control(address, value)
+            return
+        if mbc == 0x22:
+            self._mbc7_write_control(address, value)
+            return
         if mbc in (0x05, 0x06):
             if address & 0x0100:
                 bank = value & 0x0F
@@ -2205,6 +2370,535 @@ class MMU:
             self.rtc_dh = blob[8] & 0xC1
         self.rtc_last_time = time.time()
 
+    # ===== CGB cart wait / SGB / MBC6 / MBC7 =====
+    def _sgb_init_default_palettes(self):
+        """Four palettes matching the default DMG greens until a PAL command."""
+        dmg = PALETTE_DMG
+        for pal in range(4):
+            for c, (r, g, b) in enumerate(dmg):
+                self.sgb_pal_rgb[pal * 4 + c] = (r << 16) | (g << 8) | b
+        self.sgb_attr[:] = b'\x00' * (20 * 18)
+
+    @staticmethod
+    def _rgb555_to_packed(color):
+        r5 = color & 0x1F
+        g5 = (color >> 5) & 0x1F
+        b5 = (color >> 10) & 0x1F
+        r = (r5 << 3) | (r5 >> 2)
+        g = (g5 << 3) | (g5 >> 2)
+        b = (b5 << 3) | (b5 >> 2)
+        return (r << 16) | (g << 8) | b
+
+    def _sgb_set_color(self, pal, idx, color555, share_zero=False):
+        packed = self._rgb555_to_packed(color555)
+        self.sgb_pal_rgb[(pal & 3) * 4 + (idx & 3)] = packed
+        if share_zero or idx == 0:
+            for p in range(4):
+                self.sgb_pal_rgb[p * 4] = packed
+
+    def _sgb_write_joyp(self, old, new):
+        if self.sgb_player_count > 1 and (old & 0x20) == 0 and (new & 0x20):
+            self.sgb_current_player = (self.sgb_current_player + 1) % self.sgb_player_count
+        if new == 0x00:
+            self.sgb_in_packet = True
+            self.sgb_bit_count = 0
+            self.sgb_packet = bytearray(16)
+            return
+        if not self.sgb_in_packet:
+            return
+        if old == 0x30 and new in (0x10, 0x20):
+            bit = 1 if new == 0x20 else 0
+            if self.sgb_bit_count < 128:
+                byte_i = self.sgb_bit_count >> 3
+                self.sgb_packet[byte_i] |= (bit << (self.sgb_bit_count & 7))
+                self.sgb_bit_count += 1
+                if self.sgb_bit_count == 128:
+                    self.sgb_in_packet = False
+                    self._sgb_finish_packet()
+
+    def _sgb_finish_packet(self):
+        pkt = self.sgb_packet
+        if self.sgb_packets_left <= 0:
+            length = pkt[0] & 7
+            if length == 0:
+                return
+            self.sgb_cmd = pkt[0] >> 3
+            self.sgb_cmd_data = bytearray(pkt)
+            self.sgb_packets_left = length - 1
+        else:
+            self.sgb_cmd_data.extend(pkt)
+            self.sgb_packets_left -= 1
+        if self.sgb_packets_left <= 0:
+            self._sgb_exec(self.sgb_cmd, self.sgb_cmd_data)
+            if not self.is_cgb:
+                self.is_sgb = True
+                if self.ppu is not None:
+                    self.ppu.is_sgb = True
+
+    def _sgb_exec(self, cmd, data):
+        if cmd == 0x00:
+            self._sgb_pal_pair(data, 0, 1)
+        elif cmd == 0x01:
+            self._sgb_pal_pair(data, 2, 3)
+        elif cmd == 0x02:
+            self._sgb_pal_pair(data, 0, 3)
+        elif cmd == 0x03:
+            self._sgb_pal_pair(data, 1, 2)
+        elif cmd == 0x04:
+            self._sgb_attr_blk(data)
+        elif cmd == 0x05:
+            self._sgb_attr_lin(data)
+        elif cmd == 0x06:
+            self._sgb_attr_div(data)
+        elif cmd == 0x07:
+            self._sgb_attr_chr(data)
+        elif cmd == 0x0A:
+            self._sgb_pal_set(data)
+        elif cmd == 0x0B:
+            n = min(len(self.sgb_sys_pal), 0x1000)
+            self.sgb_sys_pal[:n] = self.memory[0x8000:0x8000 + n]
+        elif cmd == 0x11:
+            ctrl = data[1] if len(data) > 1 else 0
+            if ctrl == 0:
+                self.sgb_player_count = 1
+            elif ctrl == 1:
+                self.sgb_player_count = 2
+            else:
+                self.sgb_player_count = 4
+            self.sgb_current_player = 0
+        elif cmd == 0x15:
+            n = min(len(self.sgb_atf), 4050)
+            self.sgb_atf[:n] = self.memory[0x8000:0x8000 + n]
+        elif cmd == 0x16:
+            self._sgb_attr_set(data[1] if len(data) > 1 else 0)
+        elif cmd == 0x17:
+            self.sgb_mask = data[1] & 3 if len(data) > 1 else 0
+
+    def _sgb_pal_pair(self, data, pal_a, pal_b):
+        if len(data) < 15:
+            return
+        def col(off):
+            return data[off] | (data[off + 1] << 8)
+        c0 = col(1)
+        self._sgb_set_color(pal_a, 0, c0, share_zero=True)
+        self._sgb_set_color(pal_a, 1, col(3))
+        self._sgb_set_color(pal_a, 2, col(5))
+        self._sgb_set_color(pal_a, 3, col(7))
+        self._sgb_set_color(pal_b, 1, col(9))
+        self._sgb_set_color(pal_b, 2, col(11))
+        self._sgb_set_color(pal_b, 3, col(13))
+
+    def _sgb_pal_set(self, data):
+        if len(data) < 10:
+            return
+        for i in range(4):
+            pid = data[1 + i * 2] | (data[2 + i * 2] << 8)
+            pid &= 0x1FF
+            off = pid * 8
+            for c in range(4):
+                color = self.sgb_sys_pal[off + c * 2] | (self.sgb_sys_pal[off + c * 2 + 1] << 8)
+                self.sgb_pal_rgb[i * 4 + c] = self._rgb555_to_packed(color)
+        flags = data[9]
+        if flags & 0x40:
+            self.sgb_mask = 0
+        if flags & 0x80:
+            self._sgb_apply_atf(flags & 0x3F)
+
+    def _sgb_apply_atf(self, n):
+        if n > 0x2C:
+            return
+        src = self.sgb_atf[n * 90:(n + 1) * 90]
+        if len(src) < 90:
+            return
+        i = 0
+        for y in range(18):
+            for b in range(5):
+                byte = src[i]
+                i += 1
+                for t in range(4):
+                    self.sgb_attr[y * 20 + b * 4 + t] = (byte >> 6) & 3
+                    byte = (byte << 2) & 0xFF
+
+    def _sgb_attr_set(self, value):
+        self._sgb_apply_atf(value & 0x3F)
+        if value & 0x40:
+            self.sgb_mask = 0
+
+    def _sgb_attr_blk(self, data):
+        nsets = data[1] if len(data) > 1 else 0
+        off = 2
+        for _ in range(nsets):
+            if off + 6 > len(data):
+                break
+            ctrl, pals, x1, y1, x2, y2 = data[off:off + 6]
+            off += 6
+            if x1 > x2:
+                x1, x2 = x2, x1
+            if y1 > y2:
+                y1, y2 = y2, y1
+            inside = pals & 3
+            around = (pals >> 2) & 3
+            outside = (pals >> 4) & 3
+            do_in = bool(ctrl & 1)
+            do_line = bool(ctrl & 2)
+            do_out = bool(ctrl & 4)
+            if do_in and not do_line and not do_out:
+                do_line = True
+                around = inside
+            if do_out and not do_line and not do_in:
+                do_line = True
+                around = outside
+            for y in range(18):
+                for x in range(20):
+                    in_box = x1 <= x <= x2 and y1 <= y <= y2
+                    on_border = in_box and (x == x1 or x == x2 or y == y1 or y == y2)
+                    interior = in_box and not on_border
+                    if interior and do_in:
+                        self.sgb_attr[y * 20 + x] = inside
+                    elif on_border and do_line:
+                        self.sgb_attr[y * 20 + x] = around
+                    elif not in_box and do_out:
+                        self.sgb_attr[y * 20 + x] = outside
+
+    def _sgb_attr_lin(self, data):
+        nsets = data[1] if len(data) > 1 else 0
+        for i in range(nsets):
+            if 2 + i >= len(data):
+                break
+            d = data[2 + i]
+            pal = (d >> 5) & 3
+            line = d & 0x1F
+            if d & 0x80:
+                if line < 18:
+                    for x in range(20):
+                        self.sgb_attr[line * 20 + x] = pal
+            else:
+                if line < 20:
+                    for y in range(18):
+                        self.sgb_attr[y * 20 + line] = pal
+
+    def _sgb_attr_div(self, data):
+        if len(data) < 3:
+            return
+        pals = data[1]
+        coord = data[2]
+        below = pals & 3
+        above = (pals >> 2) & 3
+        line = (pals >> 4) & 3
+        if pals & 0x40:
+            for y in range(18):
+                pal = above if y < coord else (line if y == coord else below)
+                for x in range(20):
+                    self.sgb_attr[y * 20 + x] = pal
+        else:
+            for x in range(20):
+                pal = above if x < coord else (line if x == coord else below)
+                for y in range(18):
+                    self.sgb_attr[y * 20 + x] = pal
+
+    def _sgb_attr_chr(self, data):
+        if len(data) < 6:
+            return
+        x = data[1]
+        y = data[2]
+        count = data[3] | (data[4] << 8)
+        vertical = data[5] & 1
+        bits = data[6:]
+        bi = 0
+        for n in range(count):
+            byte = bits[n >> 2] if (n >> 2) < len(bits) else 0
+            shift = 6 - ((n & 3) << 1)
+            pal = (byte >> shift) & 3
+            if 0 <= x < 20 and 0 <= y < 18:
+                self.sgb_attr[y * 20 + x] = pal
+            if vertical:
+                y += 1
+                if y >= 18:
+                    y = 0
+                    x += 1
+            else:
+                x += 1
+                if x >= 20:
+                    x = 0
+                    y += 1
+
+    def _mbc6_read_window(self, address):
+        if address < 0x4000:
+            return self.rom_data[address] if address < len(self.rom_data) else 0xFF
+        if address < 0x6000:
+            bank, flash, offset = self.mbc6_rom_bank_a, self.mbc6_flash_a, address - 0x4000
+        else:
+            bank, flash, offset = self.mbc6_rom_bank_b, self.mbc6_flash_b, address - 0x6000
+        if flash and self.mbc6_flash_enable:
+            linear = (bank & 0x7F) * 0x2000 + offset
+            if self.flash_mode == 'id':
+                return 0xC2 if (offset & 1) == 0 else 0x81
+            if linear < len(self.flash_data):
+                return self.flash_data[linear]
+            return 0xFF
+        n8 = max(1, self.num_rom_banks * 2)
+        linear = (bank % n8) * 0x2000 + offset
+        return self.rom_data[linear] if linear < len(self.rom_data) else 0xFF
+
+    def _mbc6_read_ram(self, address):
+        if not self.ram_enabled or not self.ram_data:
+            return 0xFF
+        if address < 0xB000:
+            idx = (self.mbc6_ram_bank_a & 7) * 0x1000 + (address - 0xA000)
+        else:
+            idx = (self.mbc6_ram_bank_b & 7) * 0x1000 + (address - 0xB000)
+        return self.ram_data[idx] if idx < len(self.ram_data) else 0xFF
+
+    def _mbc6_write_ram(self, address, value):
+        if not self.ram_enabled or not self.ram_data:
+            return
+        if address < 0xB000:
+            idx = (self.mbc6_ram_bank_a & 7) * 0x1000 + (address - 0xA000)
+        else:
+            idx = (self.mbc6_ram_bank_b & 7) * 0x1000 + (address - 0xB000)
+        if idx < len(self.ram_data):
+            self.ram_data[idx] = value
+
+    def _mbc6_write_control(self, address, value):
+        if address <= 0x03FF:
+            self.ram_enabled = (value & 0x0F) == 0x0A
+        elif address <= 0x07FF:
+            self.mbc6_ram_bank_a = value & 0x07
+        elif address <= 0x0BFF:
+            self.mbc6_ram_bank_b = value & 0x07
+        elif address <= 0x0FFF:
+            self.mbc6_flash_enable = bool(value & 1)
+            self._remap_rom_bank()
+        elif address == 0x1000:
+            self.mbc6_flash_we = bool(value & 1)
+        elif address <= 0x27FF:
+            self.mbc6_rom_bank_a = value & 0x7F
+            self._remap_rom_bank()
+        elif address <= 0x2FFF:
+            self.mbc6_flash_a = (value & 0x08) != 0
+            self._remap_rom_bank()
+        elif address <= 0x37FF:
+            self.mbc6_rom_bank_b = value & 0x7F
+            self._remap_rom_bank()
+        elif address <= 0x3FFF:
+            self.mbc6_flash_b = (value & 0x08) != 0
+            self._remap_rom_bank()
+        elif 0x4000 <= address <= 0x7FFF:
+            self._mbc6_flash_write(address, value)
+
+    def _mbc6_flash_write(self, address, value):
+        if not self.mbc6_flash_enable:
+            return
+        if address < 0x6000:
+            if not self.mbc6_flash_a:
+                return
+            bank = self.mbc6_rom_bank_a
+            offset = address - 0x4000
+        else:
+            if not self.mbc6_flash_b:
+                return
+            bank = self.mbc6_rom_bank_b
+            offset = address - 0x6000
+        linear = (bank & 0x7F) * 0x2000 + offset
+        off = offset & 0x1FFF
+        if self.flash_mode == 'program':
+            if value == 0xF0:
+                self.flash_mode = 'ready'
+                return
+            if linear < len(self.flash_data):
+                self.flash_data[linear] &= value
+                self.memory[address] = self.flash_data[linear]
+            return
+        if value == 0xF0:
+            self.flash_mode = 'ready'
+            self.flash_cmd = 0
+            return
+        if self.flash_cmd == 0 and off == 0x1555 and value == 0xAA:
+            self.flash_cmd = 1
+        elif self.flash_cmd == 1 and off == 0x0AAA and value == 0x55:
+            self.flash_cmd = 2
+        elif self.flash_cmd == 2 and off == 0x1555:
+            if value == 0x90:
+                self.flash_mode = 'id'
+            elif value == 0xA0:
+                self.flash_mode = 'program'
+            elif value == 0x80:
+                self.flash_cmd = 3
+                return
+            self.flash_cmd = 0
+        elif self.flash_cmd == 3 and off == 0x1555 and value == 0xAA:
+            self.flash_cmd = 4
+        elif self.flash_cmd == 4 and off == 0x0AAA and value == 0x55:
+            self.flash_cmd = 5
+        elif self.flash_cmd == 5:
+            if value == 0x10:
+                if self.mbc6_flash_we:
+                    self.flash_data[:] = b'\xFF' * len(self.flash_data)
+                elif len(self.flash_data) > 0x20000:
+                    self.flash_data[0x20000:] = b'\xFF' * (len(self.flash_data) - 0x20000)
+            elif value == 0x30:
+                sector = (linear // 0x20000) * 0x20000
+                if sector != 0 or self.mbc6_flash_we:
+                    end = min(sector + 0x20000, len(self.flash_data))
+                    if sector < len(self.flash_data):
+                        self.flash_data[sector:end] = b'\xFF' * (end - sector)
+            self.flash_cmd = 0
+            self.flash_mode = 'ready'
+        else:
+            self.flash_cmd = 0
+
+    def _mbc7_write_control(self, address, value):
+        if address <= 0x1FFF:
+            self.ram_enabled = (value & 0x0F) == 0x0A
+        elif address <= 0x3FFF:
+            banks = self.num_rom_banks if self.num_rom_banks else 1
+            self.rom_bank = value % banks
+            self._remap_rom_bank()
+        elif address <= 0x5FFF:
+            self.mbc7_ram_enable2 = (value == 0x40)
+
+    def _mbc7_regs_enabled(self):
+        return self.ram_enabled and self.mbc7_ram_enable2
+
+    def _mbc7_read_reg(self, address):
+        if not self._mbc7_regs_enabled():
+            return 0xFF
+        reg = (address >> 4) & 0x0F
+        if reg <= 1:
+            return 0xFF
+        if reg == 2:
+            return self.mbc7_latch_x & 0xFF
+        if reg == 3:
+            return (self.mbc7_latch_x >> 8) & 0xFF
+        if reg == 4:
+            return self.mbc7_latch_y & 0xFF
+        if reg == 5:
+            return (self.mbc7_latch_y >> 8) & 0xFF
+        if reg == 6:
+            return 0x00
+        if reg == 8:
+            return (self.eeprom_pins & 0xC2) | (self.eeprom_do & 1)
+        return 0xFF
+
+    def _mbc7_write_reg(self, address, value):
+        if not self._mbc7_regs_enabled():
+            return
+        reg = (address >> 4) & 0x0F
+        if reg == 0 and value == 0x55:
+            self.mbc7_latch_x = 0x8000
+            self.mbc7_latch_y = 0x8000
+            self.mbc7_latch_ready = True
+        elif reg == 1 and value == 0xAA and self.mbc7_latch_ready:
+            self.mbc7_latch_x, self.mbc7_latch_y = self._mbc7_sample_accel()
+            self.mbc7_latch_ready = False
+        elif reg == 8:
+            self._eeprom_write(value)
+
+    def _mbc7_sample_accel(self):
+        x = y = MBC7_ACCEL_CENTER
+        b = self.joypad_buttons
+        if not (b & 0x01):  # Right → lower X
+            x -= MBC7_ACCEL_G
+        if not (b & 0x02):  # Left → higher X
+            x += MBC7_ACCEL_G
+        if not (b & 0x04):  # Up → higher Y
+            y += MBC7_ACCEL_G
+        if not (b & 0x08):  # Down → lower Y
+            y -= MBC7_ACCEL_G
+        return x & 0xFFFF, y & 0xFFFF
+
+    def _eeprom_write(self, value):
+        cs = bool(value & 0x80)
+        clk = bool(value & 0x40)
+        di = 1 if (value & 0x02) else 0
+        self.eeprom_pins = value & 0xC2
+        if not cs:
+            self.eeprom_cs = False
+            self.eeprom_clk = clk
+            self.eeprom_do = 1
+            self.eeprom_state = 0
+            self.eeprom_bits = 0
+            self.eeprom_shift = 0
+            return
+        rising = clk and not self.eeprom_clk
+        self.eeprom_cs = True
+        self.eeprom_clk = clk
+        if not rising:
+            return
+        if self.eeprom_state == 0:
+            if di:
+                self.eeprom_state = 1
+                self.eeprom_bits = 0
+                self.eeprom_shift = 0
+            return
+        if self.eeprom_state == 1:
+            self.eeprom_shift = ((self.eeprom_shift << 1) | di) & 0x3FF
+            self.eeprom_bits += 1
+            if self.eeprom_bits == 10:
+                self._eeprom_decode(self.eeprom_shift)
+            return
+        if self.eeprom_state == 2:  # dummy 0 then 16 read bits
+            self.eeprom_do = 0
+            self.eeprom_state = 3
+            self.eeprom_bits = 0
+            return
+        if self.eeprom_state == 3:
+            word = (self.ram_data[self.eeprom_addr * 2] << 8) | self.ram_data[self.eeprom_addr * 2 + 1]
+            self.eeprom_do = (word >> (15 - self.eeprom_bits)) & 1
+            self.eeprom_bits += 1
+            if self.eeprom_bits >= 16:
+                self.eeprom_addr = (self.eeprom_addr + 1) & 0x7F
+                self.eeprom_bits = 0
+            return
+        if self.eeprom_state == 4:
+            self.eeprom_shift = ((self.eeprom_shift << 1) | di) & 0xFFFF
+            self.eeprom_bits += 1
+            if self.eeprom_bits == 16:
+                if self.eeprom_write_en and self.eeprom_addr < 128:
+                    self.ram_data[self.eeprom_addr * 2] = (self.eeprom_shift >> 8) & 0xFF
+                    self.ram_data[self.eeprom_addr * 2 + 1] = self.eeprom_shift & 0xFF
+                self.eeprom_do = 1
+                self.eeprom_state = 0
+
+    def _eeprom_decode(self, cmd):
+        top2 = (cmd >> 8) & 3
+        addr = cmd & 0x7F
+        if top2 == 0:
+            top4 = (cmd >> 6) & 0x0F
+            if top4 == 0x00:
+                self.eeprom_write_en = False
+                self.eeprom_state = 0
+            elif top4 == 0x01:
+                self.eeprom_state = 4
+                self.eeprom_bits = 0
+                self.eeprom_shift = 0
+                self.eeprom_addr = 0
+            elif top4 == 0x02:
+                if self.eeprom_write_en:
+                    self.ram_data[:] = b'\xFF' * len(self.ram_data)
+                self.eeprom_do = 1
+                self.eeprom_state = 0
+            elif top4 == 0x03:
+                self.eeprom_write_en = True
+                self.eeprom_state = 0
+            else:
+                self.eeprom_state = 0
+        elif top2 == 1:
+            self.eeprom_addr = addr
+            self.eeprom_state = 4
+            self.eeprom_bits = 0
+            self.eeprom_shift = 0
+        elif top2 == 2:
+            self.eeprom_addr = addr
+            self.eeprom_state = 2
+            self.eeprom_bits = 0
+        else:
+            if self.eeprom_write_en and addr < 128:
+                self.ram_data[addr * 2] = 0xFF
+                self.ram_data[addr * 2 + 1] = 0xFF
+            self.eeprom_do = 1
+            self.eeprom_state = 0
+
 
 class PPU:
     """Picture Processing Unit with background rendering."""
@@ -2235,6 +2929,7 @@ class PPU:
         self.shades = [(r << 16) | (g << 8) | b for (r, g, b) in PALETTE_DMG]
         self._rebuild_dmg_lut()
         self.is_cgb = False
+        self.is_sgb = False
         self.bg_palette_data = bytearray(64)
         self.obj_palette_data = bytearray(64)
         self.bg_palette_addr = 0x00
@@ -2487,6 +3182,19 @@ class PPU:
     def _render_scanline(self, ly, lcdc):
         mem = self.mmu.memory
         is_cgb = self.is_cgb
+        is_sgb = self.is_sgb and not is_cgb
+        fb_row = ly * SCREEN_WIDTH
+        if is_sgb:
+            mask = self.mmu.sgb_mask
+            if mask == 1:
+                return
+            if mask == 2 or mask == 3:
+                fill = 0 if mask == 2 else self.mmu.sgb_pal_rgb[0]
+                fb = self.framebuffer
+                for i in range(SCREEN_WIDTH):
+                    fb[fb_row + i] = fill
+                self.bg_palette_idx[fb_row:fb_row + SCREEN_WIDTH] = self._zero_row
+                return
         # On CGB, LCDC bit 0 is BG/OBJ priority flag, not BG enable.
         # BG is always rendered in CGB mode regardless of bit 0.
         bg_enabled = (lcdc & 0x01) or is_cgb
@@ -2501,6 +3209,8 @@ class PPU:
             for i in range(SCREEN_WIDTH):
                 fb[fb_row + i] = white
             bg_pri[fb_row:fb_row + SCREEN_WIDTH] = self._zero_row
+            if self.is_sgb and not self.is_cgb:
+                self._apply_sgb_scanline(ly, mem[0xFF47])
             if lcdc & 0x02:
                 self._render_sprites(ly)
             return
@@ -2660,8 +3370,24 @@ class PPU:
             if (wx_raw - 7) < SCREEN_WIDTH:
                 self._render_window(ly)
                 self.window_line_counter += 1
+        if self.is_sgb and not self.is_cgb:
+            self._apply_sgb_scanline(ly, mem[0xFF47])
         if lcdc & 0x02:
             self._render_sprites(ly)
+
+    def _apply_sgb_scanline(self, ly, bgp):
+        """Recolour a DMG scanline using the 20×18 SGB attribute map."""
+        shades = self._PALETTE_SHADES[bgp]
+        fb = self.framebuffer
+        bg_pri = self.bg_palette_idx
+        attr = self.mmu.sgb_attr
+        pal_rgb = self.mmu.sgb_pal_rgb
+        row = ly * SCREEN_WIDTH
+        attr_row = (ly >> 3) * 20
+        for x in range(SCREEN_WIDTH):
+            pal = attr[attr_row + (x >> 3)]
+            c = bg_pri[row + x] & 3
+            fb[row + x] = pal_rgb[pal * 4 + shades[c]]
 
     def _render_window(self, ly):
         mem = self.mmu.memory
@@ -2850,6 +3576,14 @@ class PPU:
         fb = self.framebuffer
         tile_colors = self._TILE_COLORS
         obp_rgb = (self._dmg_bgp_rgb[obp0], self._dmg_bgp_rgb[obp1])
+        if self.is_sgb and not self.is_cgb:
+            pal_rgb = self.mmu.sgb_pal_rgb
+            sh0 = self._PALETTE_SHADES[obp0]
+            sh1 = self._PALETTE_SHADES[obp1]
+            obp_rgb = (
+                tuple(pal_rgb[sh0[i]] for i in range(4)),
+                tuple(pal_rgb[4 + sh1[i]] for i in range(4)),
+            )
         is_cgb = self.is_cgb
         unsigned_addrs = self._tile_base_addrs[0]
         if is_cgb:
@@ -4379,6 +5113,8 @@ class GameBoy:
                 self.ppu.is_cgb = True
                 self.ppu._cgb_init_palettes()
                 self.apu.is_cgb = True
+            elif self.mmu.is_sgb:
+                self.ppu.is_sgb = True
             if not self.mmu.bootrom_enabled:
                 # Set post-boot register state only if no boot ROM will run
                 if self.mmu.is_cgb:
@@ -4576,6 +5312,11 @@ class GameBoy:
                     self.mmu.ram_data[:n] = data[:n]
                 if self.mmu.has_rtc and len(data) >= ram_len + 8:
                     self.mmu.unpack_rtc_blob(data[ram_len:])
+                elif self.mmu.mbc_type == 0x20 and len(data) > ram_len and self.mmu.flash_data:
+                    blob = data[ram_len:]
+                    n = min(len(self.mmu.flash_data), len(blob))
+                    self.mmu.flash_data[:n] = blob[:n]
+                    self.mmu._remap_rom_bank()
                 logging.info(f"Loaded save: {os.path.basename(path)} ({len(data)} bytes)")
             except OSError as e:
                 logging.warning(f"Could not load save: {e}")
@@ -4596,6 +5337,9 @@ class GameBoy:
                     blob = self.mmu.pack_rtc_blob()
                     f.write(blob)
                     extra = len(blob)
+                elif self.mmu.mbc_type == 0x20 and self.mmu.flash_data:
+                    f.write(self.mmu.flash_data)
+                    extra = len(self.mmu.flash_data)
             logging.info(f"Saved: {os.path.basename(path)} ({len(self.mmu.ram_data) + extra} bytes)")
         except OSError as e:
             logging.warning(f"Could not save: {e}")
@@ -4603,7 +5347,7 @@ class GameBoy:
 
     # ── Save state support ─────────────────────────────────────────
     SAVE_STATE_MAGIC = b'GBST'
-    SAVE_STATE_VERSION = 2
+    SAVE_STATE_VERSION = 3
     SAVE_STATE_VERSION_MIN = 1
 
     def _state_path(self, slot):
@@ -4744,6 +5488,30 @@ class GameBoy:
             parts.append(struct.pack('<II', timers.div_counter, timers.tima_accum))
             parts.append(struct.pack('<I', len(mmu.ram_data)))
             parts.append(mmu.ram_data)
+            parts.append(struct.pack('<BHHBBBB',
+                                     mmu.serial_bits_left & 0xFF,
+                                     mmu.serial_cycle_accum & 0xFFFF,
+                                     mmu.serial_incoming & 0xFF,
+                                     1 if mmu.is_sgb else 0,
+                                     mmu.sgb_mask & 0x03,
+                                     mmu.sgb_player_count & 0x07,
+                                     mmu.sgb_current_player & 0x03))
+            parts.append(struct.pack('<16I', *([mmu.sgb_pal_rgb[i] & 0xFFFFFF for i in range(16)])))
+            parts.append(mmu.sgb_attr)
+            parts.append(struct.pack('<BBBBBBBB',
+                                     mmu.mbc6_rom_bank_a & 0x7F, mmu.mbc6_rom_bank_b & 0x7F,
+                                     mmu.mbc6_ram_bank_a & 7, mmu.mbc6_ram_bank_b & 7,
+                                     1 if mmu.mbc6_flash_a else 0, 1 if mmu.mbc6_flash_b else 0,
+                                     1 if mmu.mbc6_flash_enable else 0, 1 if mmu.mbc6_flash_we else 0))
+            flash = mmu.flash_data if mmu.mbc_type == 0x20 else b''
+            parts.append(struct.pack('<I', len(flash)))
+            parts.append(flash)
+            parts.append(struct.pack('<BBHHBBBB',
+                                     1 if mmu.mbc7_ram_enable2 else 0,
+                                     1 if mmu.mbc7_latch_ready else 0,
+                                     mmu.mbc7_latch_x & 0xFFFF, mmu.mbc7_latch_y & 0xFFFF,
+                                     mmu.eeprom_state & 0xFF, mmu.eeprom_do & 1,
+                                     1 if mmu.eeprom_write_en else 0, mmu.eeprom_addr & 0x7F))
             with open(path, 'wb') as f:
                 for p in parts:
                     f.write(p)
@@ -5014,6 +5782,58 @@ class GameBoy:
                 elif len(mmu.ram_data) > 0:
                     n = min(len(mmu.ram_data), ram_len)
                     mmu.ram_data[:n] = ram_blob[:n]
+            if ver >= 3:
+                fmt = '<BHHBBBB'
+                _need(struct.calcsize(fmt), "serial_sgb")
+                (sbits, sacc, sin, is_sgb, mask, pcount, pcur) = struct.unpack_from(fmt, data, pos)
+                pos += struct.calcsize(fmt)
+                mmu.serial_bits_left = sbits
+                mmu.serial_cycle_accum = sacc
+                mmu.serial_incoming = sin & 0xFF
+                mmu.is_sgb = bool(is_sgb)
+                ppu.is_sgb = mmu.is_sgb and not mmu.is_cgb
+                mmu.sgb_mask = mask
+                mmu.sgb_player_count = max(1, pcount)
+                mmu.sgb_current_player = pcur
+                _need(64, "sgb_pal")
+                pals = struct.unpack_from('<16I', data, pos)
+                pos += 64
+                mmu.sgb_pal_rgb = [p & 0xFFFFFF for p in pals]
+                _need(360, "sgb_attr")
+                mmu.sgb_attr[:] = data[pos:pos + 360]
+                pos += 360
+                fmt = '<BBBBBBBB'
+                _need(struct.calcsize(fmt), "mbc6")
+                (ba, bb, ra, rb, fa, fb, fe, fw) = struct.unpack_from(fmt, data, pos)
+                pos += struct.calcsize(fmt)
+                mmu.mbc6_rom_bank_a, mmu.mbc6_rom_bank_b = ba, bb
+                mmu.mbc6_ram_bank_a, mmu.mbc6_ram_bank_b = ra, rb
+                mmu.mbc6_flash_a, mmu.mbc6_flash_b = bool(fa), bool(fb)
+                mmu.mbc6_flash_enable, mmu.mbc6_flash_we = bool(fe), bool(fw)
+                _need(4, "flash_len")
+                (flash_len,) = struct.unpack_from('<I', data, pos)
+                pos += 4
+                if flash_len > MBC6_FLASH_SIZE:
+                    raise ValueError("save state flash is implausibly large")
+                _need(flash_len, "flash")
+                if flash_len:
+                    if len(mmu.flash_data) < flash_len:
+                        mmu.flash_data = bytearray(flash_len)
+                    mmu.flash_data[:flash_len] = data[pos:pos + flash_len]
+                pos += flash_len
+                fmt = '<BBHHBBBB'
+                _need(struct.calcsize(fmt), "mbc7")
+                (en2, lat, lx, ly, est, edo, ewe, eaddr) = struct.unpack_from(fmt, data, pos)
+                pos += struct.calcsize(fmt)
+                mmu.mbc7_ram_enable2 = bool(en2)
+                mmu.mbc7_latch_ready = bool(lat)
+                mmu.mbc7_latch_x, mmu.mbc7_latch_y = lx, ly
+                mmu.eeprom_state = est
+                mmu.eeprom_do = edo & 1
+                mmu.eeprom_write_en = bool(ewe)
+                mmu.eeprom_addr = eaddr
+                if mmu.mbc_type == 0x20:
+                    mmu._remap_rom_bank()
             apu.drain()
             if hasattr(self, '_audio_pending'):
                 self._audio_pending.clear()
@@ -5112,6 +5932,11 @@ class GameBoy:
                         remain = min(remain, m3 - sd)
         if self.mmu.dma_remaining > 0:
             remain = min(remain, 4)
+        if self.mmu.serial_bits_left > 0 and (self.mmu.serial_control & 0x81) == 0x81:
+            until = self.mmu._serial_bit_period() - self.mmu.serial_cycle_accum
+            if until < 1:
+                until = 1
+            remain = min(remain, until)
         tac = mem[0xFF07]
         if tac & 0x04:
             rate = self.timers._TIMA_RATES[tac & 0x03]
@@ -5159,6 +5984,8 @@ class GameBoy:
         tac = mem[0xFF07]
         if tac & 0x04:
             timers._tima_step(cpu_cycles, tac)
+        if mmu.serial_bits_left > 0:
+            mmu._serial_step(cpu_cycles)
         self.apu.step(dot_cycles, div_old=old_div, div_new=div,
                       double_speed=bool(mmu.key1 & 0x80))
         if self._has_rtc:
