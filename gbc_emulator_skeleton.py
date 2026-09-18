@@ -2,9 +2,9 @@
 Game Boy / Game Boy Color emulator written in Python.
 
 Supports MBC1/MBC5 cartridges, BG / Window / Sprite rendering, and includes
-a built-in menu with ROM browser. Performance-tuned to ~60-90 fps on
-SUPERBAJTEK via precomputed tile / palette LUTs, unrolled scanline writers,
-and a combined per-opcode dispatcher.
+a built-in menu with ROM browser. Performance-tuned via precomputed tile /
+palette LUTs, unrolled scanline writers, a combined per-opcode dispatcher,
+and fast-path WRAM/HRAM memory access. Keyboard bindings are customisable.
 
 Usage:
     python gbc_emulator_skeleton.py                # launch the menu
@@ -205,27 +205,46 @@ FLAG_N = 6  # Subtract flag
 FLAG_H = 5  # Half Carry flag
 FLAG_C = 4  # Carry flag
 
-# Key bindings: pygame key -> joypad bit (matches set_joypad_button bit order)
-KEY_TO_JOYPAD_BIT = {
-    pygame.K_RIGHT:  0,  # Right
-    pygame.K_LEFT:   1,  # Left
-    pygame.K_UP:     2,  # Up
-    pygame.K_DOWN:   3,  # Down
-    pygame.K_z:      4,  # A
-    pygame.K_x:      5,  # B
-    pygame.K_RSHIFT: 6,  # Select
-    pygame.K_RETURN: 7,  # Start
-} if pygame else {}
+# Joypad bit order matches P1 (FF00): Right, Left, Up, Down, A, B, Select, Start
+JOYPAD_BUTTON_KEYS = ('right', 'left', 'up', 'down', 'a', 'b', 'select', 'start')
+JOYPAD_BUTTON_LABELS = ('Right', 'Left', 'Up', 'Down', 'A', 'B', 'Select', 'Start')
+DEFAULT_KEY_BINDINGS = {
+    'right':  ['right', 'd'],
+    'left':   ['left', 'a'],
+    'up':     ['up', 'w'],
+    'down':   ['down', 's'],
+    'a':      ['z'],
+    'b':      ['x'],
+    'select': ['right shift'],
+    'start':  ['return'],
+}
+WASD_ALIASES = (('d', 'right'), ('a', 'left'), ('w', 'up'), ('s', 'down'))
+
+# pygame key -> joypad bit; rebuilt from config / the Controls page.
+KEY_TO_JOYPAD_BIT = {}
 
 # Gamepad mapping: joystick button index -> joypad bit (Xbox / PlayStation layout)
 _GAMEPAD_BUTTON_MAP = {
-    0: 4,   # A (Cross)  -> A
-    1: 5,   # B (Circle) -> B
-    6: 6,   # Select/Back -> Select
-    7: 7,   # Start       -> Start
+    0: 4,   # A / Cross  -> A
+    1: 5,   # B / Circle -> B
+    2: 5,   # X / Square -> B
+    3: 4,   # Y / Triangle -> A
+    4: 5,   # LB / L1    -> B
+    5: 4,   # RB / R1    -> A
+    6: 6,   # Select/Back/Share -> Select
+    7: 7,   # Start/Options     -> Start
 }
 _GAMEPAD_AXIS_THRESHOLD = 0.5
 _GAMEPAD_DPAD_BITS = {0: 0, 1: 1, 2: 2, 3: 3}  # hat direction index -> joypad bit
+_JOY_SRC_KB = 0
+_JOY_SRC_HAT = 1
+_JOY_SRC_AXIS = 2
+_JOY_SRC_BTN = 3
+_JOY_SRC_TURBO = 4
+_RESERVED_REMAP_KEY_NAMES = frozenset({
+    'escape', 'tab', 'f2', 'f3', 'f4', 'f5', 'f6', 'f7', 'f8', 'f9',
+})
+_RESERVED_KEY_MSG = "That key is reserved (Esc, Tab, F2-F9)"
 
 def _init_joysticks():
     """Initialise all connected joysticks. Safe to call multiple times."""
@@ -251,13 +270,16 @@ def _joystick_dpad_from_hat(event):
     return results
 
 def _joystick_dpad_from_axis(event):
-    """Convert a JOYAXISMOTION event to (joypad_bit, pressed) tuples for axes 0/1."""
+    """Convert a JOYAXISMOTION event to (joypad_bit, pressed) tuples.
+
+    Axes 0/1 are the left stick; 6/7 are the D-pad on some Xbox-style pads.
+    """
     T = _GAMEPAD_AXIS_THRESHOLD
-    if event.axis == 0:
+    if event.axis in (0, 6):
         if event.value > T:      return [(0, True), (1, False)]
         elif event.value < -T:   return [(1, True), (0, False)]
         else:                    return [(0, False), (1, False)]
-    if event.axis == 1:
+    if event.axis in (1, 7):
         if event.value > T:      return [(3, True), (2, False)]
         elif event.value < -T:   return [(2, True), (3, False)]
         else:                    return [(2, False), (3, False)]
@@ -278,13 +300,178 @@ def _gamepad_menu_action(event):
         if x == 1:  return 'right'
     if event.type == pygame.JOYAXISMOTION:
         T = _GAMEPAD_AXIS_THRESHOLD
-        if event.axis == 1:
+        if event.axis in (1, 7):
             if event.value < -T: return 'up'
             if event.value > T:  return 'down'
-        if event.axis == 0:
+        if event.axis in (0, 6):
             if event.value < -T: return 'left'
             if event.value > T:  return 'right'
     return None
+
+
+def _normalize_key_name(name):
+    """Canonicalise a pygame key name for config storage."""
+    return str(name).strip().lower().replace('_', ' ')
+
+
+_KEY_NAME_ALIASES = {
+    'right shift': 'K_RSHIFT',
+    'left shift': 'K_LSHIFT',
+    'return': 'K_RETURN',
+    'enter': 'K_RETURN',
+    'space': 'K_SPACE',
+    'right': 'K_RIGHT',
+    'left': 'K_LEFT',
+    'up': 'K_UP',
+    'down': 'K_DOWN',
+}
+
+
+def _key_constant(name):
+    """Resolve a stored key name to a pygame key constant, or None."""
+    if not pygame or not name:
+        return None
+    name = _normalize_key_name(name)
+    alias = _KEY_NAME_ALIASES.get(name)
+    if alias:
+        return getattr(pygame, alias, None)
+    attr = 'K_' + name.upper().replace(' ', '_')
+    val = getattr(pygame, attr, None)
+    if val is not None:
+        return val
+    # Unusual names (e.g. 'left ctrl') need pygame.init(); skip before then
+    # so import doesn't warn.
+    if not pygame.get_init():
+        return None
+    try:
+        return pygame.key.key_code(name)
+    except (ValueError, OverflowError, pygame.error, TypeError):
+        return None
+
+
+def _key_display_name(name):
+    """Pretty-print a stored key name for menus."""
+    name = _normalize_key_name(name)
+    aliases = {
+        'return': 'Enter',
+        'right shift': 'R-Shift',
+        'left shift': 'L-Shift',
+        'space': 'Space',
+        'right': 'Right',
+        'left': 'Left',
+        'up': 'Up',
+        'down': 'Down',
+    }
+    if name in aliases:
+        return aliases[name]
+    if len(name) == 1:
+        return name.upper()
+    return ' '.join(part.capitalize() for part in name.split())
+
+
+def _default_key_bindings(wasd_enabled=True):
+    bindings = {k: list(v) for k, v in DEFAULT_KEY_BINDINGS.items()}
+    if not wasd_enabled:
+        for alias, button in WASD_ALIASES:
+            if alias in bindings[button]:
+                bindings[button] = [n for n in bindings[button] if n != alias]
+    return bindings
+
+
+def _sanitize_key_bindings(raw, wasd_enabled=True):
+    """Return a validated bit-name -> [key-name] map, filling any gaps."""
+    bindings = _default_key_bindings(wasd_enabled)
+    if not isinstance(raw, dict):
+        return bindings
+    for button in JOYPAD_BUTTON_KEYS:
+        value = raw.get(button)
+        if not isinstance(value, (list, tuple)):
+            continue
+        names = []
+        for item in value:
+            name = _normalize_key_name(item)
+            if not name or name in _RESERVED_REMAP_KEY_NAMES or name in names:
+                continue
+            if pygame and _key_constant(name) is None:
+                continue
+            names.append(name)
+        if names:
+            bindings[button] = names
+    if wasd_enabled:
+        used = {name for keys in bindings.values() for name in keys}
+        for alias, button in WASD_ALIASES:
+            if alias not in used and alias not in bindings[button]:
+                bindings[button].append(alias)
+    else:
+        wasd = {alias for alias, _ in WASD_ALIASES}
+        for button in ('right', 'left', 'up', 'down'):
+            bindings[button] = [n for n in bindings[button] if n not in wasd]
+            if not bindings[button]:
+                bindings[button] = list(DEFAULT_KEY_BINDINGS[button][:1])
+    return bindings
+
+
+def _rebuild_key_map(bindings=None, wasd_enabled=True):
+    """Rebuild KEY_TO_JOYPAD_BIT from a bindings dict. Returns the map."""
+    global KEY_TO_JOYPAD_BIT
+    bindings = _sanitize_key_bindings(bindings, wasd_enabled)
+    mapping = {}
+    if pygame:
+        for bit, button in enumerate(JOYPAD_BUTTON_KEYS):
+            for name in bindings.get(button, ()):
+                key = _key_constant(name)
+                if key is not None and key not in mapping:
+                    mapping[key] = bit
+    KEY_TO_JOYPAD_BIT = mapping
+    return bindings
+
+
+def _binding_label(bindings, button):
+    names = bindings.get(button) or DEFAULT_KEY_BINDINGS[button]
+    return ', '.join(_key_display_name(n) for n in names)
+
+
+def _assign_binding_key(bindings, button, key_name):
+    """Set `button`'s primary key. If another button owns it, swap primaries."""
+    key_name = _normalize_key_name(key_name)
+    if not key_name or key_name in _RESERVED_REMAP_KEY_NAMES:
+        return False
+    if pygame and _key_constant(key_name) is None:
+        return False
+    old_primary = (bindings.get(button) or [None])[0]
+    owner = None
+    for other, names in bindings.items():
+        if key_name in names:
+            owner = other
+            break
+    if owner is not None and owner != button:
+        bindings[owner] = [n for n in bindings[owner] if n != key_name]
+        if old_primary and old_primary != key_name:
+            bindings[owner] = [old_primary] + [n for n in bindings[owner] if n != old_primary]
+        if not bindings[owner]:
+            fallback = DEFAULT_KEY_BINDINGS[owner][0]
+            if fallback != key_name:
+                bindings[owner] = [fallback]
+    rest = [n for n in bindings.get(button, []) if n != key_name]
+    bindings[button] = [key_name] + rest
+    return True
+
+
+def _menu_nav_action(action):
+    """Map WASD / gamepad strings onto the arrow-key constants used by menus."""
+    if action in ('up', 'down', 'left', 'right', 'select', 'back'):
+        return action
+    if not pygame:
+        return action
+    if action in (pygame.K_UP, pygame.K_w):
+        return pygame.K_UP
+    if action in (pygame.K_DOWN, pygame.K_s):
+        return pygame.K_DOWN
+    if action in (pygame.K_LEFT, pygame.K_a):
+        return pygame.K_LEFT
+    if action in (pygame.K_RIGHT, pygame.K_d):
+        return pygame.K_RIGHT
+    return action
 
 
 # ── Persistent settings configuration ─────────────────────────────────
@@ -298,21 +485,32 @@ def _load_config():
     """Load user settings from the JSON config file. Returns {} on any error."""
     try:
         with open(_CONFIG_PATH, 'r') as f:
-            return json.load(f)
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
     except (OSError, ValueError, json.JSONDecodeError):
         return {}
 
 def _save_config(cfg):
-    """Write the settings dictionary to the config file."""
+    """Merge `cfg` into the existing JSON config and write it back."""
+    current = _load_config()
+    current.update(cfg)
     try:
         with open(_CONFIG_PATH, 'w') as f:
-            json.dump(cfg, f, indent=2)
+            json.dump(current, f, indent=2)
     except OSError:
         pass
 
 
+# Apply persisted (or default) key bindings as soon as pygame is importable.
+_cfg0 = _load_config()
+_rebuild_key_map(_cfg0.get('key_bindings'), bool(_cfg0.get('wasd_enabled', True)))
+del _cfg0
+
+
 class Registers:
     """Manages the 8-bit and 16-bit paired registers of the LR35902 CPU."""
+    __slots__ = ('a', 'f', 'b', 'c', 'd', 'e', 'h', 'l', 'sp', 'pc')
+
     def __init__(self):
         self.a = 0x00
         self.f = 0x00
@@ -372,6 +570,11 @@ class Registers:
     def get_flag(self, flag_bit):
         return (self.f >> flag_bit) & 1
 
+    def set_znhc(self, z, n, h, c):
+        """Write Z/N/H/C in one assignment (hot path)."""
+        self.f = ((0x80 if z else 0) | (0x40 if n else 0) |
+                  (0x20 if h else 0) | (0x10 if c else 0))
+
 
 class CPU:
     """The LR35902 CPU."""
@@ -390,6 +593,7 @@ class CPU:
         self.branch_trace = deque(maxlen=8192)
         self.invalid_opcode_count = 0
         self.trace_branch = _noop_trace
+        self.current_opcode_pc = 0
 
     def _record_branch(self, kind, old_pc, new_pc, opcode):
         self.branch_trace.append({
@@ -460,75 +664,53 @@ class CPU:
 
     def _alu_a_op(self, op_type, operand):
         a = self.reg.a
-        carry = self.reg.get_flag(FLAG_C)
+        carry = (self.reg.f >> FLAG_C) & 1
+        set_znhc = self.reg.set_znhc
         if op_type == 0:
             result = a + operand
-            self.reg.set_flag(FLAG_Z, (result & 0xFF) == 0)
-            self.reg.set_flag(FLAG_N, 0)
-            self.reg.set_flag(FLAG_H, (a & 0xF) + (operand & 0xF) > 0xF)
-            self.reg.set_flag(FLAG_C, result > 0xFF)
+            set_znhc((result & 0xFF) == 0, 0,
+                     (a & 0xF) + (operand & 0xF) > 0xF, result > 0xFF)
             self.reg.a = result & 0xFF
         elif op_type == 1:
             result = a + operand + carry
-            self.reg.set_flag(FLAG_Z, (result & 0xFF) == 0)
-            self.reg.set_flag(FLAG_N, 0)
-            self.reg.set_flag(FLAG_H, (a & 0xF) + (operand & 0xF) + carry > 0xF)
-            self.reg.set_flag(FLAG_C, result > 0xFF)
+            set_znhc((result & 0xFF) == 0, 0,
+                     (a & 0xF) + (operand & 0xF) + carry > 0xF, result > 0xFF)
             self.reg.a = result & 0xFF
         elif op_type == 2:
             result = a - operand
-            self.reg.set_flag(FLAG_Z, (result & 0xFF) == 0)
-            self.reg.set_flag(FLAG_N, 1)
-            self.reg.set_flag(FLAG_H, (a & 0xF) < (operand & 0xF))
-            self.reg.set_flag(FLAG_C, a < operand)
+            set_znhc((result & 0xFF) == 0, 1,
+                     (a & 0xF) < (operand & 0xF), a < operand)
             self.reg.a = result & 0xFF
         elif op_type == 3:
             result = a - operand - carry
-            self.reg.set_flag(FLAG_Z, (result & 0xFF) == 0)
-            self.reg.set_flag(FLAG_N, 1)
-            self.reg.set_flag(FLAG_H, (a & 0xF) < (operand & 0xF) + carry)
-            self.reg.set_flag(FLAG_C, a < operand + carry)
+            set_znhc((result & 0xFF) == 0, 1,
+                     (a & 0xF) < (operand & 0xF) + carry, a < operand + carry)
             self.reg.a = result & 0xFF
         elif op_type == 4:
             result = a & operand
-            self.reg.set_flag(FLAG_Z, result == 0)
-            self.reg.set_flag(FLAG_N, 0)
-            self.reg.set_flag(FLAG_H, 1)
-            self.reg.set_flag(FLAG_C, 0)
+            set_znhc(result == 0, 0, 1, 0)
             self.reg.a = result
         elif op_type == 5:
             result = a ^ operand
-            self.reg.set_flag(FLAG_Z, result == 0)
-            self.reg.set_flag(FLAG_N, 0)
-            self.reg.set_flag(FLAG_H, 0)
-            self.reg.set_flag(FLAG_C, 0)
+            set_znhc(result == 0, 0, 0, 0)
             self.reg.a = result
         elif op_type == 6:
             result = a | operand
-            self.reg.set_flag(FLAG_Z, result == 0)
-            self.reg.set_flag(FLAG_N, 0)
-            self.reg.set_flag(FLAG_H, 0)
-            self.reg.set_flag(FLAG_C, 0)
+            set_znhc(result == 0, 0, 0, 0)
             self.reg.a = result
         elif op_type == 7:
             result = a - operand
-            self.reg.set_flag(FLAG_Z, (result & 0xFF) == 0)
-            self.reg.set_flag(FLAG_N, 1)
-            self.reg.set_flag(FLAG_H, (a & 0xF) < (operand & 0xF))
-            self.reg.set_flag(FLAG_C, a < operand)
+            set_znhc((result & 0xFF) == 0, 1,
+                     (a & 0xF) < (operand & 0xF), a < operand)
 
     def _inc_r8(self, val):
         result = (val + 1) & 0xFF
-        self.reg.set_flag(FLAG_Z, result == 0)
-        self.reg.set_flag(FLAG_N, 0)
-        self.reg.set_flag(FLAG_H, (val & 0xF) == 0xF)
+        self.reg.set_znhc(result == 0, 0, (val & 0xF) == 0xF, (self.reg.f >> FLAG_C) & 1)
         return result
 
     def _dec_r8(self, val):
         result = (val - 1) & 0xFF
-        self.reg.set_flag(FLAG_Z, result == 0)
-        self.reg.set_flag(FLAG_N, 1)
-        self.reg.set_flag(FLAG_H, (val & 0xF) == 0)
+        self.reg.set_znhc(result == 0, 1, (val & 0xF) == 0, (self.reg.f >> FLAG_C) & 1)
         return result
 
     def _add_hl_rr(self, rr_val):
@@ -607,8 +789,9 @@ class CPU:
             opcode = mem[pc]
         else:
             opcode = mem[pc]
-            reg.pc = pc + 1
-        self.current_opcode_pc = pc
+            reg.pc = (pc + 1) & 0xFFFF
+        if self.trace_enabled:
+            self.current_opcode_pc = pc
         cycles = self.execute(opcode)
         if self.interrupts_master_enabled:
             cycles += self._handle_interrupts()
@@ -643,7 +826,7 @@ class CPU:
             self.reg.hl = (self.reg.hl - 1) & 0xFFFF; return 8
         if opcode == 0x20:  # JR NZ - 3.3%
             offset = self.fetch_byte()
-            if self.reg.get_flag(FLAG_Z) == 0:
+            if (self.reg.f & 0x80) == 0:
                 offset = _sign_extend_byte(offset)
                 self.reg.pc = (self.reg.pc + offset) & 0xFFFF; return 12
             return 8
@@ -662,7 +845,7 @@ class CPU:
             self.reg.bc = (self.reg.bc - 1) & 0xFFFF; return 8
         if opcode == 0x28:  # JR Z - 1.6%
             offset = self.fetch_byte()
-            if self.reg.get_flag(FLAG_Z) == 1:
+            if self.reg.f & 0x80:
                 offset = _sign_extend_byte(offset)
                 self.reg.pc = (self.reg.pc + offset) & 0xFFFF; return 12
             return 8
@@ -1120,9 +1303,9 @@ class CPU:
             result = ops[bit_pos](val)
             cycles = 16 if is_hl else 8
         elif op_group == 1:
-            self.reg.set_flag(FLAG_Z, self._cb_bit(val, bit_pos))
-            self.reg.set_flag(FLAG_N, 0)
-            self.reg.set_flag(FLAG_H, 1)
+            z = self._cb_bit(val, bit_pos)
+            # BIT: Z from tested bit, N=0, H=1, C preserved
+            self.reg.f = (self.reg.f & 0x10) | (0x80 if z else 0) | 0x20
             return 12 if is_hl else 8
         elif op_group == 2:
             result = self._cb_res(val, bit_pos)
@@ -1143,74 +1326,50 @@ class CPU:
     def _cb_rlc(self, val):
         carry = (val >> 7) & 1
         result = ((val << 1) | carry) & 0xFF
-        self.reg.set_flag(FLAG_Z, result == 0)
-        self.reg.set_flag(FLAG_N, 0)
-        self.reg.set_flag(FLAG_H, 0)
-        self.reg.set_flag(FLAG_C, carry)
+        self.reg.set_znhc(result == 0, 0, 0, carry)
         return result
 
     def _cb_rrc(self, val):
         carry = val & 1
         result = ((val >> 1) | (carry << 7)) & 0xFF
-        self.reg.set_flag(FLAG_Z, result == 0)
-        self.reg.set_flag(FLAG_N, 0)
-        self.reg.set_flag(FLAG_H, 0)
-        self.reg.set_flag(FLAG_C, carry)
+        self.reg.set_znhc(result == 0, 0, 0, carry)
         return result
 
     def _cb_rl(self, val):
-        old_c = self.reg.get_flag(FLAG_C)
+        old_c = (self.reg.f >> FLAG_C) & 1
         carry = (val >> 7) & 1
         result = ((val << 1) | old_c) & 0xFF
-        self.reg.set_flag(FLAG_Z, result == 0)
-        self.reg.set_flag(FLAG_N, 0)
-        self.reg.set_flag(FLAG_H, 0)
-        self.reg.set_flag(FLAG_C, carry)
+        self.reg.set_znhc(result == 0, 0, 0, carry)
         return result
 
     def _cb_rr(self, val):
-        old_c = self.reg.get_flag(FLAG_C)
+        old_c = (self.reg.f >> FLAG_C) & 1
         carry = val & 1
         result = ((val >> 1) | (old_c << 7)) & 0xFF
-        self.reg.set_flag(FLAG_Z, result == 0)
-        self.reg.set_flag(FLAG_N, 0)
-        self.reg.set_flag(FLAG_H, 0)
-        self.reg.set_flag(FLAG_C, carry)
+        self.reg.set_znhc(result == 0, 0, 0, carry)
         return result
 
     def _cb_sla(self, val):
         carry = (val >> 7) & 1
         result = (val << 1) & 0xFF
-        self.reg.set_flag(FLAG_Z, result == 0)
-        self.reg.set_flag(FLAG_N, 0)
-        self.reg.set_flag(FLAG_H, 0)
-        self.reg.set_flag(FLAG_C, carry)
+        self.reg.set_znhc(result == 0, 0, 0, carry)
         return result
 
     def _cb_sra(self, val):
         carry = val & 1
         result = (val >> 1) | (val & 0x80)
-        self.reg.set_flag(FLAG_Z, result == 0)
-        self.reg.set_flag(FLAG_N, 0)
-        self.reg.set_flag(FLAG_H, 0)
-        self.reg.set_flag(FLAG_C, carry)
+        self.reg.set_znhc(result == 0, 0, 0, carry)
         return result
 
     def _cb_srl(self, val):
         carry = val & 1
         result = val >> 1
-        self.reg.set_flag(FLAG_Z, result == 0)
-        self.reg.set_flag(FLAG_N, 0)
-        self.reg.set_flag(FLAG_H, 0)
-        self.reg.set_flag(FLAG_C, carry)
+        self.reg.set_znhc(result == 0, 0, 0, carry)
         return result
 
     def _cb_swap(self, val):
         result = ((val & 0x0F) << 4) | ((val & 0xF0) >> 4)
-        self.reg.set_flag(FLAG_Z, result == 0)
-        self.reg.set_flag(FLAG_N, 0)
-        self.reg.set_flag(FLAG_H, 0)
-        self.reg.set_flag(FLAG_C, 0)
+        self.reg.set_znhc(result == 0, 0, 0, 0)
         return result
 
     @staticmethod
@@ -1299,6 +1458,11 @@ class MMU:
         self.num_rom_banks = 2
         self.num_ram_banks = 0
         self.joypad_buttons = 0xFF
+        # Independent input sources (keyboard / hat / stick / pad buttons / turbo).
+        # Combined as AND because 0 = pressed. Stops analog-stick release
+        # from eating a still-held D-pad or keyboard direction.
+        self._joy_src = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF]
+        self._dpad_last = [0, 2]  # last-wins SOCD: horiz bit, vert bit
         self.div_reset_callback = None
         self.apu = None
         self.ppu = None
@@ -1389,11 +1553,14 @@ class MMU:
         # Boot ROM shadows cartridge ROM at 0x0000-N while enabled
         if self.bootrom_enabled and address < len(self.bootrom):
             return self.bootrom[address]
-        # Fast path: most accesses hit WRAM/HRAM/VRAM/OAM (direct array)
+        # Fast path: WRAM (C000-DFFF) and HRAM/IE (FF80-FFFF) dominate game traffic
+        if 0xC000 <= address < 0xE000:
+            return self.memory[address]
+        if address >= 0xFF80:
+            return self.memory[address]
+        # Fast path: remaining high addresses (echo RAM, OAM, I/O)
         if address >= 0xC000:
             if address < 0xFE00:
-                if address < 0xE000:
-                    return self.memory[address]
                 return self.memory[address - 0x2000]  # Echo RAM
             # OAM (0xFE00-0xFE9F): blocked during PPU modes 2 and 3, or during OAM DMA
             if address < 0xFEA0:
@@ -1509,14 +1676,42 @@ class MMU:
             result = 0x0F
         return 0xC0 | sel | result
 
-    def set_joypad_button(self, bit, pressed):
+    def set_joypad_button(self, bit, pressed, source=_JOY_SRC_KB):
+        """Update one input source and recompute the combined P1 state.
+
+        `source` is one of _JOY_SRC_KB / _JOY_SRC_HAT / _JOY_SRC_AXIS / _JOY_SRC_BTN
+        so analog-stick release cannot un-press a still-held hat or key.
+        Opposite D-pad directions use last-wins SOCD cleaning (hardware cannot
+        press Left+Right or Up+Down together).
+        """
+        mask = self._joy_src[source]
         if pressed:
-            new_state = self.joypad_buttons & ~(1 << bit)
+            mask &= ~(1 << bit)
+            if bit <= 3:
+                self._dpad_last[bit >> 1] = bit
         else:
-            new_state = self.joypad_buttons | (1 << bit)
-        if new_state != self.joypad_buttons and pressed:
-            if_reg = self.memory[0xFF0F]
-            self.memory[0xFF0F] = if_reg | IF_JOYPAD
+            mask |= (1 << bit)
+        self._joy_src[source] = mask
+        self._recompute_joypad()
+
+    def release_all_joypad(self):
+        """Clear every input source (used when opening the pause menu)."""
+        self._joy_src = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF]
+        self.joypad_buttons = 0xFF
+
+    def _recompute_joypad(self):
+        src = self._joy_src
+        new_state = src[0] & src[1] & src[2] & src[3]
+        if len(src) > 4:
+            new_state &= src[4]
+        # Last-wins SOCD: if both sides of an axis are down, keep the latest.
+        if (new_state & 0x03) == 0:
+            new_state |= (0x02 if self._dpad_last[0] == 0 else 0x01)
+        if (new_state & 0x0C) == 0:
+            new_state |= (0x08 if self._dpad_last[1] == 2 else 0x04)
+        newly_pressed = self.joypad_buttons & ~new_state
+        if newly_pressed:
+            self.memory[0xFF0F] |= IF_JOYPAD
         self.joypad_buttons = new_state
 
     def read_word(self, address):
@@ -1526,6 +1721,13 @@ class MMU:
 
     def write_byte(self, address, value):
         value &= 0xFF
+        # Fast path: WRAM (C000-DFFF) and HRAM/IE (FF80-FFFF)
+        if 0xC000 <= address < 0xE000:
+            self.memory[address] = value
+            return
+        if address >= 0xFF80:
+            self.memory[address] = value
+            return
         if address < 0x8000:
             self._handle_mbc_write(address, value)
         elif 0xA000 <= address <= 0xBFFF:
@@ -3203,7 +3405,11 @@ class APU:
         elif right < INT16_MIN: right = INT16_MIN
         lv = left & 0xFFFF
         rv = right & 0xFFFF
-        self.buffer.extend((lv & 0xFF, (lv >> 8) & 0xFF, rv & 0xFF, (rv >> 8) & 0xFF))
+        buf = self.buffer
+        buf.append(lv & 0xFF)
+        buf.append(lv >> 8)
+        buf.append(rv & 0xFF)
+        buf.append(rv >> 8)
 
     # ── Main step ───────────────────────────────────────────────────
 
@@ -3213,9 +3419,10 @@ class APU:
         if not self.power:
             # APU off: still produce silence so the audio buffer keeps flowing.
             self.sample_accum += cycles * sd
-            while self.sample_accum >= sn:
-                self.sample_accum -= sn
-                self.buffer.extend(b'\x00\x00\x00\x00')
+            n = self.sample_accum // sn
+            if n:
+                self.sample_accum -= n * sn
+                self.buffer.extend(b'\x00\x00\x00\x00' * n)
             return
 
         # Frame sequencer (512 Hz) — tick on each falling edge of bit 12.
@@ -3225,15 +3432,21 @@ class APU:
         if ((new_fs >> 12) & 1) < ((old_fs >> 12) & 1):
             self._frame_seq_tick()
 
-        # Channel waveform timers (skip when all channels silent)
-        if self.ch1_enabled or self.ch2_enabled or self.ch3_enabled or self.ch4_enabled:
+        active = self.ch1_enabled or self.ch2_enabled or self.ch3_enabled or self.ch4_enabled
+        if active:
             self._step_channels(cycles)
 
         # Sample emission
         self.sample_accum += cycles * sd
-        while self.sample_accum >= sn:
-            self.sample_accum -= sn
-            self._mix_sample()
+        if active:
+            while self.sample_accum >= sn:
+                self.sample_accum -= sn
+                self._mix_sample()
+        else:
+            n = self.sample_accum // sn
+            if n:
+                self.sample_accum -= n * sn
+                self.buffer.extend(b'\x00\x00\x00\x00' * n)
 
     def drain(self):
         """Returns and clears the accumulated PCM bytes (signed-16 stereo LE)."""
@@ -3272,6 +3485,9 @@ MENU_BG = (8, 24, 32)      # DMG darkest: (8, 24, 32)
 MENU_FG = (136, 192, 112)  # DMG light-mid: (136, 192, 112)
 MENU_HI = (224, 248, 208)  # DMG lightest: (224, 248, 208)
 MENU_DIM = (52, 104, 86)   # DMG dark-mid: (52, 104, 86)
+MENU_FOOTER_Y = MENU_H - 22
+MENU_SECONDARY_Y = MENU_H - 48
+MENU_RULE_Y = MENU_H - 62
 
 _font_cache = {}
 def get_font(size, bold=True):
@@ -3284,6 +3500,85 @@ def get_font(size, bold=True):
     return _font_cache[key]
 
 
+def _fit_text(font, text, max_width):
+    """Ellipsize `text` so it fits within max_width pixels."""
+    text = str(text)
+    if max_width <= 0:
+        return ''
+    if font.size(text)[0] <= max_width:
+        return text
+    ell = '...'
+    if font.size(ell)[0] >= max_width:
+        return ell
+    lo, hi = 0, len(text)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if font.size(text[:mid] + ell)[0] <= max_width:
+            lo = mid
+        else:
+            hi = mid - 1
+    return text[:lo] + ell
+
+
+def _decorate_cyclic_setting(text, selected):
+    """Wrap the value of a selected cyclic setting in < > so Left/Right is obvious."""
+    if not selected or ': ' not in text:
+        return text
+    name, value = text.split(': ', 1)
+    return f"{name}: < {value} >"
+
+
+def _overlay_layout(w, h, n_items, has_hint=True):
+    """Pause-panel metrics that keep title, rows, and hint inside the window."""
+    n = max(int(n_items), 1)
+    margin = 8
+    panel_w = max(220, w - margin * 2)
+    if h >= 500:
+        title_size, base_item, hint_size = 28, 24, 16
+    elif h >= 400:
+        title_size, base_item, hint_size = 22, 18, 14
+    elif h >= 320:
+        title_size, base_item, hint_size = 18, 15, 12
+    else:
+        title_size, base_item, hint_size = 16, 13, 11
+    if n >= 9:
+        base_item = min(base_item, 16 if h >= 400 else 13)
+    title_band = title_size + 14
+    hint_band = (hint_size + 14) if has_hint else 8
+    max_panel_h = max(48, h - margin * 2)
+    item_h = min(36, max(14, (max_panel_h - title_band - hint_band) // n))
+    item_size = min(base_item, max(11, item_h - 3))
+    while title_band + n * item_h + hint_band > max_panel_h and item_h > 13:
+        item_h -= 1
+        item_size = min(item_size, max(11, item_h - 3))
+    panel_h = min(max_panel_h, title_band + n * item_h + hint_band)
+    px = (w - panel_w) // 2
+    py = max(margin, (h - panel_h) // 2)
+    return {
+        'panel_w': panel_w,
+        'panel_h': panel_h,
+        'px': px,
+        'py': py,
+        'title_size': title_size,
+        'item_size': item_size,
+        'hint_size': hint_size,
+        'title_band': title_band,
+        'hint_band': hint_band,
+        'item_h': item_h,
+    }
+
+
+def _blit_selection_bar(surface, x, y, w, h):
+    """Highlight the selected menu row."""
+    if w < 2 or h < 2:
+        return
+    bar = pygame.Surface((w, h))
+    bar.fill(MENU_DIM)
+    bar.set_alpha(120)
+    surface.blit(bar, (x, y))
+    pygame.draw.rect(surface, MENU_HI, (x, y, w, h), 1)
+
+
 class EmulatorMenu:
     def __init__(self, bootrom_path=None):
         self.selected = 0
@@ -3291,7 +3586,7 @@ class EmulatorMenu:
         self.roms = []
         self.rom_cursor = 0
         self.rom_scroll = 0
-        self.max_visible = 12
+        self.max_visible = 10
         self.settings_items = ["Window Scale: 4x"]
         self.settings_cursor = 0
         self.exit_cursor = 0
@@ -3314,6 +3609,10 @@ class EmulatorMenu:
         self.palette_idx = _opt_index(PALETTE_LIST, cfg.get("palette", 0), 0)
         self.filter_idx = _opt_index(FILTER_OPTIONS, cfg.get("smooth_scale", False), 0)
         self.shader_idx = _opt_index(SHADER_LIST, cfg.get("shader", 0), 0)
+        self.wasd_enabled = bool(cfg.get("wasd_enabled", True))
+        self.key_bindings = _rebuild_key_map(cfg.get("key_bindings"), self.wasd_enabled)
+        self.controls_cursor = 0
+        self.controls_capture = None  # button key being remapped, or None
         self._sync_settings_items()
         if pygame is None:
             print("=" * 55)
@@ -3330,6 +3629,7 @@ class EmulatorMenu:
             pygame.init()
             logging.warning("Audio init failed — running silent (dummy audio driver).")
         _init_joysticks()
+        self.key_bindings = _rebuild_key_map(self.key_bindings, self.wasd_enabled)
         self.screen = pygame.display.set_mode((MENU_W, MENU_H))
         pygame.display.set_caption("Python GBC Emulator")
         self.logo = None
@@ -3385,6 +3685,7 @@ class EmulatorMenu:
             f"Palette: {PALETTE_LIST[self.palette_idx][0]}",
             f"Filter: {FILTER_OPTIONS[self.filter_idx][0]}",
             f"Shader: {SHADER_LIST[self.shader_idx][0]}",
+            "Controls...",
         ]
         _save_config(dict(
             window_scale=self.window_scale,
@@ -3394,7 +3695,25 @@ class EmulatorMenu:
             palette=self.palette_idx,
             smooth_scale=FILTER_OPTIONS[self.filter_idx][1],
             shader=self.shader_idx,
+            wasd_enabled=self.wasd_enabled,
+            key_bindings=self.key_bindings,
         ))
+
+    def _persist_controls(self):
+        self.key_bindings = _rebuild_key_map(self.key_bindings, self.wasd_enabled)
+        _save_config({
+            'wasd_enabled': self.wasd_enabled,
+            'key_bindings': self.key_bindings,
+        })
+
+    def _controls_items(self):
+        items = [
+            f"{JOYPAD_BUTTON_LABELS[i]}: {_binding_label(self.key_bindings, key)}"
+            for i, key in enumerate(JOYPAD_BUTTON_KEYS)
+        ]
+        items.append(f"WASD as D-Pad: {'On' if self.wasd_enabled else 'Off'}")
+        items.append("Reset to Default")
+        return items
 
     def _status(self, msg):
         self.status_line = msg
@@ -3411,16 +3730,58 @@ class EmulatorMenu:
         self.screen.blit(s, (x, y))
         return s.get_width()
 
-    def _draw_menu(self, items, cursor, start_y, gap):
-        f = get_font(28)
+    def _draw_chrome(self, primary, secondary=None):
+        """Footer plus optional secondary hint. Status toasts replace the hint."""
+        pygame.draw.line(self.screen, MENU_DIM, (48, MENU_RULE_Y), (MENU_W - 48, MENU_RULE_Y), 1)
+        if self.status_ttl and self.status_line:
+            self._centre_text(self.status_line, MENU_SECONDARY_Y, MENU_HI, 18)
+        elif secondary:
+            self._centre_text(secondary, MENU_SECONDARY_Y, MENU_DIM, 15)
+        self._centre_text(primary, MENU_FOOTER_Y, MENU_DIM, 16)
+
+    def _draw_menu(self, items, cursor, start_y, gap, size=28):
+        f = get_font(size)
+        max_w = 0
+        for item in items:
+            max_w = max(max_w, f.size(item)[0])
+        bar_w = min(MENU_W - 80, max(220, max_w + 72))
+        bar_h = size + 10
         for i, item in enumerate(items):
             y = start_y + i * gap
+            if i == cursor:
+                _blit_selection_bar(
+                    self.screen, (MENU_W - bar_w) // 2, y - 4, bar_w, bar_h)
             colour = MENU_HI if i == cursor else MENU_FG
-            w = self._centre_text(item, y, colour, 28, shadow=(i == cursor))
+            w = self._centre_text(item, y, colour, size, shadow=(i == cursor))
             if i == cursor:
                 cursor_surf = f.render(">", True, MENU_HI)
                 cursor_x = (MENU_W - w) // 2 - cursor_surf.get_width() - 10
                 self.screen.blit(cursor_surf, (cursor_x, y))
+
+    def _cycle_menu_setting(self, cursor, direction=1):
+        """Cycle a main-menu setting forward (1) or backward (-1)."""
+        if cursor == 0:
+            scales = [2, 3, 4, 5]
+            try:
+                idx = scales.index(self.window_scale)
+            except ValueError:
+                idx = 2
+            self.window_scale = scales[(idx + direction) % len(scales)]
+        elif cursor == 1:
+            self.fps_limit_idx = (self.fps_limit_idx + direction) % len(FPS_LIMIT_OPTIONS)
+        elif cursor == 2:
+            self.audio_idx = (self.audio_idx + direction) % len(AUDIO_OPTIONS)
+        elif cursor == 3:
+            self.volume_idx = (self.volume_idx + direction) % len(VOLUME_OPTIONS)
+        elif cursor == 4:
+            self.palette_idx = (self.palette_idx + direction) % len(PALETTE_LIST)
+        elif cursor == 5:
+            self.filter_idx = (self.filter_idx + direction) % len(FILTER_OPTIONS)
+        elif cursor == 6:
+            self.shader_idx = (self.shader_idx + direction) % len(SHADER_LIST)
+        else:
+            return
+        self._sync_settings_items()
 
     def run(self):
         clock = pygame.time.Clock()
@@ -3437,10 +3798,10 @@ class EmulatorMenu:
                 self._render_load_rom()
             elif page == "settings":
                 self._render_settings()
+            elif page == "controls":
+                self._render_controls()
             elif page == "confirm_exit":
                 self._render_confirm_exit()
-            if self.status_ttl:
-                self._centre_text(self.status_line, MENU_H - 28, MENU_DIM, 18)
             pygame.display.flip()
             clock.tick(60)
 
@@ -3455,7 +3816,7 @@ class EmulatorMenu:
                     raw = pygame.image.load(candidate).convert_alpha()
                 except (OSError, pygame.error):
                     continue
-                scaled = pygame.transform.smoothscale(raw, (160, 160))
+                scaled = pygame.transform.smoothscale(raw, (112, 112))
                 if np is not None:
                     arr = pygame.surfarray.array3d(scaled).transpose(1, 0, 2)
                     mask = (arr[:, :, 0] > 220) & (arr[:, :, 1] > 220) & (arr[:, :, 2] > 220)
@@ -3463,7 +3824,7 @@ class EmulatorMenu:
                     new_surf = pygame.surfarray.make_surface(arr.transpose(1, 0, 2))
                 else:
                     new_surf = scaled
-                block = pygame.Surface((180, 180))
+                block = pygame.Surface((132, 132))
                 block.fill(MENU_BG)
                 block.blit(new_surf, (10, 10))
                 self.logo = block
@@ -3479,18 +3840,38 @@ class EmulatorMenu:
             if event.type == pygame.QUIT:
                 pygame.quit()
                 sys.exit()
+            if page == "controls" and self.controls_capture is not None:
+                if event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_ESCAPE:
+                        self.controls_capture = None
+                        pygame.key.set_repeat(200, 50)
+                        continue
+                    name = _normalize_key_name(pygame.key.name(event.key))
+                    if _assign_binding_key(self.key_bindings, self.controls_capture, name):
+                        self._persist_controls()
+                        self._status(f"{self.controls_capture.title()} -> {_key_display_name(name)}")
+                    else:
+                        self._status(_RESERVED_KEY_MSG)
+                    self.controls_capture = None
+                    pygame.key.set_repeat(200, 50)
+                continue
             if event.type == pygame.KEYDOWN:
                 action = event.key
             elif event.type in (pygame.JOYBUTTONDOWN, pygame.JOYHATMOTION, pygame.JOYAXISMOTION):
                 action = _gamepad_menu_action(event)
+            elif event.type in (getattr(pygame, 'JOYDEVICEADDED', -1),
+                                getattr(pygame, 'JOYDEVICEREMOVED', -2)):
+                _init_joysticks()
+                continue
             else:
                 continue
             if action is None:
                 continue
+            action = _menu_nav_action(action)
             if page == "main":
-                if action == pygame.K_UP:
+                if action == pygame.K_UP or action == 'up':
                     self.selected = (self.selected - 1) % len(self.main_items)
-                elif action == pygame.K_DOWN:
+                elif action == pygame.K_DOWN or action == 'down':
                     self.selected = (self.selected + 1) % len(self.main_items)
                 elif action == pygame.K_RETURN or action == 'select':
                     if self.selected == 0:
@@ -3509,12 +3890,12 @@ class EmulatorMenu:
                     self.exit_cursor = 0
                     return "confirm_exit"
             elif page == "load_rom":
-                if action == pygame.K_UP:
+                if action == pygame.K_UP or action == 'up':
                     if self.rom_cursor > 0:
                         self.rom_cursor -= 1
                         if self.rom_cursor < self.rom_scroll:
                             self.rom_scroll = self.rom_cursor
-                elif action == pygame.K_DOWN:
+                elif action == pygame.K_DOWN or action == 'down':
                     if self.rom_cursor < len(self.roms) - 1:
                         self.rom_cursor += 1
                         if self.rom_cursor >= self.rom_scroll + self.max_visible:
@@ -3547,12 +3928,15 @@ class EmulatorMenu:
                             self.palette_idx = si['palette']
                             self.filter_idx = si['filter']
                             self.shader_idx = si['shader']
+                            self.wasd_enabled = gb.wasd_enabled
+                            self.key_bindings = _rebuild_key_map(gb.key_bindings, self.wasd_enabled)
                         except FileNotFoundError:
                             self._status(f"ROM not found: {os.path.basename(path)}")
                         except (OSError, pygame.error, RuntimeError, MemoryError) as e:
                             self._status(f"Error loading ROM: {e}")
                         self.screen = pygame.display.set_mode((MENU_W, MENU_H))
                         pygame.event.clear()
+                        pygame.key.set_repeat(200, 50)
                         _init_joysticks()
                         return "main"
                 elif action == pygame.K_ESCAPE or action == 'back':
@@ -3564,36 +3948,50 @@ class EmulatorMenu:
                     self.rom_scroll = 0
                     self._status("ROM list refreshed")
             elif page == "settings":
-                if action == pygame.K_UP:
+                if action == pygame.K_UP or action == 'up':
                     self.settings_cursor = (self.settings_cursor - 1) % len(self.settings_items)
-                elif action == pygame.K_DOWN:
+                elif action == pygame.K_DOWN or action == 'down':
                     self.settings_cursor = (self.settings_cursor + 1) % len(self.settings_items)
                 elif action == pygame.K_RETURN or action == 'select':
-                    if self.settings_cursor == 0:
-                        scales = [2, 3, 4, 5]
-                        try:
-                            idx = scales.index(self.window_scale)
-                        except ValueError:
-                            idx = 2
-                        self.window_scale = scales[(idx + 1) % len(scales)]
-                    elif self.settings_cursor == 1:
-                        self.fps_limit_idx = (self.fps_limit_idx + 1) % len(FPS_LIMIT_OPTIONS)
-                    elif self.settings_cursor == 2:
-                        self.audio_idx = (self.audio_idx + 1) % len(AUDIO_OPTIONS)
-                    elif self.settings_cursor == 3:
-                        self.volume_idx = (self.volume_idx + 1) % len(VOLUME_OPTIONS)
-                    elif self.settings_cursor == 4:
-                        self.palette_idx = (self.palette_idx + 1) % len(PALETTE_LIST)
-                    elif self.settings_cursor == 5:
-                        self.filter_idx = (self.filter_idx + 1) % len(FILTER_OPTIONS)
-                    elif self.settings_cursor == 6:
-                        self.shader_idx = (self.shader_idx + 1) % len(SHADER_LIST)
-                    self._sync_settings_items()
+                    if self.settings_cursor == 7:
+                        self.controls_cursor = 0
+                        self.controls_capture = None
+                        return "controls"
+                    self._cycle_menu_setting(self.settings_cursor, 1)
+                elif action in (pygame.K_RIGHT, 'right'):
+                    if self.settings_cursor != 7:
+                        self._cycle_menu_setting(self.settings_cursor, 1)
+                elif action in (pygame.K_LEFT, 'left'):
+                    if self.settings_cursor != 7:
+                        self._cycle_menu_setting(self.settings_cursor, -1)
                 elif action == pygame.K_ESCAPE or action == 'back':
                     self.selected = 1
                     return "main"
+            elif page == "controls":
+                items = self._controls_items()
+                if action == pygame.K_UP or action == 'up':
+                    self.controls_cursor = (self.controls_cursor - 1) % len(items)
+                elif action == pygame.K_DOWN or action == 'down':
+                    self.controls_cursor = (self.controls_cursor + 1) % len(items)
+                elif action == pygame.K_RETURN or action == 'select':
+                    if self.controls_cursor < 8:
+                        self.controls_capture = JOYPAD_BUTTON_KEYS[self.controls_cursor]
+                        pygame.key.set_repeat()
+                    elif self.controls_cursor == 8:
+                        self.wasd_enabled = not self.wasd_enabled
+                        self.key_bindings = _sanitize_key_bindings(self.key_bindings, self.wasd_enabled)
+                        self._persist_controls()
+                    else:
+                        self.wasd_enabled = True
+                        self.key_bindings = _default_key_bindings(True)
+                        self._persist_controls()
+                        self._status("Controls reset to default")
+                elif action == pygame.K_ESCAPE or action == 'back':
+                    self.controls_capture = None
+                    return "settings"
             elif page == "confirm_exit":
-                if action in (pygame.K_UP, pygame.K_DOWN, pygame.K_LEFT, pygame.K_RIGHT, 'up', 'down', 'left', 'right'):
+                if action in (pygame.K_UP, pygame.K_DOWN, pygame.K_LEFT, pygame.K_RIGHT,
+                              'up', 'down', 'left', 'right'):
                     self.exit_cursor ^= 1
                 elif action == pygame.K_RETURN or action == 'select':
                     if self.exit_cursor == 1:
@@ -3609,63 +4007,90 @@ class EmulatorMenu:
     def _render_main(self):
         if self.logo is not None:
             lx = (MENU_W - self.logo.get_width()) // 2
-            self.screen.blit(self.logo, (lx, 20))
-            title_y = 200
-            subtitle_y = 235
-            menu_y = 290
+            self.screen.blit(self.logo, (lx, 10))
+            title_y = 10 + self.logo.get_height() + 6
         else:
-            title_y = 120
-            subtitle_y = 160
-            menu_y = 200
-        self._centre_text("Python GBC Emulator", title_y, MENU_HI, 44, shadow=True)
-        self._centre_text("v1.0", subtitle_y, MENU_DIM, 20)
-        self._draw_menu(self.main_items, self.selected, menu_y, 50)
-        self._centre_text("Arrow Keys: Navigate  |  Enter: Select  |  Esc: Quit", MENU_H - 30, MENU_DIM, 18)
+            title_y = 72
+        self._centre_text("Python GBC Emulator", title_y, MENU_HI, 36, shadow=True)
+        self._centre_text("v1.0", title_y + 42, MENU_DIM, 18)
+        self._draw_menu(self.main_items, self.selected, title_y + 88, 48, size=28)
+        self._draw_chrome("Up/Down or WASD: Move   Enter: Select   Esc: Quit")
 
     def _render_load_rom(self):
-        self._centre_text("Select ROM", 40, MENU_HI, 36, shadow=True)
+        self._centre_text("Select ROM", 22, MENU_HI, 32, shadow=True)
         if not self.roms:
-            self._centre_text("No .gb/.gbc files found", 180, MENU_DIM)
-            self._centre_text("Place your ROM files in the  roms  folder alongside this program", 225, MENU_DIM)
-            self._centre_text("or anywhere in this directory or its parent.", 260, MENU_DIM)
-            self._centre_text("Press F5 to rescan for ROMs.", 310, MENU_HI, 22)
-        else:
-            visible = self.roms[self.rom_scroll:self.rom_scroll + self.max_visible]
-            for i, rom_path in enumerate(visible):
-                y = 90 + i * 30
-                idx = self.rom_scroll + i
-                name = os.path.basename(rom_path)
-                if len(name) > 44:
-                    name = name[:41] + "..."
-                colour = MENU_HI if idx == self.rom_cursor else MENU_FG
-                f = get_font(24)
-                s = f.render(f"  {name}  ({os.path.dirname(rom_path) or '.'})", True, colour)
-                self.screen.blit(s, (30, y))
-                if idx == self.rom_cursor:
-                    pygame.draw.rect(self.screen, colour, (28, y + 20, 580, 1))
-                    # Show ROM header info for the selected entry
-                    info = getattr(self, '_rom_info_cache', {}).get(rom_path)
-                    if info is None:
-                        info = _parse_rom_header(rom_path) or "Could not read header"
-                        self._rom_info_cache = getattr(self, '_rom_info_cache', {})
-                        self._rom_info_cache[rom_path] = info
-                    if info:
-                        fi = get_font(18)
-                        si = fi.render(info, True, MENU_DIM)
-                        self.screen.blit(si, (40, 90 + len(visible) * 30 + 15))
-        self._centre_text("Enter: Load  |  F5: Refresh  |  Esc: Back", MENU_H - 30, MENU_DIM, 18)
+            self._centre_text("No .gb / .gbc files found", 160, MENU_DIM, 24)
+            self._centre_text("Put ROM files in the roms folder", 210, MENU_DIM, 20)
+            self._centre_text("(or this directory / its parent)", 240, MENU_DIM, 20)
+            self._centre_text("Press F5 to rescan", 300, MENU_HI, 22)
+            self._draw_chrome("F5: Refresh   Esc: Back")
+            return
+        list_y = 68
+        row_h = 32
+        visible = self.roms[self.rom_scroll:self.rom_scroll + self.max_visible]
+        name_font = get_font(22)
+        if self.rom_scroll > 0:
+            self._centre_text("^ more", list_y - 18, MENU_DIM, 14)
+        for i, rom_path in enumerate(visible):
+            y = list_y + i * row_h
+            idx = self.rom_scroll + i
+            selected = idx == self.rom_cursor
+            if selected:
+                _blit_selection_bar(self.screen, 24, y - 3, MENU_W - 48, 28)
+            name = os.path.basename(rom_path)
+            label = _fit_text(name_font, name, MENU_W - 80)
+            colour = MENU_HI if selected else MENU_FG
+            s = name_font.render(label, True, colour)
+            self.screen.blit(s, (40, y))
+        more_below = self.rom_scroll + self.max_visible < len(self.roms)
+        info_y = list_y + len(visible) * row_h + 8
+        if more_below:
+            self._centre_text("v more", info_y, MENU_DIM, 14)
+            info_y += 16
+        path = self.roms[self.rom_cursor]
+        folder = os.path.dirname(path) or '.'
+        info = getattr(self, '_rom_info_cache', {}).get(path)
+        if info is None:
+            info = _parse_rom_header(path) or "Could not read header"
+            self._rom_info_cache = getattr(self, '_rom_info_cache', {})
+            self._rom_info_cache[path] = info
+        fi = get_font(16)
+        meta = _fit_text(fi, f"{folder}  |  {info}", MENU_W - 64)
+        self._centre_text(meta, min(info_y, MENU_RULE_Y - 22), MENU_DIM, 16)
+        self._draw_chrome("Enter: Load   F5: Refresh   Esc: Back")
 
     def _render_settings(self):
-        self._centre_text("Settings", 40, MENU_HI, 36, shadow=True)
-        self._draw_menu(self.settings_items, self.settings_cursor, 120, 45)
-        self._centre_text("Enter: Cycle  |  Esc: Back", MENU_H - 30, MENU_DIM, 18)
+        self._centre_text("Settings", 24, MENU_HI, 32, shadow=True)
+        items = [
+            _decorate_cyclic_setting(text, i == self.settings_cursor and i < 7)
+            for i, text in enumerate(self.settings_items)
+        ]
+        self._draw_menu(items, self.settings_cursor, 80, 36, size=24)
+        footer = ("Enter: Open Controls   Esc: Back"
+                  if self.settings_cursor == 7
+                  else "Left/Right or Enter: Change   Esc: Back")
+        self._draw_chrome(footer)
+
+    def _render_controls(self):
+        self._centre_text("Controls", 18, MENU_HI, 32, shadow=True)
+        items = self._controls_items()
+        if self.controls_capture is not None:
+            items = list(items)
+            idx = JOYPAD_BUTTON_KEYS.index(self.controls_capture)
+            items[idx] = f"{JOYPAD_BUTTON_LABELS[idx]}: press a key..."
+        self._draw_menu(items, self.controls_cursor, 60, 32, size=22)
+        hint = "Press a new key   Esc: Cancel" if self.controls_capture else \
+            "Enter: Remap / Toggle   Esc: Back"
+        self._draw_chrome(
+            hint,
+            secondary=None if self.controls_capture else
+            "Tab: Fast-forward   F3: FPS   F4: Input   Ctrl+R: Reset")
 
     def _render_confirm_exit(self):
-        self._centre_text("Exit Emulator?", 130, MENU_HI, 40, shadow=True)
-        self._centre_text("Are you sure you want to quit to the OS?", 195, MENU_DIM, 22)
-        self._draw_menu(["Keep Playing", "Exit to OS"], self.exit_cursor, 270, 50)
-        self._centre_text("Arrow Keys: Choose  |  Enter: Select  |  Esc: Cancel",
-                          MENU_H - 30, MENU_DIM, 18)
+        self._centre_text("Exit Emulator?", 120, MENU_HI, 36, shadow=True)
+        self._centre_text("Quit to the operating system?", 178, MENU_DIM, 22)
+        self._draw_menu(["Keep Playing", "Exit to OS"], self.exit_cursor, 250, 50, size=28)
+        self._draw_chrome("Left/Right: Choose   Enter: Confirm   Esc: Cancel")
 
 
 class GameBoy:
@@ -3768,6 +4193,19 @@ class GameBoy:
         self.pause_exit_cursor = 0
         self._pause_msg = ''
         self._pause_msg_ttl = 0
+        cfg = _load_config()
+        self.wasd_enabled = bool(cfg.get('wasd_enabled', True))
+        self.key_bindings = _rebuild_key_map(cfg.get('key_bindings'), self.wasd_enabled)
+        self.controls_capture = None
+        self.pause_controls_cursor = 0
+        self._fast_forward = False
+        self._show_fps = False
+        self._show_input = False
+        self._fps_frames = 0
+        self._fps_t0 = time.perf_counter()
+        self._fps_value = 0.0
+        self._turbo_phase = 0
+        self._frame_index = 0
         self._set_idx = {
             'scale':   _opt_index(WINDOW_SCALE_OPTIONS, window_scale, 2),
             'fps':     _opt_index(FPS_LIMIT_OPTIONS, fps_limit, 0),
@@ -4073,6 +4511,7 @@ class GameBoy:
             self._has_rtc = mmu.has_rtc
             mmu.is_cgb = bool(is_cgb)
             mmu.joypad_buttons = joypad
+            mmu._joy_src = [joypad, 0xFF, 0xFF, 0xFF, 0xFF]
             mmu.serial_data = serial_data
             mmu.serial_control = serial_control
             mmu.vram_bank_select = vram_bank_select & 1
@@ -4291,6 +4730,42 @@ class GameBoy:
             self._sync_samples = 0
             self._sync_frames = 0
 
+    def _halt_cpu_cycles(self):
+        """How many CPU T-cycles a halted CPU can sleep before the next event.
+
+        Stops at the next PPU mode/scanline boundary (STAT/VBlank sources) and
+        at the next TIMA increment so interrupt wake-up is not delayed.
+        """
+        ppu = self.ppu
+        mem = self.mmu.memory
+        sd = ppu.scanline_dot
+        remain = DOTS_PER_SCANLINE - sd
+        if remain < 1:
+            remain = 1
+        if ppu.lcd_was_on and (mem[0xFF40] & 0x80):
+            ly = mem[0xFF44]
+            if ly < 144:
+                if sd < MODE3_START_DOT:
+                    remain = min(remain, MODE3_START_DOT - sd)
+                else:
+                    m3 = MODE3_START_DOT + ppu.mode3_duration
+                    if sd < m3:
+                        remain = min(remain, m3 - sd)
+        tac = mem[0xFF07]
+        if tac & 0x04:
+            rate = self.timers._TIMA_RATES[tac & 0x03]
+            until = rate - self.timers.tima_accum
+            if until < 1:
+                until = 1
+            remain = min(remain, until)
+        if self.mmu.key1 & 0x80:
+            cpu_cycles = remain * 2 - self.speed_remainder
+            if cpu_cycles < 1:
+                cpu_cycles = 1
+        else:
+            cpu_cycles = remain
+        return cpu_cycles
+
     def step_all(self):
         """Execute one CPU step and propagate cycles to PPU, timers, and APU."""
         mmu = self.mmu
@@ -4304,10 +4779,16 @@ class GameBoy:
                 mmu.memory[0xFE00:0xFEA0] = mmu.dma_buffer
                 mmu.dma_buffer = bytearray()
         else:
-            cpu_cycles = self.cpu.step()
-            if mmu.gdma_stall > 0:
-                cpu_cycles += mmu.gdma_stall
-                mmu.gdma_stall = 0
+            cpu = self.cpu
+            mem = mmu.memory
+            if (cpu.halted and mmu.gdma_stall == 0
+                    and not (mem[0xFFFF] & mem[0xFF0F])):
+                cpu_cycles = self._halt_cpu_cycles()
+            else:
+                cpu_cycles = cpu.step()
+                if mmu.gdma_stall > 0:
+                    cpu_cycles += mmu.gdma_stall
+                    mmu.gdma_stall = 0
         # CGB double-speed (KEY1)
         if mmu.key1 & 0x80:
             self.speed_remainder += cpu_cycles
@@ -4342,6 +4823,10 @@ class GameBoy:
         self._sync_samples = 0
         self._sync_frames = 0
         self._cycle_carry = 0
+        self._fps_t0 = time.perf_counter()
+        self._fps_frames = 0
+        if pygame:
+            pygame.key.set_repeat()  # disable key-repeat so held keys don't retrigger
 
         while self.running:
             cycles_this_frame = self._cycle_carry
@@ -4349,18 +4834,26 @@ class GameBoy:
             while cycles_this_frame < CYCLES_PER_FRAME:
                 cycles_this_frame += self.step_all()
             self._cycle_carry = cycles_this_frame - CYCLES_PER_FRAME
+            self._frame_index += 1
 
             samples_this_frame = 0
             if pygame:
                 self.handle_events()
-                self.render()
+                self._apply_turbo()
+                skip_blit = self._fast_forward and (self._frame_index & 3)
+                if not skip_blit:
+                    self.render()
                 samples_this_frame = self._flush_audio()
 
             if self.paused and pygame:
                 self._pause_menu_loop()
                 continue
 
-            self._pace_frame(samples_this_frame)
+            self._tick_fps()
+            if self._status_ttl > 0:
+                self._status_ttl -= 1
+            if not self._fast_forward:
+                self._pace_frame(samples_this_frame)
 
         self._save_sav()
         if self.mmu.link_cable is not None:
@@ -4399,29 +4892,235 @@ class GameBoy:
                     else:
                         self._status_msg = "No save state in slot 1"
                     self._status_ttl = 90
+                elif event.key == pygame.K_F3:
+                    self._show_fps = not self._show_fps
+                    self._status_msg = "FPS overlay on" if self._show_fps else "FPS overlay off"
+                    self._status_ttl = 60
+                elif event.key == pygame.K_F4:
+                    self._show_input = not self._show_input
+                    self._status_msg = "Input overlay on" if self._show_input else "Input overlay off"
+                    self._status_ttl = 60
+                elif event.key == pygame.K_TAB:
+                    self._fast_forward = True
+                elif event.key == pygame.K_r and (event.mod & pygame.KMOD_CTRL):
+                    self.soft_reset()
                 elif event.key in KEY_TO_JOYPAD_BIT:
-                    self.mmu.set_joypad_button(KEY_TO_JOYPAD_BIT[event.key], True)
+                    self.mmu.set_joypad_button(
+                        KEY_TO_JOYPAD_BIT[event.key], True, _JOY_SRC_KB)
             elif event.type == pygame.KEYUP:
-                if event.key in KEY_TO_JOYPAD_BIT:
-                    self.mmu.set_joypad_button(KEY_TO_JOYPAD_BIT[event.key], False)
-            # Gamepad input
+                if event.key == pygame.K_TAB:
+                    self._fast_forward = False
+                elif event.key in KEY_TO_JOYPAD_BIT:
+                    self.mmu.set_joypad_button(
+                        KEY_TO_JOYPAD_BIT[event.key], False, _JOY_SRC_KB)
             elif event.type == pygame.JOYBUTTONDOWN:
-                bit = _GAMEPAD_BUTTON_MAP.get(event.button)
-                if bit is not None:
-                    self.mmu.set_joypad_button(bit, True)
-                if event.button == 7:  # Start -> pause
+                if event.button == 9:
+                    self._fast_forward = True
+                    continue
+                if event.button == 7 and not (self.mmu._joy_src[_JOY_SRC_BTN] & (1 << 6)):
+                    # Select is already held: Select+Start opens the pause menu
+                    # instead of injecting Start into the game.
                     self._open_pause_menu()
                     return
-            elif event.type == pygame.JOYBUTTONUP:
                 bit = _GAMEPAD_BUTTON_MAP.get(event.button)
                 if bit is not None:
-                    self.mmu.set_joypad_button(bit, False)
+                    self.mmu.set_joypad_button(bit, True, _JOY_SRC_BTN)
+            elif event.type == pygame.JOYBUTTONUP:
+                if event.button == 9:
+                    self._fast_forward = False
+                bit = _GAMEPAD_BUTTON_MAP.get(event.button)
+                if bit is not None:
+                    self.mmu.set_joypad_button(bit, False, _JOY_SRC_BTN)
             elif event.type == pygame.JOYHATMOTION:
                 for bit, pressed in _joystick_dpad_from_hat(event):
-                    self.mmu.set_joypad_button(bit, pressed)
+                    self.mmu.set_joypad_button(bit, pressed, _JOY_SRC_HAT)
             elif event.type == pygame.JOYAXISMOTION:
                 for bit, pressed in _joystick_dpad_from_axis(event):
-                    self.mmu.set_joypad_button(bit, pressed)
+                    self.mmu.set_joypad_button(bit, pressed, _JOY_SRC_AXIS)
+            elif event.type in (getattr(pygame, 'JOYDEVICEADDED', -1),
+                                getattr(pygame, 'JOYDEVICEREMOVED', -2)):
+                _init_joysticks()
+
+    def _sync_held_inputs(self):
+        """Re-read currently held keyboard / gamepad state after the pause menu."""
+        kb = 0xFF
+        pressed = pygame.key.get_pressed()
+        for key, bit in KEY_TO_JOYPAD_BIT.items():
+            if key == pygame.K_ESCAPE:
+                continue
+            if bit == 7:  # don't stick Start from Enter used to confirm Resume
+                continue
+            if pressed[key]:
+                kb &= ~(1 << bit)
+        hat = 0xFF
+        axis = 0xFF
+        padbtn = 0xFF
+        try:
+            count = pygame.joystick.get_count()
+        except pygame.error:
+            count = 0
+        T = _GAMEPAD_AXIS_THRESHOLD
+        for i in range(count):
+            try:
+                js = pygame.joystick.Joystick(i)
+                for b, bit in _GAMEPAD_BUTTON_MAP.items():
+                    if b < js.get_numbuttons() and js.get_button(b):
+                        padbtn &= ~(1 << bit)
+                if js.get_numhats() > 0:
+                    x, y = js.get_hat(0)
+                    if x == 1:  hat &= ~0x01
+                    if x == -1: hat &= ~0x02
+                    if y == 1:  hat &= ~0x04
+                    if y == -1: hat &= ~0x08
+                naxes = js.get_numaxes()
+                def _axis_pair(idx, pos_bit, neg_bit, mask):
+                    if idx >= naxes:
+                        return mask
+                    val = js.get_axis(idx)
+                    if val > T:
+                        return mask & ~(1 << pos_bit)
+                    if val < -T:
+                        return mask & ~(1 << neg_bit)
+                    return mask
+                axis = _axis_pair(0, 0, 1, axis)
+                axis = _axis_pair(1, 3, 2, axis)
+                axis = _axis_pair(6, 0, 1, axis)
+                axis = _axis_pair(7, 3, 2, axis)
+            except pygame.error:
+                continue
+        self.mmu._joy_src = [kb, hat, axis, padbtn, 0xFF]
+        self.mmu._recompute_joypad()
+
+    def _apply_turbo(self):
+        """Hold Q/E (or comma/period) to auto-fire A/B at 30 Hz."""
+        if not pygame:
+            return
+        pressed = pygame.key.get_pressed()
+        turbo_a = bool(pressed[pygame.K_q] or pressed[pygame.K_COMMA])
+        turbo_b = bool(pressed[pygame.K_e] or pressed[pygame.K_PERIOD])
+        self._turbo_phase ^= 1
+        fire = bool(self._turbo_phase)
+        mask = 0xFF
+        if turbo_a and fire:
+            mask &= ~(1 << 4)
+        if turbo_b and fire:
+            mask &= ~(1 << 5)
+        src = self.mmu._joy_src
+        if len(src) < 5:
+            src.extend([0xFF] * (5 - len(src)))
+        if src[_JOY_SRC_TURBO] != mask:
+            src[_JOY_SRC_TURBO] = mask
+            self.mmu._recompute_joypad()
+
+    def _tick_fps(self):
+        self._fps_frames += 1
+        now = time.perf_counter()
+        dt = now - self._fps_t0
+        if dt >= 0.4:
+            self._fps_value = self._fps_frames / dt
+            self._fps_frames = 0
+            self._fps_t0 = now
+
+    def soft_reset(self):
+        """Reset CPU/PPU/APU to post-boot state without wiping cartridge RAM."""
+        cpu = self.cpu
+        cpu.halted = False
+        cpu.interrupts_master_enabled = False
+        cpu.ime_pending = False
+        cpu.halt_bug_pending = False
+        cpu.reg.sp = 0xFFFE
+        cpu.reg.pc = 0x0100
+        if self.mmu.is_cgb:
+            cpu.reg.a = 0x11
+            cpu.reg.f = 0x80
+            cpu.reg.b = 0x00
+            cpu.reg.c = 0x00
+            cpu.reg.d = 0xFF
+            cpu.reg.e = 0x56
+            cpu.reg.h = 0x00
+            cpu.reg.l = 0x0D
+        else:
+            cpu.reg.a = 0x01
+            cpu.reg.f = 0xB0
+            cpu.reg.b = 0x00
+            cpu.reg.c = 0x13
+            cpu.reg.d = 0x00
+            cpu.reg.e = 0xD8
+            cpu.reg.h = 0x01
+            cpu.reg.l = 0x4D
+        mem = self.mmu.memory
+        mem[0xFF0F] = 0x00
+        mem[0xFFFF] = 0x00
+        mem[0xFF44] = 0x00
+        self.mmu.dma_remaining = 0
+        self.mmu.hdma_active = False
+        self.mmu.gdma_stall = 0
+        ppu = self.ppu
+        ppu.scanline_dot = 0
+        ppu.mode = 2
+        ppu.lcd_was_on = False
+        ppu.window_line_counter = 0
+        ppu.window_active = False
+        ppu.prev_stat_irq = False
+        self.timers.div_counter = 0
+        self.timers.tima_accum = 0
+        mem[0xFF04] = 0
+        self.apu.drain()
+        if hasattr(self, '_audio_pending'):
+            self._audio_pending.clear()
+        self.speed_remainder = 0
+        self._cycle_carry = 0
+        self._av_start = time.perf_counter()
+        self._sync_samples = 0
+        self._sync_frames = 0
+        self._status_msg = "Reset"
+        self._status_ttl = 90
+
+    def _draw_hud(self):
+        """FPS / input / fast-forward overlays drawn after the scaled frame."""
+        if not pygame or getattr(self, 'screen', None) is None:
+            return
+        try:
+            h = self.screen.get_height()
+            f = get_font(18 if h >= 400 else 14)
+            y = 8
+            right = self.screen.get_width() - 8
+
+            def _badge(surf, colour=MENU_HI):
+                nonlocal y
+                bg = pygame.Surface((surf.get_width() + 12, surf.get_height() + 6))
+                bg.fill(MENU_BG)
+                bg.set_alpha(210)
+                x = right - bg.get_width()
+                self.screen.blit(bg, (x, y))
+                pygame.draw.rect(self.screen, colour, (x, y, bg.get_width(), bg.get_height()), 1)
+                self.screen.blit(surf, (x + 6, y + 3))
+                y += bg.get_height() + 4
+
+            if getattr(self, '_fast_forward', False):
+                _badge(f.render("FF", True, MENU_HI))
+            if getattr(self, '_show_fps', False):
+                _badge(f.render(f"{getattr(self, '_fps_value', 0.0):.0f} fps", True, MENU_HI))
+            if getattr(self, '_show_input', False):
+                jp = self.mmu.joypad_buttons
+                names = (('R', 0), ('L', 1), ('U', 2), ('D', 3),
+                         ('A', 4), ('B', 5), ('Se', 6), ('St', 7))
+                parts = []
+                total_w = 6
+                for label, bit in names:
+                    pressed = (jp & (1 << bit)) == 0
+                    ps = f.render(label, True, MENU_HI if pressed else MENU_DIM)
+                    parts.append(ps)
+                    total_w += ps.get_width() + 6
+                row = pygame.Surface((max(total_w, 12), f.get_height()))
+                row.fill(MENU_BG)
+                rx = 0
+                for ps in parts:
+                    row.blit(ps, (rx, 0))
+                    rx += ps.get_width() + 6
+                _badge(row)
+        except (pygame.error, AttributeError):
+            pass
 
     # ── In-game pause menu ────────────────────────────────────────────
     PAUSE_ITEMS = ["Resume", "Save State", "Load State", "Settings", "Exit to Menu"]
@@ -4432,6 +5131,9 @@ class GameBoy:
         self.pause_cursor = 0
         self.pause_settings_cursor = 0
         self.pause_exit_cursor = 0
+        self.pause_controls_cursor = 0
+        self.controls_capture = None
+        self._fast_forward = False
 
     def _pause_status(self, msg):
         self._pause_msg = msg
@@ -4439,7 +5141,7 @@ class GameBoy:
 
     def _pause_settings_items(self):
         si = self._set_idx
-        return [
+        raw = [
             f"Window Scale: {WINDOW_SCALE_OPTIONS[si['scale']][0]}",
             f"Frame Rate: {FPS_LIMIT_OPTIONS[si['fps']][0]}",
             f"Audio: {AUDIO_OPTIONS[si['audio']][0]}",
@@ -4447,6 +5149,11 @@ class GameBoy:
             f"Palette: {PALETTE_LIST[si['palette']][0]}",
             f"Filter: {FILTER_OPTIONS[si['filter']][0]}",
             f"Shader: {SHADER_LIST[si['shader']][0]}",
+            "Controls...",
+        ]
+        return [
+            _decorate_cyclic_setting(text, i == self.pause_settings_cursor and i < 7)
+            for i, text in enumerate(raw)
         ]
 
     def _cycle_pause_setting(self, cursor, direction=1):
@@ -4496,6 +5203,8 @@ class GameBoy:
             si['shader'] = (si['shader'] + direction) % n
             self.shader = SHADER_LIST[si['shader']][1]
             self._prev_shader_frame = None
+        elif cursor == 7:
+            return False
         # Persist settings so they survive restart
         _save_config(dict(
             window_scale=WINDOW_SCALE_OPTIONS[si['scale']][1],
@@ -4505,12 +5214,14 @@ class GameBoy:
             palette=si['palette'],
             smooth_scale=FILTER_OPTIONS[si['filter']][1],
             shader=si['shader'],
+            wasd_enabled=self.wasd_enabled,
+            key_bindings=self.key_bindings,
         ))
         return resized
 
     def _capture_pause_backdrop(self):
         """Render the current frame, then return a dimmed copy to sit behind the menu."""
-        self.render()
+        self.render(overlays=False)
         backdrop = self.screen.copy()
         veil = pygame.Surface(backdrop.get_size())
         veil.fill((0, 0, 0))
@@ -4522,7 +5233,7 @@ class GameBoy:
         """Blocking loop that runs while the game is paused. Halts emulation and
         audio, shows the overlay menu, and returns once the player resumes or exits."""
         # Release every joypad button so the game doesn't see a stuck input.
-        self.mmu.joypad_buttons = 0xFF
+        self.mmu.release_all_joypad()
         if self.audio_channel is not None:
             try:
                 self.audio_channel.stop()
@@ -4547,11 +5258,7 @@ class GameBoy:
         # Resume cleanly: re-sync held keys to the joypad and reset the A/V clock
         # so frame pacing doesn't try to "catch up" on the paused wall-clock time.
         if self.running:
-            pressed = pygame.key.get_pressed()
-            for key, bit in KEY_TO_JOYPAD_BIT.items():
-                if key in (pygame.K_RETURN, pygame.K_ESCAPE):
-                    continue
-                self.mmu.set_joypad_button(bit, bool(pressed[key]))
+            self._sync_held_inputs()
         pygame.event.clear()
         self._av_start = time.perf_counter()
         self._sync_samples = 0
@@ -4563,6 +5270,23 @@ class GameBoy:
                 self.running = False
                 self.paused = False
                 return page, backdrop
+            if page == "controls" and self.controls_capture is not None:
+                if event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_ESCAPE:
+                        self.controls_capture = None
+                    else:
+                        name = _normalize_key_name(pygame.key.name(event.key))
+                        if _assign_binding_key(self.key_bindings, self.controls_capture, name):
+                            self.key_bindings = _rebuild_key_map(self.key_bindings, self.wasd_enabled)
+                            _save_config({
+                                'key_bindings': self.key_bindings,
+                                'wasd_enabled': self.wasd_enabled,
+                            })
+                            self._pause_status(f"{self.controls_capture.title()} -> {_key_display_name(name)}")
+                        else:
+                            self._pause_status(_RESERVED_KEY_MSG)
+                        self.controls_capture = None
+                continue
             if event.type == pygame.KEYDOWN:
                 action = event.key
             elif event.type in (pygame.JOYBUTTONDOWN, pygame.JOYHATMOTION, pygame.JOYAXISMOTION):
@@ -4571,6 +5295,7 @@ class GameBoy:
                 continue
             if action is None:
                 continue
+            action = _menu_nav_action(action)
             if page == "pause":
                 if action in (pygame.K_UP, 'up'):
                     self.pause_cursor = (self.pause_cursor - 1) % len(self.PAUSE_ITEMS)
@@ -4586,14 +5311,52 @@ class GameBoy:
                     self.pause_settings_cursor = (self.pause_settings_cursor - 1) % len(items)
                 elif action in (pygame.K_DOWN, 'down'):
                     self.pause_settings_cursor = (self.pause_settings_cursor + 1) % len(items)
-                elif action == pygame.K_RETURN or action == 'select' or action in (pygame.K_RIGHT, 'right'):
-                    if self._cycle_pause_setting(self.pause_settings_cursor, 1):
+                elif action == pygame.K_RETURN or action == 'select':
+                    if self.pause_settings_cursor == 7:
+                        self.pause_controls_cursor = 0
+                        self.controls_capture = None
+                        page = "controls"
+                    elif self._cycle_pause_setting(self.pause_settings_cursor, 1):
                         backdrop = self._capture_pause_backdrop()
+                elif action in (pygame.K_RIGHT, 'right'):
+                    if self.pause_settings_cursor != 7:
+                        if self._cycle_pause_setting(self.pause_settings_cursor, 1):
+                            backdrop = self._capture_pause_backdrop()
                 elif action in (pygame.K_LEFT, 'left'):
-                    if self._cycle_pause_setting(self.pause_settings_cursor, -1):
-                        backdrop = self._capture_pause_backdrop()
+                    if self.pause_settings_cursor != 7:
+                        if self._cycle_pause_setting(self.pause_settings_cursor, -1):
+                            backdrop = self._capture_pause_backdrop()
                 elif action == pygame.K_ESCAPE or action == 'back':
                     page = "pause"
+            elif page == "controls":
+                items = self._pause_controls_items()
+                if action in (pygame.K_UP, 'up'):
+                    self.pause_controls_cursor = (self.pause_controls_cursor - 1) % len(items)
+                elif action in (pygame.K_DOWN, 'down'):
+                    self.pause_controls_cursor = (self.pause_controls_cursor + 1) % len(items)
+                elif action == pygame.K_RETURN or action == 'select':
+                    if self.pause_controls_cursor < 8:
+                        self.controls_capture = JOYPAD_BUTTON_KEYS[self.pause_controls_cursor]
+                    elif self.pause_controls_cursor == 8:
+                        self.wasd_enabled = not self.wasd_enabled
+                        self.key_bindings = _sanitize_key_bindings(self.key_bindings, self.wasd_enabled)
+                        self.key_bindings = _rebuild_key_map(self.key_bindings, self.wasd_enabled)
+                        _save_config({
+                            'key_bindings': self.key_bindings,
+                            'wasd_enabled': self.wasd_enabled,
+                        })
+                    else:
+                        self.wasd_enabled = True
+                        self.key_bindings = _default_key_bindings(True)
+                        self.key_bindings = _rebuild_key_map(self.key_bindings, True)
+                        _save_config({
+                            'key_bindings': self.key_bindings,
+                            'wasd_enabled': True,
+                        })
+                        self._pause_status("Controls reset to default")
+                elif action == pygame.K_ESCAPE or action == 'back':
+                    self.controls_capture = None
+                    page = "settings"
             elif page == "confirm_exit":
                 if action in (pygame.K_UP, pygame.K_DOWN, pygame.K_LEFT, pygame.K_RIGHT,
                               'up', 'down', 'left', 'right'):
@@ -4629,57 +5392,101 @@ class GameBoy:
             page = "confirm_exit"
         return page, backdrop
 
-    def _draw_overlay_menu(self, backdrop, title, items, cursor, hint):
+    def _pause_controls_items(self):
+        items = [
+            f"{JOYPAD_BUTTON_LABELS[i]}: {_binding_label(self.key_bindings, key)}"
+            for i, key in enumerate(JOYPAD_BUTTON_KEYS)
+        ]
+        if self.controls_capture is not None:
+            idx = JOYPAD_BUTTON_KEYS.index(self.controls_capture)
+            items[idx] = f"{JOYPAD_BUTTON_LABELS[idx]}: Press a key..."
+        items.append(f"WASD as D-Pad: {'On' if self.wasd_enabled else 'Off'}")
+        items.append("Reset to Default")
+        return items
+
+    def _draw_overlay_menu(self, backdrop, title, items, cursor, hint, hint_hi=False):
         self.screen.blit(backdrop, (0, 0))
         w, h = self.screen.get_size()
-        panel_w = min(w - 40, 380)
-        panel_h = 70 + len(items) * 42
-        px = (w - panel_w) // 2
-        py = (h - panel_h) // 2
+        n = max(len(items), 1)
+        L = _overlay_layout(w, h, n, has_hint=bool(hint))
+        px, py = L['px'], L['py']
+        panel_w, panel_h = L['panel_w'], L['panel_h']
         panel = pygame.Surface((panel_w, panel_h))
         panel.fill(MENU_BG)
-        panel.set_alpha(238)
+        panel.set_alpha(240)
         self.screen.blit(panel, (px, py))
         pygame.draw.rect(self.screen, MENU_HI, (px, py, panel_w, panel_h), 2)
 
-        tf = get_font(38)
-        ts = tf.render(title, True, MENU_HI)
-        self.screen.blit(ts, (px + (panel_w - ts.get_width()) // 2, py + 16))
+        tf = get_font(L['title_size'])
+        ts = tf.render(_fit_text(tf, title, panel_w - 16), True, MENU_HI)
+        self.screen.blit(ts, (px + (panel_w - ts.get_width()) // 2, py + 6))
 
-        itf = get_font(30)
+        itf = get_font(L['item_size'])
+        max_item_w = panel_w - 40
         for i, item in enumerate(items):
-            colour = MENU_HI if i == cursor else MENU_FG
-            isf = itf.render(item, True, colour)
-            iy = py + 62 + i * 42
-            ix = px + (panel_w - isf.get_width()) // 2
-            self.screen.blit(isf, (ix, iy))
+            iy = py + L['title_band'] + i * L['item_h']
+            label = _fit_text(itf, item, max_item_w)
+            if i == cursor:
+                bar_h = max(12, L['item_h'] - 2)
+                _blit_selection_bar(self.screen, px + 6, iy - 1, panel_w - 12, bar_h)
+                colour = MENU_HI
+            else:
+                colour = MENU_FG
+            isf = itf.render(label, True, colour)
+            ix = px + max(16, (panel_w - isf.get_width()) // 2)
             if i == cursor:
                 cursor_surf = itf.render(">", True, MENU_HI)
-                cursor_x = ix - cursor_surf.get_width() - 10
-                self.screen.blit(cursor_surf, (cursor_x, iy))
+                self.screen.blit(
+                    cursor_surf,
+                    (max(px + 10, ix - cursor_surf.get_width() - 6), iy))
+            self.screen.blit(isf, (ix, iy))
 
         if hint:
-            hf = get_font(22)
-            hs = hf.render(hint, True, MENU_DIM)
-            self.screen.blit(hs, ((w - hs.get_width()) // 2, h - 30))
+            hf = get_font(L['hint_size'])
+            hs = hf.render(
+                _fit_text(hf, hint, panel_w - 16),
+                True, MENU_HI if hint_hi else MENU_DIM)
+            self.screen.blit(
+                hs,
+                (px + (panel_w - hs.get_width()) // 2,
+                 py + panel_h - L['hint_band'] + 4))
         pygame.display.flip()
+
+    def _pause_hint(self, wide, narrow):
+        return wide if self.screen.get_width() >= 400 else narrow
 
     def _render_pause_page(self, page, backdrop):
         if page == "settings":
-            self._draw_overlay_menu(backdrop, "Settings", self._pause_settings_items(),
-                                    self.pause_settings_cursor,
-                                    "Enter: Cycle  |  Esc: Back")
+            self._draw_overlay_menu(
+                backdrop, "Settings", self._pause_settings_items(),
+                self.pause_settings_cursor,
+                self._pause_hint("Left/Right or Enter: Change   Esc: Back",
+                                 "Left/Right: Change   Esc: Back"))
+        elif page == "controls":
+            if self.controls_capture:
+                hint = self._pause_hint("Press a new key   Esc: Cancel",
+                                        "Press a key   Esc: Cancel")
+            else:
+                hint = self._pause_hint("Enter: Remap / Toggle   Esc: Back",
+                                        "Enter: Remap   Esc: Back")
+            self._draw_overlay_menu(
+                backdrop, "Controls", self._pause_controls_items(),
+                self.pause_controls_cursor, hint)
         elif page == "confirm_exit":
-            self._draw_overlay_menu(backdrop, "Exit to Menu?",
-                                    ["Keep Playing", "Exit to Menu"], self.pause_exit_cursor,
-                                    "Tip: Save State (F6) keeps your progress")
+            self._draw_overlay_menu(
+                backdrop, "Exit to Menu?",
+                ["Keep Playing", "Exit to Menu"], self.pause_exit_cursor,
+                self._pause_hint("Tip: F6 saves progress first", "F6 saves first"))
         else:
-            hint = self._pause_msg if self._pause_msg_ttl > 0 else \
-                "Up/Down: Move  |  Enter: Select  |  Esc: Resume"
-            self._draw_overlay_menu(backdrop, "Paused", self.PAUSE_ITEMS,
-                                    self.pause_cursor, hint)
+            status = self._pause_msg_ttl > 0 and self._pause_msg
+            hint = status or self._pause_hint(
+                "Up/Down: Move   Enter: Select   Esc: Resume",
+                "Enter: Select   Esc: Resume")
+            self._draw_overlay_menu(
+                backdrop, "Paused", self.PAUSE_ITEMS,
+                self.pause_cursor, hint, hint_hi=bool(status))
 
-    def render(self):
+    def render(self, overlays=True):
         """Draws the PPU framebuffer to the Pygame screen."""
         if np is not None:
             # framebuffer holds packed 24-bit colours; unpack the whole frame
@@ -4713,20 +5520,22 @@ class GameBoy:
         else:
             scaled = pygame.transform.scale(surf, target_size)
         self.screen.blit(scaled, (0, 0))
-        # Transient status overlay (save/load messages)
-        if getattr(self, '_status_ttl', 0) > 0 and getattr(self, '_status_msg', ''):
-            try:
-                f = get_font(22)
-                s = f.render(self._status_msg, True, MENU_FG)
-                bg = pygame.Surface((s.get_width() + 16, s.get_height() + 8))
-                bg.fill(MENU_BG)
-                bg.set_alpha(200)
-                self.screen.blit(bg, (8, 8))
-                pygame.draw.rect(self.screen, MENU_HI, (8, 8, bg.get_width(), bg.get_height()), 1)
-                self.screen.blit(s, (16, 12))
-            except (pygame.error, AttributeError):
-                pass
-            self._status_ttl -= 1
+        if overlays:
+            # Transient status overlay (save/load messages) — bottom-left toast
+            if getattr(self, '_status_ttl', 0) > 0 and getattr(self, '_status_msg', ''):
+                try:
+                    f = get_font(20 if self.screen.get_height() >= 400 else 14)
+                    s = f.render(self._status_msg, True, MENU_FG)
+                    bg = pygame.Surface((s.get_width() + 16, s.get_height() + 8))
+                    bg.fill(MENU_BG)
+                    bg.set_alpha(210)
+                    x, y = 8, self.screen.get_height() - bg.get_height() - 8
+                    self.screen.blit(bg, (x, y))
+                    pygame.draw.rect(self.screen, MENU_HI, (x, y, bg.get_width(), bg.get_height()), 1)
+                    self.screen.blit(s, (x + 8, y + 4))
+                except (pygame.error, AttributeError):
+                    pass
+            self._draw_hud()
         pygame.display.flip()
 
 if __name__ == "__main__":
