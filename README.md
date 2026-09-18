@@ -37,8 +37,8 @@ CGB compatibility.
 - **CGB extras** — VRAM bank 1 (FF4F), WRAM bank 1-7 (FF70), CGB BG/OBJ
   palettes (FF68-FF6C), KEY1 double-speed (FF4D), and all write-protection
   rules (STAT read-only bits 0-2 / 6, unused bits forced to 1).
-- **Save states** — Snapshot full emulator state to `<rom>.ss<slot>`
-  with F6 / F8 (save) and F7 / F9 (load).
+- **Save states** — Snapshot full emulator state (including cartridge SRAM)
+  to `<rom>.ss<slot>` with F6 / F8 (save) and F7 / F9 (load).
 - **Menu system** — ROM browser, window-scale selector, keyboard controls,
   project logo.
 - **Input** — D-pad, A / B, Start, Select via keyboard (customisable
@@ -71,14 +71,17 @@ CGB compatibility.
 
 ```bash
 pip install -r requirements.txt
-python gbc_emulator_skeleton.py
+python gbc_emulator.py
 ```
 
 ### Boot a ROM directly (skip the menu)
 
 ```bash
-python gbc_emulator_skeleton.py path/to/rom.gb --nomenu
+python gbc_emulator.py path/to/rom.gb
 ```
+
+`--nomenu` is still accepted and means the same thing. A missing ROM path
+prints an error instead of dropping into the menu.
 
 ### Chromebook (Crostini Linux)
 
@@ -90,10 +93,10 @@ python gbc_emulator_skeleton.py path/to/rom.gb --nomenu
    ```
 3. Launch the emulator:
    ```bash
-   python3 gbc_emulator_skeleton.py
+   python3 gbc_emulator.py
    ```
    The `run.sh` launcher automatically sets `SDL_AUDIODRIVER=alsa` on ChromeOS. If
-   audio doesn't work, try `SDL_AUDIODRIVER=dummy python3 gbc_emulator_skeleton.py`
+   audio doesn't work, try `SDL_AUDIODRIVER=dummy python3 gbc_emulator.py`
    to run silently.
 
 ## Controls
@@ -147,10 +150,10 @@ Two emulator instances can connect via TCP for local link cable gameplay:
 
 ```bash
 # Player 1 (server):
-python gbc_emulator_skeleton.py rom.gbc --nomenu --link-server 12345
+python gbc_emulator.py rom.gbc --link-server 12345
 
 # Player 2 (client):
-python gbc_emulator_skeleton.py rom.gbc --nomenu --link-connect 127.0.0.1:12345
+python gbc_emulator.py rom.gbc --link-connect 127.0.0.1:12345
 ```
 
 ## Settings Persistence
@@ -192,7 +195,7 @@ filesystem (up to two levels deep) looking for `.gb` / `.gbc` files.
 
 ## Architecture
 
-The emulator lives in a single ~4,700-line Python file. The hot path
+The emulator lives in a single Python file. The hot path
 is:
 
 1. `GameBoy.step_all` — combined per-opcode dispatcher.
@@ -229,11 +232,13 @@ Performance-critical helpers:
 ## Project Layout
 
 ```
-gbc_emulator_skeleton.py   Single-file emulator (CPU, MMU, PPU, Timers, menu, runner)
+gbc_emulator.py            Single-file emulator (CPU, MMU, PPU, Timers, menu, runner)
+gbc_emulator_skeleton.py   Deprecated CLI alias that forwards to gbc_emulator.py
 test_headless.py           Self-contained smoke test (synthetic ROM, no display)
 test_save_state.py         Save-state round-trip test (synthetic CGB ROM)
 test_controls.py           Joypad sources, SOCD, key bindings, WRAM fast-path
-requirements.txt           Pinned dependency list (pygame, numpy)
+ci_test.py                 Runs the three portable tests (used by GitHub Actions)
+requirements.txt           Dependency list (pygame, numpy)
 run.bat                    Windows launcher (installs deps if missing, then runs)
 run.sh                     Linux / macOS launcher (bash, installs deps if missing)
 gbclogo.png                Branding logo (used in menu + window icon)
@@ -273,7 +278,7 @@ D-pad cleaning, customisable key bindings, and WRAM/HRAM write fast-paths:
 python test_controls.py
 ```
 
-Both tests are self-contained (no display, no local ROMs) and exit
+All three portable tests are self-contained (no display, no local ROMs) and exit
 non-zero on failure, so they work as CI checks.
 
 A single wrapper script runs all tests sequentially:
@@ -281,6 +286,9 @@ A single wrapper script runs all tests sequentially:
 ```bash
 python ci_test.py
 ```
+
+GitHub Actions (`.github/workflows/ci.yml`) runs that wrapper on Python
+3.9, 3.11, and 3.12.
 
 ## Status
 
@@ -299,13 +307,17 @@ interpreter on modest hardware.
   penalty (one extra wait state per cartridge read at 2× speed) is not
   emulated — in practice this only affects a few test ROMs.
 - SGB (Super Game Boy) features are not emulated.
-- MBC6 and MBC7 mappers are recognised in the ROM browser but not emulated;
-  games that require them (e.g. *Kirby Tilt 'n' Tumble*) will not work.
-- Multiplayer requires `--nomenu` mode (the menu does not support the
-  link cable).  Use `--link-server PORT` and `--link-connect HOST:PORT`.
-- Save states (slots 0 and 1) and battery-backed `.sav` files are fully
-  supported.  RTC state is persisted in the `.sav` file in VBA-compatible
-  format.
+- MBC6 and MBC7 mappers are recognised in the ROM browser (labelled
+  *unsupported*) but not emulated; games that require them (e.g. *Kirby
+  Tilt 'n' Tumble*) will not work.
+- Link-cable multiplayer is CLI-only (`--link-server PORT` /
+  `--link-connect HOST:PORT` with a ROM path). Transfers complete in one
+  shot rather than bit-clocking over ~128 µs, so picky serial titles may
+  desync. A stalled partner times out instead of freezing the emulator.
+- Save states (slots 0 and 1) include cartridge SRAM. Battery-backed
+  `.sav` files are written on exit. MBC3 RTC is stored after SRAM in
+  VBA-M's 44-byte format (unix timestamp included) so day/night continues
+  while the emulator is closed. Older 48-byte custom trailers still load.
 
 ## License
 

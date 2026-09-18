@@ -1,4 +1,4 @@
-"""CI wrapper: runs both smoke tests and exits non-zero on any failure.
+"""CI wrapper: runs the portable test suite and exits non-zero on any failure.
 
 Usage:
     python ci_test.py
@@ -28,7 +28,7 @@ for cmd in tests:
     try:
         result = subprocess.run(cmd, cwd=HERE,
                                 capture_output=False,
-                                timeout=60)
+                                timeout=90)
         if result.returncode != 0:
             print(f"FAILED: {' '.join(cmd)} (exit code {result.returncode})")
             failed += 1

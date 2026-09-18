@@ -37,12 +37,14 @@ echo     Z          - A button
 echo     X          - B button
 echo     Right Shift- Select
 echo     Enter      - Start
-echo     Escape     - Return to menu / Quit
+echo     Escape     - Pause menu (in game) / Back
+echo     F6 / F8    - Save state (slot 0 / 1)
+echo     F7 / F9    - Load state (slot 0 / 1)
 echo.
 echo   In menu:  Arrow keys to navigate, Enter to select, Esc to go back
 echo.
 
-python "%~dp0gbc_emulator_skeleton.py"
+python "%~dp0gbc_emulator.py"
 if %errorlevel% neq 0 (
     echo.
     echo [ERROR] Emulator crashed. See the error message above.
