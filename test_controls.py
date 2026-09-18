@@ -118,6 +118,11 @@ def test_key_bindings(ns):
     check("A primary is j", custom["a"][0] == "j")
     check("assign reserved Escape is rejected",
           _assign_binding_key(custom, "start", "escape") is False)
+    check("assign reserved Tab is rejected",
+          _assign_binding_key(custom, "a", "tab") is False)
+    check("assign reserved F3 is rejected",
+          _assign_binding_key(custom, "b", "f3") is False)
+    check("reserved-key copy mentions Tab", "Tab" in ns["_RESERVED_KEY_MSG"])
     check("assign z to Start swaps/steals", _assign_binding_key(custom, "start", "z"))
     check("Start now includes z", "z" in custom["start"])
     check("A no longer uses z as primary", custom["a"][0] != "z")
@@ -278,6 +283,50 @@ def test_turbo_and_reset(ns):
         os.unlink(path)
 
 
+def test_ui_layout(ns):
+    """Menu overlay metrics must keep title, rows, and hint on-screen."""
+    _overlay_layout = ns["_overlay_layout"]
+    _decorate_cyclic_setting = ns["_decorate_cyclic_setting"]
+    check("cyclic setting shows chevrons when selected",
+          _decorate_cyclic_setting("Window Scale: 4x", True) == "Window Scale: < 4x >")
+    check("cyclic setting unchanged when not selected",
+          _decorate_cyclic_setting("Window Scale: 4x", False) == "Window Scale: 4x")
+    check("Controls row is not decorated",
+          _decorate_cyclic_setting("Controls...", True) == "Controls...")
+    cases = (
+        (320, 288, 10, True),
+        (320, 288, 5, True),
+        (320, 288, 2, True),
+        (480, 432, 8, True),
+        (640, 576, 10, True),
+        (640, 480, 3, False),
+        (800, 720, 10, True),
+    )
+    for w, h, n, hint in cases:
+        L = _overlay_layout(w, h, n, has_hint=hint)
+        check(f"overlay {w}x{h} n={n} stays in window",
+              L['px'] >= 0 and L['py'] >= 0
+              and L['px'] + L['panel_w'] <= w
+              and L['py'] + L['panel_h'] <= h)
+        last_bottom = L['py'] + L['title_band'] + n * L['item_h']
+        hint_top = L['py'] + L['panel_h'] - L['hint_band']
+        check(f"overlay {w}x{h} n={n} rows above hint",
+              last_bottom <= hint_top + 1)
+        check(f"overlay {w}x{h} n={n} readable row",
+              L['item_h'] >= 13 and L['item_size'] >= 11)
+
+    pygame = ns["pygame"]
+    if pygame is None:
+        print("  skip: pygame not available for _fit_text")
+        return
+    pygame.init()
+    font = ns["get_font"](20)
+    _fit_text = ns["_fit_text"]
+    check("fit_text keeps short strings", _fit_text(font, "Start", 400) == "Start")
+    fitted = _fit_text(font, "supercalifragilisticexpialidocious.gbc", 80)
+    check("fit_text ellipsizes long strings", fitted.endswith("...") and font.size(fitted)[0] <= 80)
+
+
 def main():
     ns = load_module()
     print("wram/hram fast path:");     test_wram_hram_fast_path(ns)
@@ -290,6 +339,7 @@ def main():
     print("silent apu batch:");        test_silent_apu_batches(ns)
     print("halt skip:");               test_halt_skip(ns)
     print("turbo and reset:");         test_turbo_and_reset(ns)
+    print("ui layout:");               test_ui_layout(ns)
     print("\nALL CHECKS PASSED")
 
 

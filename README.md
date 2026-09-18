@@ -119,8 +119,8 @@ python gbc_emulator_skeleton.py path/to/rom.gb --nomenu
 | F7 / F9        | Load state (slot 0 / 1) |
 
 Keys are customisable: **Settings → Controls...** (also available from the
-in-game pause menu). Press Enter on a button to capture a new key. Esc, F5–F9
-are reserved. Bindings are stored in `gbc_config.json`.
+in-game pause menu). Press Enter on a button to capture a new key. Esc, Tab,
+and F2–F9 are reserved. Bindings are stored in `gbc_config.json`.
 
 ### Gamepad / Controller
 Gamepads are auto-detected and use Xbox/PlayStation layout by default:
