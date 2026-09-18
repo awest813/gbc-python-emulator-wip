@@ -5,6 +5,8 @@ Exits non-zero on any failure. No display and no local ROM files required.
 import os
 import sys
 import tempfile
+import time
+import struct
 
 os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
@@ -13,10 +15,10 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 
 def load_module():
-    path = os.path.join(HERE, "gbc_emulator_skeleton.py")
+    path = os.path.join(HERE, "gbc_emulator.py")
     src = open(path, encoding="utf-8").read().split("if __name__")[0]
     ns = {}
-    exec(compile(src, "gbc_emulator_skeleton.py", "exec"), ns)
+    exec(compile(src, "gbc_emulator.py", "exec"), ns)
     return ns
 
 
@@ -327,6 +329,92 @@ def test_ui_layout(ns):
     check("fit_text ellipsizes long strings", fitted.endswith("...") and font.size(fitted)[0] <= 80)
 
 
+def test_config_indices(ns):
+    _clamp_index = ns["_clamp_index"]
+    _clamp_choice = ns["_clamp_choice"]
+    PALETTE_LIST = ns["PALETTE_LIST"]
+    SHADER_LIST = ns["SHADER_LIST"]
+    check("palette index 3 is kept", _clamp_index(3, len(PALETTE_LIST), 0) == 3)
+    check("palette index 0 is kept", _clamp_index(0, len(PALETTE_LIST), 1) == 0)
+    check("out-of-range palette falls back", _clamp_index(99, len(PALETTE_LIST), 0) == 0)
+    check("non-int palette falls back", _clamp_index("nope", len(PALETTE_LIST), 0) == 0)
+    check("shader index 2 is kept", _clamp_index(2, len(SHADER_LIST), 0) == 2)
+    check("window scale 3 is kept", _clamp_choice(3, ns["_WINDOW_SCALES"], 4) == 3)
+    check("window scale 9 falls back", _clamp_choice(9, ns["_WINDOW_SCALES"], 4) == 4)
+
+
+def test_rtc_blob(ns):
+    MMU = ns["MMU"]
+    m = MMU()
+    m.has_rtc = True
+    m.rtc_s = 50
+    m.rtc_m = 0
+    m.rtc_h = 1
+    m.rtc_dl = 2
+    m.rtc_dh = 0
+    m.rtc_last_time = time.time() - 15
+    blob = m.pack_rtc_blob()
+    check("VBA RTC blob is 44 bytes", len(blob) == 44)
+    ts = struct.unpack_from("<i", blob, 40)[0]
+    check("VBA RTC blob stores a unix timestamp", ts > 0)
+    check("RTC advanced across the 15s gap before packing", m.rtc_s == 5 and m.rtc_m == 1)
+    m2 = MMU()
+    m2.has_rtc = True
+    m2.unpack_rtc_blob(blob)
+    check("VBA RTC seconds restored", m2.rtc_s == m.rtc_s)
+    check("VBA RTC minutes restored", m2.rtc_m == m.rtc_m)
+    check("VBA RTC hours restored", m2.rtc_h == m.rtc_h)
+
+    legacy = bytearray(48)
+    legacy[4] = 12
+    legacy[5] = 7
+    legacy[6] = 3
+    legacy[7] = 9
+    legacy[8] = 0x41
+    m3 = MMU()
+    m3.has_rtc = True
+    m3.unpack_rtc_blob(legacy)
+    check("legacy RTC seconds", m3.rtc_s == 12)
+    check("legacy RTC minutes", m3.rtc_m == 7)
+    check("legacy RTC halt bit", m3.rtc_dh & 0x40)
+
+
+def test_cli_errors(ns):
+    """CLI argument handling without opening a display."""
+    import subprocess
+    emu = os.path.join(HERE, "gbc_emulator.py")
+    py = sys.executable
+    ver = subprocess.run([py, emu, "--version"], capture_output=True, text=True)
+    out = (ver.stdout or "") + (ver.stderr or "")
+    check("--version prints 1.0.0", ver.returncode == 0 and "1.0.0" in out)
+    missing = subprocess.run([py, emu, os.path.join(HERE, "no-such-rom.gb")],
+                             capture_output=True, text=True)
+    err = (missing.stdout or "") + (missing.stderr or "")
+    check("missing ROM exits non-zero", missing.returncode != 0)
+    check("missing ROM mentions the path", "not found" in err.lower())
+    nomenu = subprocess.run([py, emu, "--nomenu"], capture_output=True, text=True)
+    nerr = (nomenu.stdout or "") + (nomenu.stderr or "")
+    check("--nomenu without ROM is an error", nomenu.returncode != 0)
+    check("--nomenu error mentions ROM", "rom" in nerr.lower())
+
+
+def test_unsupported_cart_header(ns):
+    _parse_rom_header = ns["_parse_rom_header"]
+    with tempfile.NamedTemporaryFile(suffix=".gb", delete=False) as tf:
+        rom = bytearray(0x200)
+        rom[0x0143] = 0x00
+        rom[0x0147] = 0x22  # MBC7
+        rom[0x0148] = 0x00
+        rom[0x0149] = 0x00
+        tf.write(rom)
+        path = tf.name
+    try:
+        info = _parse_rom_header(path)
+        check("MBC7 header is labelled unsupported", "unsupported" in info.lower())
+    finally:
+        os.unlink(path)
+
+
 def main():
     ns = load_module()
     print("wram/hram fast path:");     test_wram_hram_fast_path(ns)
@@ -340,6 +428,10 @@ def main():
     print("halt skip:");               test_halt_skip(ns)
     print("turbo and reset:");         test_turbo_and_reset(ns)
     print("ui layout:");               test_ui_layout(ns)
+    print("config indices:");          test_config_indices(ns)
+    print("rtc blob:");                test_rtc_blob(ns)
+    print("cli errors:");              test_cli_errors(ns)
+    print("unsupported cart header:"); test_unsupported_cart_header(ns)
     print("\nALL CHECKS PASSED")
 
 

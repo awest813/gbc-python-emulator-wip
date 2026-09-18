@@ -55,12 +55,14 @@ echo "    Z          - A button"
 echo "    X          - B button"
 echo "    Right Shift- Select"
 echo "    Enter      - Start"
-echo "    Escape     - Return to menu / Quit"
+echo "    Escape     - Pause menu (in game) / Back"
+echo "    F6 / F8    - Save state (slot 0 / 1)"
+echo "    F7 / F9    - Load state (slot 0 / 1)"
 echo
 echo "  In menu:  Arrow keys to navigate, Enter to select, Esc to go back"
 echo
 
-"$PY" "$(dirname "$0")/gbc_emulator_skeleton.py"
+"$PY" "$(dirname "$0")/gbc_emulator.py"
 status=$?
 
 if [ $status -ne 0 ]; then

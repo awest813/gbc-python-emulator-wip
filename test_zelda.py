@@ -7,9 +7,9 @@ import imageio
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-src = open(os.path.join(HERE, "gbc_emulator_skeleton.py"), encoding="utf-8").read()
+src = open(os.path.join(HERE, "gbc_emulator.py"), encoding="utf-8").read()
 src = src.split('if __name__')[0]
-exec(compile(src, 'gbc_emulator_skeleton.py', 'exec'))
+exec(compile(src, 'gbc_emulator.py', 'exec'))
 
 if len(sys.argv) < 2:
     print("Usage: python test_zelda.py <path-to-rom>")

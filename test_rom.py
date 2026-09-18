@@ -5,8 +5,8 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 exec(compile(
-    open(os.path.join(HERE, "gbc_emulator_skeleton.py"), encoding="utf-8").read().split("if __name__")[0],
-    "gbc_emulator_skeleton.py", "exec"))
+    open(os.path.join(HERE, "gbc_emulator.py"), encoding="utf-8").read().split("if __name__")[0],
+    "gbc_emulator.py", "exec"))
 
 if len(sys.argv) < 2:
     print("Usage: python test_rom.py <path-to-rom>")

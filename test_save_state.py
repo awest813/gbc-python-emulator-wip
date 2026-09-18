@@ -12,13 +12,16 @@ import os
 import sys
 import tempfile
 
+os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
+os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
-src = open(os.path.join(HERE, "gbc_emulator_skeleton.py"), encoding="utf-8").read()
+src = open(os.path.join(HERE, "gbc_emulator.py"), encoding="utf-8").read()
 src = src.split("if __name__")[0]
 _ns = {}
-exec(compile(src, "gbc_emulator_skeleton.py", "exec"), _ns)
+exec(compile(src, "gbc_emulator.py", "exec"), _ns)
 MMU, CPU, PPU, APU, Timers = (_ns["MMU"], _ns["CPU"], _ns["PPU"], _ns["APU"], _ns["Timers"])
 GameBoy = _ns["GameBoy"]
 PALETTE_DMG = _ns["PALETTE_DMG"]
@@ -142,6 +145,45 @@ def main():
 
         # Loading a missing slot must fail gracefully, not raise.
         check("missing slot load returns False", gb.load_state(3) is False)
+
+        # Cartridge SRAM must round-trip (battery games keep party/inventory).
+        gb.mmu.ram_data = bytearray(0x2000)
+        gb.mmu.has_ram = True
+        gb.mmu.ram_data[0] = 0x42
+        gb.mmu.ram_data[0x1FFF] = 0x99
+        check("save_state with SRAM succeeds", gb.save_state(0) is True)
+        gb.mmu.ram_data[0] = 0x00
+        gb.mmu.ram_data[0x1FFF] = 0x00
+        check("load_state restores SRAM", gb.load_state(0) is True)
+        check("SRAM byte 0 restored", gb.mmu.ram_data[0] == 0x42)
+        check("SRAM last byte restored", gb.mmu.ram_data[0x1FFF] == 0x99)
+
+        # HDMA destination is a full address; saving mid-transfer must not crash.
+        gb.mmu.hdma_src = 0xC000
+        gb.mmu.hdma_dst = 0x8000
+        gb.mmu.hdma_remaining = 32
+        gb.mmu.hdma_active = True
+        dma_left = 40
+        gb.mmu.dma_remaining = dma_left
+        gb.mmu.dma_index = 10
+        check("save_state during HDMA succeeds", gb.save_state(1) is True)
+        check("save_state does not cancel in-flight OAM DMA",
+              gb.mmu.dma_remaining == dma_left)
+        gb.mmu.hdma_dst = 0
+        gb.mmu.hdma_active = False
+        gb.mmu.dma_remaining = 0
+        check("load_state restores HDMA destination", gb.load_state(1) is True)
+        check("HDMA dst restored", gb.mmu.hdma_dst == 0x8000)
+        check("HDMA remaining restored", gb.mmu.hdma_remaining == 32)
+        check("OAM DMA remaining restored", gb.mmu.dma_remaining == dma_left)
+
+        # A truncated / corrupt file must fail without shrinking live memory.
+        corrupt = gb._state_path(0)
+        with open(corrupt, "wb") as f:
+            f.write(b"GBST" + bytes([gb.SAVE_STATE_VERSION, 0, 0, 0]) + b"\x00" * 200)
+        mem_len = len(gb.mmu.memory)
+        check("truncated load returns False", gb.load_state(0) is False)
+        check("truncated load leaves 64KB memory", len(gb.mmu.memory) == mem_len == 0x10000)
 
     if _failures:
         print(f"\n{_failures} CHECK(S) FAILED")

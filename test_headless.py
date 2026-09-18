@@ -25,10 +25,10 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 def load_module():
     """Exec the emulator source (minus its __main__ block) into a namespace."""
-    path = os.path.join(HERE, "gbc_emulator_skeleton.py")
+    path = os.path.join(HERE, "gbc_emulator.py")
     src = open(path, encoding="utf-8").read().split("if __name__")[0]
     ns = {}
-    exec(compile(src, "gbc_emulator_skeleton.py", "exec"), ns)
+    exec(compile(src, "gbc_emulator.py", "exec"), ns)
     return ns
 
 
@@ -457,6 +457,23 @@ def test_gameboy_frame_audio(ns):
         os.unlink(path)
 
 
+def test_mbc1_mode1_low_bank(ns):
+    """MBC1 mode 1 maps 0000-3FFF using the upper bank bits (not always bank 0)."""
+    MMU = ns["MMU"]
+    rom = bytearray(0x100000)  # 1 MB
+    rom[0x0143] = 0x00
+    rom[0x0147] = 0x01  # MBC1
+    rom[0x0148] = 0x05  # 1 MB
+    rom[0x0000] = 0xAA
+    rom[0x20 * 0x4000] = 0xBB  # bank 32
+    m = MMU()
+    m.load_rom(bytes(rom))
+    check("MBC1 mode 0 low bank is ROM bank 0", m.read_byte(0x0000) == 0xAA)
+    m.write_byte(0x6000, 0x01)  # mode 1
+    m.write_byte(0x4000, 0x01)  # upper bits = 1 -> bank 32
+    check("MBC1 mode 1 low bank uses upper bits", m.read_byte(0x0000) == 0xBB)
+
+
 def test_double_speed(ns):
     """KEY1 double-speed must halve the base-clock dots fed to the PPU/APU."""
     GameBoy = ns["GameBoy"]
@@ -657,6 +674,7 @@ def main():
     print("oam dma sprite load:");     test_oam_dma(ns)
     print("apu power and DIV:");       test_apu_power_and_div(ns)
     print("double-speed timing:");     test_double_speed(ns)
+    print("mbc1 mode-1 low bank:");    test_mbc1_mode1_low_bank(ns)
     print("\nALL CHECKS PASSED")
 
 
