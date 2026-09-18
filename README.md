@@ -108,6 +108,12 @@ python gbc_emulator_skeleton.py path/to/rom.gb --nomenu
 | Right Shift    | Select        |
 | Enter          | Start         |
 | Escape         | Pause menu (in game) / Back |
+| Tab            | Fast-forward (hold) |
+| Q / `,`        | Turbo A |
+| E / `.`        | Turbo B |
+| F3             | Toggle FPS overlay |
+| F4             | Toggle input overlay |
+| Ctrl+R         | Soft reset |
 | F5 (in menu)   | Refresh ROMs  |
 | F6 / F8        | Save state (slot 0 / 1) |
 | F7 / F9        | Load state (slot 0 / 1) |
@@ -127,6 +133,7 @@ Gamepads are auto-detected and use Xbox/PlayStation layout by default:
 | B / Circle / X / LB | B        |
 | Select / Share | Select        |
 | Start / Options | Start        |
+| R3 (stick click)| Fast-forward |
 | Select + Start | Pause menu    |
 | Escape         | Pause menu    |
 
@@ -216,6 +223,8 @@ Performance-critical helpers:
   the I/O decode chain on the hottest CPU read/write path.
 - Silent APU frames emit a single bulk zero-fill instead of mixing 700+
   empty samples per video frame.
+- Halted CPUs skip ahead to the next PPU mode or TIMA event instead of
+  burning 4 T-cycles per `step_all` call (~17k times per frame).
 
 ## Project Layout
 

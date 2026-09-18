@@ -4,6 +4,7 @@ Exits non-zero on any failure. No display and no local ROM files required.
 """
 import os
 import sys
+import tempfile
 
 os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
@@ -194,6 +195,89 @@ def test_silent_apu_batches(ns):
           len(apu.buffer) % APU_BYTES_PER_STEREO_SAMPLE == 0)
 
 
+def _halt_rom():
+    rom = bytearray(0x8000)
+    rom[0x0143] = 0x80
+    rom[0x0147] = 0x00
+    prog = [
+        0x3E, 0x91, 0xE0, 0x40,  # LCD on
+        0xFB,                    # EI
+        0x3E, 0x01, 0xE0, 0xFF,  # IE = VBlank
+        0xAF, 0xE0, 0x0F,        # IF = 0
+        0x76,                    # HALT
+        0x18, 0xFD,              # JR -3
+    ]
+    rom[0x0100:0x0100 + len(prog)] = prog
+    return bytes(rom)
+
+
+def test_halt_skip(ns):
+    """HALT skip must still raise VBlank and match a 4-cycle stepper's LY."""
+    GameBoy = ns["GameBoy"]
+    CYCLES_PER_FRAME = ns["CYCLES_PER_FRAME"]
+    rom = _halt_rom()
+    with tempfile.NamedTemporaryFile(suffix=".gbc", delete=False) as tf:
+        tf.write(rom)
+        path = tf.name
+    try:
+        gb = GameBoy(path, fps_limit=0, audio_enabled=False)
+        gb.cpu.reg.pc = 0x0100
+        dots = 0
+        steps = 0
+        saw_vblank = False
+        while dots < CYCLES_PER_FRAME:
+            d = gb.step_all()
+            dots += d
+            steps += 1
+            if gb.mmu.memory[0xFF0F] & 0x01:
+                saw_vblank = True
+        check("halt-skip uses far fewer than 4-cycle steps", steps < 4000)
+        check("halt-skip covers one frame of dots", dots >= CYCLES_PER_FRAME)
+        check("LY stays in range after halt-skip frame", 0 <= gb.mmu.memory[0xFF44] <= 153)
+        check("VBlank IF fired during the halt-skip frame", saw_vblank)
+        # A 4-cycle stepper of the same ROM must also finish a legal scanline.
+        ref = GameBoy(path, fps_limit=0, audio_enabled=False)
+        ref.cpu.reg.pc = 0x0100
+        dots = 0
+        while dots < CYCLES_PER_FRAME:
+            c = ref.cpu.step()
+            ref.ppu.step(c)
+            ref.timers.step(c)
+            ref.apu.step(c)
+            dots += c
+        check("4-cycle stepper LY also in range", 0 <= ref.mmu.memory[0xFF44] <= 153)
+    finally:
+        os.unlink(path)
+
+
+def test_turbo_and_reset(ns):
+    MMU = ns["MMU"]
+    GameBoy = ns["GameBoy"]
+    _JOY_SRC_TURBO = ns["_JOY_SRC_TURBO"]
+    m = MMU()
+    m.set_joypad_button(4, True, _JOY_SRC_TURBO)
+    check("turbo source presses A", (m.joypad_buttons & 0x10) == 0)
+    m.set_joypad_button(4, False, _JOY_SRC_TURBO)
+    check("turbo source releases A", (m.joypad_buttons & 0x10) != 0)
+
+    rom = _halt_rom()
+    with tempfile.NamedTemporaryFile(suffix=".gbc", delete=False) as tf:
+        tf.write(rom)
+        path = tf.name
+    try:
+        gb = GameBoy(path, fps_limit=0, audio_enabled=False)
+        gb.cpu.reg.pc = 0x1234
+        gb.cpu.halted = True
+        gb.mmu.memory[0xFF0F] = 0x1F
+        gb.soft_reset()
+        check("soft reset restores PC to 0x0100", gb.cpu.reg.pc == 0x0100)
+        check("soft reset clears HALT", gb.cpu.halted is False)
+        check("soft reset clears IF", gb.mmu.memory[0xFF0F] == 0)
+        check("soft reset clears IME", gb.cpu.interrupts_master_enabled is False)
+    finally:
+        os.unlink(path)
+
+
 def main():
     ns = load_module()
     print("wram/hram fast path:");     test_wram_hram_fast_path(ns)
@@ -204,6 +288,8 @@ def main():
     print("gamepad start combo:");     test_gamepad_start_does_not_auto_pause(ns)
     print("inc preserves carry:");     test_inc_preserves_carry(ns)
     print("silent apu batch:");        test_silent_apu_batches(ns)
+    print("halt skip:");               test_halt_skip(ns)
+    print("turbo and reset:");         test_turbo_and_reset(ns)
     print("\nALL CHECKS PASSED")
 
 

@@ -240,8 +240,9 @@ _JOY_SRC_KB = 0
 _JOY_SRC_HAT = 1
 _JOY_SRC_AXIS = 2
 _JOY_SRC_BTN = 3
+_JOY_SRC_TURBO = 4
 _RESERVED_REMAP_KEY_NAMES = frozenset({
-    'escape', 'f5', 'f6', 'f7', 'f8', 'f9',
+    'escape', 'tab', 'f2', 'f3', 'f4', 'f5', 'f6', 'f7', 'f8', 'f9',
 })
 
 def _init_joysticks():
@@ -1456,10 +1457,10 @@ class MMU:
         self.num_rom_banks = 2
         self.num_ram_banks = 0
         self.joypad_buttons = 0xFF
-        # Independent input sources (keyboard / hat / stick / pad buttons).
+        # Independent input sources (keyboard / hat / stick / pad buttons / turbo).
         # Combined as AND because 0 = pressed. Stops analog-stick release
         # from eating a still-held D-pad or keyboard direction.
-        self._joy_src = [0xFF, 0xFF, 0xFF, 0xFF]
+        self._joy_src = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF]
         self._dpad_last = [0, 2]  # last-wins SOCD: horiz bit, vert bit
         self.div_reset_callback = None
         self.apu = None
@@ -1694,12 +1695,14 @@ class MMU:
 
     def release_all_joypad(self):
         """Clear every input source (used when opening the pause menu)."""
-        self._joy_src = [0xFF, 0xFF, 0xFF, 0xFF]
+        self._joy_src = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF]
         self.joypad_buttons = 0xFF
 
     def _recompute_joypad(self):
         src = self._joy_src
         new_state = src[0] & src[1] & src[2] & src[3]
+        if len(src) > 4:
+            new_state &= src[4]
         # Last-wins SOCD: if both sides of an axis are down, keep the latest.
         if (new_state & 0x03) == 0:
             new_state |= (0x02 if self._dpad_last[0] == 0 else 0x01)
@@ -3957,7 +3960,7 @@ class EmulatorMenu:
         hint = "Press a key to bind  |  Esc: Cancel" if self.controls_capture else \
             "Enter: Remap / Toggle  |  Esc: Back"
         self._centre_text(hint, MENU_H - 30, MENU_DIM, 18)
-        self._centre_text("Gamepad: Start in-game  |  Select+Start: Pause  |  Esc: Pause",
+        self._centre_text("Tab: Fast-forward  |  F3: FPS  |  F4: Input  |  Ctrl+R: Reset",
                           MENU_H - 52, MENU_DIM, 16)
 
     def _render_confirm_exit(self):
@@ -4073,6 +4076,14 @@ class GameBoy:
         self.key_bindings = _rebuild_key_map(cfg.get('key_bindings'), self.wasd_enabled)
         self.controls_capture = None
         self.pause_controls_cursor = 0
+        self._fast_forward = False
+        self._show_fps = False
+        self._show_input = False
+        self._fps_frames = 0
+        self._fps_t0 = time.perf_counter()
+        self._fps_value = 0.0
+        self._turbo_phase = 0
+        self._frame_index = 0
         self._set_idx = {
             'scale':   _opt_index(WINDOW_SCALE_OPTIONS, window_scale, 2),
             'fps':     _opt_index(FPS_LIMIT_OPTIONS, fps_limit, 0),
@@ -4378,7 +4389,7 @@ class GameBoy:
             self._has_rtc = mmu.has_rtc
             mmu.is_cgb = bool(is_cgb)
             mmu.joypad_buttons = joypad
-            mmu._joy_src = [joypad, 0xFF, 0xFF, 0xFF]
+            mmu._joy_src = [joypad, 0xFF, 0xFF, 0xFF, 0xFF]
             mmu.serial_data = serial_data
             mmu.serial_control = serial_control
             mmu.vram_bank_select = vram_bank_select & 1
@@ -4597,6 +4608,42 @@ class GameBoy:
             self._sync_samples = 0
             self._sync_frames = 0
 
+    def _halt_cpu_cycles(self):
+        """How many CPU T-cycles a halted CPU can sleep before the next event.
+
+        Stops at the next PPU mode/scanline boundary (STAT/VBlank sources) and
+        at the next TIMA increment so interrupt wake-up is not delayed.
+        """
+        ppu = self.ppu
+        mem = self.mmu.memory
+        sd = ppu.scanline_dot
+        remain = DOTS_PER_SCANLINE - sd
+        if remain < 1:
+            remain = 1
+        if ppu.lcd_was_on and (mem[0xFF40] & 0x80):
+            ly = mem[0xFF44]
+            if ly < 144:
+                if sd < MODE3_START_DOT:
+                    remain = min(remain, MODE3_START_DOT - sd)
+                else:
+                    m3 = MODE3_START_DOT + ppu.mode3_duration
+                    if sd < m3:
+                        remain = min(remain, m3 - sd)
+        tac = mem[0xFF07]
+        if tac & 0x04:
+            rate = self.timers._TIMA_RATES[tac & 0x03]
+            until = rate - self.timers.tima_accum
+            if until < 1:
+                until = 1
+            remain = min(remain, until)
+        if self.mmu.key1 & 0x80:
+            cpu_cycles = remain * 2 - self.speed_remainder
+            if cpu_cycles < 1:
+                cpu_cycles = 1
+        else:
+            cpu_cycles = remain
+        return cpu_cycles
+
     def step_all(self):
         """Execute one CPU step and propagate cycles to PPU, timers, and APU."""
         mmu = self.mmu
@@ -4610,10 +4657,16 @@ class GameBoy:
                 mmu.memory[0xFE00:0xFEA0] = mmu.dma_buffer
                 mmu.dma_buffer = bytearray()
         else:
-            cpu_cycles = self.cpu.step()
-            if mmu.gdma_stall > 0:
-                cpu_cycles += mmu.gdma_stall
-                mmu.gdma_stall = 0
+            cpu = self.cpu
+            mem = mmu.memory
+            if (cpu.halted and mmu.gdma_stall == 0
+                    and not (mem[0xFFFF] & mem[0xFF0F])):
+                cpu_cycles = self._halt_cpu_cycles()
+            else:
+                cpu_cycles = cpu.step()
+                if mmu.gdma_stall > 0:
+                    cpu_cycles += mmu.gdma_stall
+                    mmu.gdma_stall = 0
         # CGB double-speed (KEY1)
         if mmu.key1 & 0x80:
             self.speed_remainder += cpu_cycles
@@ -4648,6 +4701,8 @@ class GameBoy:
         self._sync_samples = 0
         self._sync_frames = 0
         self._cycle_carry = 0
+        self._fps_t0 = time.perf_counter()
+        self._fps_frames = 0
         if pygame:
             pygame.key.set_repeat()  # disable key-repeat so held keys don't retrigger
 
@@ -4657,18 +4712,24 @@ class GameBoy:
             while cycles_this_frame < CYCLES_PER_FRAME:
                 cycles_this_frame += self.step_all()
             self._cycle_carry = cycles_this_frame - CYCLES_PER_FRAME
+            self._frame_index += 1
 
             samples_this_frame = 0
             if pygame:
                 self.handle_events()
-                self.render()
+                self._apply_turbo()
+                skip_blit = self._fast_forward and (self._frame_index & 3)
+                if not skip_blit:
+                    self.render()
                 samples_this_frame = self._flush_audio()
 
             if self.paused and pygame:
                 self._pause_menu_loop()
                 continue
 
-            self._pace_frame(samples_this_frame)
+            self._tick_fps()
+            if not self._fast_forward:
+                self._pace_frame(samples_this_frame)
 
         self._save_sav()
         if self.mmu.link_cable is not None:
@@ -4707,14 +4768,31 @@ class GameBoy:
                     else:
                         self._status_msg = "No save state in slot 1"
                     self._status_ttl = 90
+                elif event.key == pygame.K_F3:
+                    self._show_fps = not self._show_fps
+                    self._status_msg = "FPS overlay on" if self._show_fps else "FPS overlay off"
+                    self._status_ttl = 60
+                elif event.key == pygame.K_F4:
+                    self._show_input = not self._show_input
+                    self._status_msg = "Input overlay on" if self._show_input else "Input overlay off"
+                    self._status_ttl = 60
+                elif event.key == pygame.K_TAB:
+                    self._fast_forward = True
+                elif event.key == pygame.K_r and (event.mod & pygame.KMOD_CTRL):
+                    self.soft_reset()
                 elif event.key in KEY_TO_JOYPAD_BIT:
                     self.mmu.set_joypad_button(
                         KEY_TO_JOYPAD_BIT[event.key], True, _JOY_SRC_KB)
             elif event.type == pygame.KEYUP:
-                if event.key in KEY_TO_JOYPAD_BIT:
+                if event.key == pygame.K_TAB:
+                    self._fast_forward = False
+                elif event.key in KEY_TO_JOYPAD_BIT:
                     self.mmu.set_joypad_button(
                         KEY_TO_JOYPAD_BIT[event.key], False, _JOY_SRC_KB)
             elif event.type == pygame.JOYBUTTONDOWN:
+                if event.button == 9:
+                    self._fast_forward = True
+                    continue
                 if event.button == 7 and not (self.mmu._joy_src[_JOY_SRC_BTN] & (1 << 6)):
                     # Select is already held: Select+Start opens the pause menu
                     # instead of injecting Start into the game.
@@ -4724,6 +4802,8 @@ class GameBoy:
                 if bit is not None:
                     self.mmu.set_joypad_button(bit, True, _JOY_SRC_BTN)
             elif event.type == pygame.JOYBUTTONUP:
+                if event.button == 9:
+                    self._fast_forward = False
                 bit = _GAMEPAD_BUTTON_MAP.get(event.button)
                 if bit is not None:
                     self.mmu.set_joypad_button(bit, False, _JOY_SRC_BTN)
@@ -4784,8 +4864,128 @@ class GameBoy:
                 axis = _axis_pair(7, 3, 2, axis)
             except pygame.error:
                 continue
-        self.mmu._joy_src = [kb, hat, axis, padbtn]
+        self.mmu._joy_src = [kb, hat, axis, padbtn, 0xFF]
         self.mmu._recompute_joypad()
+
+    def _apply_turbo(self):
+        """Hold Q/E (or comma/period) to auto-fire A/B at 30 Hz."""
+        if not pygame:
+            return
+        pressed = pygame.key.get_pressed()
+        turbo_a = bool(pressed[pygame.K_q] or pressed[pygame.K_COMMA])
+        turbo_b = bool(pressed[pygame.K_e] or pressed[pygame.K_PERIOD])
+        self._turbo_phase ^= 1
+        fire = bool(self._turbo_phase)
+        mask = 0xFF
+        if turbo_a and fire:
+            mask &= ~(1 << 4)
+        if turbo_b and fire:
+            mask &= ~(1 << 5)
+        src = self.mmu._joy_src
+        if len(src) < 5:
+            src.extend([0xFF] * (5 - len(src)))
+        if src[_JOY_SRC_TURBO] != mask:
+            src[_JOY_SRC_TURBO] = mask
+            self.mmu._recompute_joypad()
+
+    def _tick_fps(self):
+        self._fps_frames += 1
+        now = time.perf_counter()
+        dt = now - self._fps_t0
+        if dt >= 0.4:
+            self._fps_value = self._fps_frames / dt
+            self._fps_frames = 0
+            self._fps_t0 = now
+
+    def soft_reset(self):
+        """Reset CPU/PPU/APU to post-boot state without wiping cartridge RAM."""
+        cpu = self.cpu
+        cpu.halted = False
+        cpu.interrupts_master_enabled = False
+        cpu.ime_pending = False
+        cpu.halt_bug_pending = False
+        cpu.reg.sp = 0xFFFE
+        cpu.reg.pc = 0x0100
+        if self.mmu.is_cgb:
+            cpu.reg.a = 0x11
+            cpu.reg.f = 0x80
+            cpu.reg.b = 0x00
+            cpu.reg.c = 0x00
+            cpu.reg.d = 0xFF
+            cpu.reg.e = 0x56
+            cpu.reg.h = 0x00
+            cpu.reg.l = 0x0D
+        else:
+            cpu.reg.a = 0x01
+            cpu.reg.f = 0xB0
+            cpu.reg.b = 0x00
+            cpu.reg.c = 0x13
+            cpu.reg.d = 0x00
+            cpu.reg.e = 0xD8
+            cpu.reg.h = 0x01
+            cpu.reg.l = 0x4D
+        mem = self.mmu.memory
+        mem[0xFF0F] = 0x00
+        mem[0xFFFF] = 0x00
+        mem[0xFF44] = 0x00
+        self.mmu.dma_remaining = 0
+        self.mmu.hdma_active = False
+        self.mmu.gdma_stall = 0
+        ppu = self.ppu
+        ppu.scanline_dot = 0
+        ppu.mode = 2
+        ppu.lcd_was_on = False
+        ppu.window_line_counter = 0
+        ppu.window_active = False
+        ppu.prev_stat_irq = False
+        self.timers.div_counter = 0
+        self.timers.tima_accum = 0
+        mem[0xFF04] = 0
+        self.apu.drain()
+        if hasattr(self, '_audio_pending'):
+            self._audio_pending.clear()
+        self.speed_remainder = 0
+        self._cycle_carry = 0
+        self._av_start = time.perf_counter()
+        self._sync_samples = 0
+        self._sync_frames = 0
+        self._status_msg = "Reset"
+        self._status_ttl = 90
+
+    def _draw_hud(self):
+        """FPS / input / fast-forward overlays drawn after the scaled frame."""
+        if not pygame or getattr(self, 'screen', None) is None:
+            return
+        lines = []
+        if getattr(self, '_fast_forward', False):
+            lines.append("FF >>")
+        if getattr(self, '_show_fps', False):
+            lines.append(f"{getattr(self, '_fps_value', 0.0):.0f} fps")
+        if getattr(self, '_show_input', False):
+            jp = self.mmu.joypad_buttons
+            bits = []
+            names = ('R', 'L', 'U', 'D', 'A', 'B', 'Se', 'St')
+            for i, name in enumerate(names):
+                if (jp & (1 << i)) == 0:
+                    bits.append(name)
+            lines.append(' '.join(bits) if bits else '-')
+        if not lines:
+            return
+        try:
+            f = get_font(20)
+            y = 8
+            for text in lines:
+                s = f.render(text, True, MENU_HI)
+                bg = pygame.Surface((s.get_width() + 12, s.get_height() + 6))
+                bg.fill(MENU_BG)
+                bg.set_alpha(200)
+                x = self.screen.get_width() - bg.get_width() - 8
+                self.screen.blit(bg, (x, y))
+                pygame.draw.rect(self.screen, MENU_HI, (x, y, bg.get_width(), bg.get_height()), 1)
+                self.screen.blit(s, (x + 6, y + 3))
+                y += bg.get_height() + 4
+        except (pygame.error, AttributeError):
+            pass
 
     # ── In-game pause menu ────────────────────────────────────────────
     PAUSE_ITEMS = ["Resume", "Save State", "Load State", "Settings", "Exit to Menu"]
@@ -4798,6 +4998,7 @@ class GameBoy:
         self.pause_exit_cursor = 0
         self.pause_controls_cursor = 0
         self.controls_capture = None
+        self._fast_forward = False
 
     def _pause_status(self, msg):
         self._pause_msg = msg
@@ -5166,7 +5367,7 @@ class GameBoy:
                 self.screen.blit(s, (16, 12))
             except (pygame.error, AttributeError):
                 pass
-            self._status_ttl -= 1
+        self._draw_hud()
         pygame.display.flip()
 
 if __name__ == "__main__":
