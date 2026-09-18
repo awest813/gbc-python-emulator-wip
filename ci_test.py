@@ -13,9 +13,11 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 
+python = sys.executable
 tests = [
-    ["python", os.path.join(HERE, "test_headless.py")],
-    ["python", os.path.join(HERE, "test_save_state.py")],
+    [python, os.path.join(HERE, "test_headless.py")],
+    [python, os.path.join(HERE, "test_save_state.py")],
+    [python, os.path.join(HERE, "test_controls.py")],
 ]
 
 failed = 0

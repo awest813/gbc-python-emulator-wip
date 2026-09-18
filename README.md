@@ -102,6 +102,7 @@ python gbc_emulator_skeleton.py path/to/rom.gb --nomenu
 | Key            | GB Button     |
 | -------------- | ------------- |
 | Arrow keys     | D-pad         |
+| W A S D        | D-pad (toggle in Controls) |
 | Z              | A             |
 | X              | B             |
 | Right Shift    | Select        |
@@ -111,16 +112,27 @@ python gbc_emulator_skeleton.py path/to/rom.gb --nomenu
 | F6 / F8        | Save state (slot 0 / 1) |
 | F7 / F9        | Load state (slot 0 / 1) |
 
+Keys are customisable: **Settings → Controls...** (also available from the
+in-game pause menu). Press Enter on a button to capture a new key. Esc, F5–F9
+are reserved. Bindings are stored in `gbc_config.json`.
+
 ### Gamepad / Controller
 Gamepads are auto-detected and use Xbox/PlayStation layout by default:
 
 | Gamepad        | GB Button     |
 | -------------- | ------------- |
 | D-pad          | D-pad         |
-| A / Cross      | A             |
-| B / Circle     | B             |
+| Left stick     | D-pad         |
+| A / Cross / Y / RB | A         |
+| B / Circle / X / LB | B        |
 | Select / Share | Select        |
-| Start / Options | Start (also opens pause menu) |
+| Start / Options | Start        |
+| Select + Start | Pause menu    |
+| Escape         | Pause menu    |
+
+D-pad, analog stick, and keyboard are tracked as separate sources so releasing
+the stick cannot un-press a still-held D-pad or key. Opposite directions on the
+same axis use last-wins cleaning (hardware cannot press Left+Right together).
 
 ## Link Cable (Local Multiplayer)
 
@@ -136,9 +148,9 @@ python gbc_emulator_skeleton.py rom.gbc --nomenu --link-connect 127.0.0.1:12345
 
 ## Settings Persistence
 
-All menu settings (scale, volume, palette, shader, audio toggle, frame rate)
-are saved to `gbc_config.json` and reloaded on next launch.  The file is
-created automatically in the emulator directory.
+All menu settings (scale, volume, palette, shader, audio toggle, frame rate,
+key bindings) are saved to `gbc_config.json` and reloaded on next launch.  The
+file is created automatically in the emulator directory.
 
 ## Menu
 
@@ -151,6 +163,7 @@ created automatically in the emulator directory.
   - *Palette* — DMG Green / Grayscale / Amber / Blue / Brown / Pastel
   - *Filter* — Nearest (pixel-sharp) / Smooth (bilinear)
   - *Shader* — Off / LCD Ghost / CRT Scanlines / Gamma Warm / Pixel Bloom / Pocket Green
+  - *Controls...* — Remap keyboard keys, toggle WASD D-pad, reset to defaults
 - **Exit to OS** — Quit the emulator (with a confirmation prompt).
 
 ## Pause menu
@@ -162,7 +175,7 @@ Emulation and audio halt, and the current frame is dimmed behind the menu:
 - **Save State** / **Load State** — Quick-save or restore slot 0.
 - **Settings** — The same options as the main settings page, applied
   **live** to the running game (palette, shader, filter, volume, audio,
-  frame rate, and window scale all update immediately).
+  frame rate, window scale, and Controls remapping all update immediately).
 - **Exit to Menu** — Return to the main menu, with a confirmation prompt.
   Your battery save (`.sav`) is written out on the way back.
 
@@ -199,12 +212,18 @@ Performance-critical helpers:
   assignment per pixel, but the per-frame host blit unpacks the whole
   frame with a vectorised numpy shift instead of iterating 23 040 tuples
   (~2.5× faster render-to-surface path).
+- Direct WRAM (`C000–DFFF`) and HRAM/IE (`FF80–FFFF`) memory accessors skip
+  the I/O decode chain on the hottest CPU read/write path.
+- Silent APU frames emit a single bulk zero-fill instead of mixing 700+
+  empty samples per video frame.
 
 ## Project Layout
 
 ```
 gbc_emulator_skeleton.py   Single-file emulator (CPU, MMU, PPU, Timers, menu, runner)
 test_headless.py           Self-contained smoke test (synthetic ROM, no display)
+test_save_state.py         Save-state round-trip test (synthetic CGB ROM)
+test_controls.py           Joypad sources, SOCD, key bindings, WRAM fast-path
 requirements.txt           Pinned dependency list (pygame, numpy)
 run.bat                    Windows launcher (installs deps if missing, then runs)
 run.sh                     Linux / macOS launcher (bash, installs deps if missing)
@@ -235,6 +254,14 @@ are restored exactly:
 
 ```bash
 python test_save_state.py
+```
+
+A third portable test covers input: multi-source joypad combining (keyboard
+does not get un-pressed when an analog stick recenters), last-wins opposite
+D-pad cleaning, customisable key bindings, and WRAM/HRAM write fast-paths:
+
+```bash
+python test_controls.py
 ```
 
 Both tests are self-contained (no display, no local ROMs) and exit
