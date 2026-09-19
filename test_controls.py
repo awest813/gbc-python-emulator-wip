@@ -294,6 +294,7 @@ def test_controls_rows(ns):
     wasd = ns["CONTROLS_WASD_ROW"]
     turbo = ns["CONTROLS_TURBO_ROW"]
     reset = ns["CONTROLS_RESET_ROW"]
+    advance = ns["_advance_controls_cursor"]
     check("controls WASD row index", wasd == len(keys))
     check("controls turbo row index", turbo == wasd + 1)
     check("controls reset row index", reset == wasd + 2)
@@ -301,6 +302,9 @@ def test_controls_rows(ns):
     items = menu._controls_items()
     check("turbo row is informational", items[turbo].startswith("Turbo"))
     check("reset is last controls row", items[reset] == "Reset to Default")
+    n = len(items)
+    check("down from WASD skips turbo", advance(wasd, 1, n) == reset)
+    check("up from reset skips turbo", advance(reset, -1, n) == wasd)
 
 
 def test_ui_layout(ns):

@@ -281,6 +281,14 @@ JOYPAD_BUTTON_KEYS = ('right', 'left', 'up', 'down', 'a', 'b', 'select', 'start'
 CONTROLS_WASD_ROW = len(JOYPAD_BUTTON_KEYS)
 CONTROLS_TURBO_ROW = CONTROLS_WASD_ROW + 1
 CONTROLS_RESET_ROW = CONTROLS_WASD_ROW + 2
+
+
+def _advance_controls_cursor(cursor, delta, n_items):
+    """Move the controls-menu cursor, skipping the informational turbo row."""
+    nxt = (cursor + delta) % n_items
+    if nxt == CONTROLS_TURBO_ROW:
+        nxt = (nxt + delta) % n_items
+    return nxt
 JOYPAD_BUTTON_LABELS = ('Right', 'Left', 'Up', 'Down', 'A', 'B', 'Select', 'Start')
 DEFAULT_KEY_BINDINGS = {
     'right':  ['right', 'd'],
@@ -2978,6 +2986,7 @@ class PPU:
         # the rest of the frame even if WY is changed, matching hardware.
         self.window_active = False
         self._scanline_sprites = None  # OAM hits reused between mode-3 entry and sprite pass
+        self._scanline_sprite_height = None
         self._bg_rgb = [0] * 32
         self._obj_rgb = [0] * 32
         unsigned_addrs = tuple(0x8000 + i * 16 for i in range(256))
@@ -3175,8 +3184,10 @@ class PPU:
         if self.is_cgb or (lcdc & 0x01) or (lcdc & 0x20) or (lcdc & 0x02):
             # Reuse the OAM scan for the sprite render pass on this line.
             self._scanline_sprites = sprites if (lcdc & 0x02) else None
+            self._scanline_sprite_height = sprite_height if (lcdc & 0x02) else None
             self._render_scanline(ly, lcdc)
             self._scanline_sprites = None
+            self._scanline_sprite_height = None
         self.mode = 3
         stat = (mem[0xFF41] & 0xFC) | 3
         mem[0xFF41] = stat
@@ -3602,7 +3613,7 @@ class PPU:
             return
         sprite_height = 16 if (lcdc & 0x04) else 8
         sprites = self._scanline_sprites
-        if sprites is None:
+        if sprites is None or self._scanline_sprite_height != sprite_height:
             sprites = self._scanline_oam(ly, sprite_height)
         # CGB: OAM index priority (OPRI=0). DMG / CGB with OPRI=1: sort by X.
         if not self.is_cgb or self.cgb_opri:
@@ -5060,11 +5071,13 @@ class EmulatorMenu:
             elif page == "controls":
                 items = self._controls_items()
                 if action == pygame.K_UP or action == 'up':
-                    self.controls_cursor = (self.controls_cursor - 1) % len(items)
+                    self.controls_cursor = _advance_controls_cursor(
+                        self.controls_cursor, -1, len(items))
                     self.controls_scroll, _ = _sync_list_scroll(
                         self.controls_cursor, self.controls_scroll, 8, len(items))
                 elif action == pygame.K_DOWN or action == 'down':
-                    self.controls_cursor = (self.controls_cursor + 1) % len(items)
+                    self.controls_cursor = _advance_controls_cursor(
+                        self.controls_cursor, 1, len(items))
                     self.controls_scroll, _ = _sync_list_scroll(
                         self.controls_cursor, self.controls_scroll, 8, len(items))
                 elif action == pygame.K_RETURN or action == 'select':
@@ -5075,6 +5088,8 @@ class EmulatorMenu:
                         self.wasd_enabled = not self.wasd_enabled
                         self.key_bindings = _sanitize_key_bindings(self.key_bindings, self.wasd_enabled)
                         self._persist_controls()
+                    elif self.controls_cursor == CONTROLS_TURBO_ROW:
+                        self._status("Turbo A/B: Q/E (not remappable)")
                     elif self.controls_cursor == CONTROLS_RESET_ROW:
                         self.wasd_enabled = True
                         self.key_bindings = _default_key_bindings(True)
@@ -5846,7 +5861,10 @@ class GameBoy:
 
     def _restore_post_load(self, ver=None):
         """Clear stale caches and re-sync live input sources after load_state."""
-        self.ppu._scanline_sprites = None
+        ppu = self.ppu
+        ppu._scanline_sprites = None
+        ppu._scanline_sprite_height = None
+        ppu.bg_palette_idx[:] = b'\x00' * len(ppu.bg_palette_idx)
         self._sanitize_serial_after_load()
         if ver is not None and ver < 7:
             self._reset_sgb_fsm()
@@ -5917,6 +5935,17 @@ class GameBoy:
             return None
         base = os.path.splitext(self.mmu.rom_path)[0]
         return f"{base}.ss{slot}"
+
+    def _rom_identity_ok(self, name_len, full_len, saved_name):
+        """Return True when a v4+ save header matches the loaded ROM basename."""
+        if not name_len:
+            return True
+        current_base = os.path.basename(self.mmu.rom_path or '')
+        current_name = current_base.encode('utf-8', 'replace')[:31]
+        current_full_len = min(len(current_base.encode('utf-8', 'replace')), 255)
+        if saved_name != current_name[:name_len]:
+            return False
+        return not (full_len and current_full_len != full_len)
 
     def _state_toast(self, action, slot, ok):
         detail = getattr(self, '_last_state_detail', None)
@@ -6154,12 +6183,7 @@ class GameBoy:
                 name_len = data[6]
                 full_len = data[7]
                 saved_name = bytes(data[8:8 + name_len])
-                current_base = os.path.basename(self.mmu.rom_path or '')
-                current_name = current_base.encode('utf-8', 'replace')[:31]
-                current_full_len = len(current_base.encode('utf-8', 'replace'))
-                if name_len and (
-                        saved_name != current_name[:name_len]
-                        or (full_len and current_full_len != full_len)):
+                if not self._rom_identity_ok(name_len, full_len, saved_name):
                     self._last_state_error = 'wrong_rom'
                     return False
                 pos = self._state_header_bytes(ver)
@@ -6414,6 +6438,8 @@ class GameBoy:
                 elif len(mmu.ram_data) > 0:
                     n = min(len(mmu.ram_data), ram_len)
                     mmu.ram_data[:n] = ram_blob[:n]
+                    if ram_len < len(mmu.ram_data):
+                        mmu.ram_data[ram_len:] = b'\x00' * (len(mmu.ram_data) - ram_len)
             if ver >= 3:
                 fmt = '<BHHBBBB'
                 _need(struct.calcsize(fmt), "serial_sgb")
@@ -6452,6 +6478,8 @@ class GameBoy:
                     if len(mmu.flash_data) < flash_len:
                         mmu.flash_data = bytearray(flash_len)
                     mmu.flash_data[:flash_len] = data[pos:pos + flash_len]
+                    if flash_len < len(mmu.flash_data):
+                        mmu.flash_data[flash_len:] = b'\x00' * (len(mmu.flash_data) - flash_len)
                 pos += flash_len
                 fmt = '<BBHHBBBB'
                 _need(struct.calcsize(fmt), "mbc7")
@@ -7240,11 +7268,13 @@ class GameBoy:
                 items = self._pause_controls_items()
                 cap = _overlay_scroll_capacity(*self.screen.get_size(), has_status=True)
                 if action in (pygame.K_UP, 'up'):
-                    self.pause_controls_cursor = (self.pause_controls_cursor - 1) % len(items)
+                    self.pause_controls_cursor = _advance_controls_cursor(
+                        self.pause_controls_cursor, -1, len(items))
                     self.pause_controls_scroll, _ = _sync_list_scroll(
                         self.pause_controls_cursor, self.pause_controls_scroll, cap, len(items))
                 elif action in (pygame.K_DOWN, 'down'):
-                    self.pause_controls_cursor = (self.pause_controls_cursor + 1) % len(items)
+                    self.pause_controls_cursor = _advance_controls_cursor(
+                        self.pause_controls_cursor, 1, len(items))
                     self.pause_controls_scroll, _ = _sync_list_scroll(
                         self.pause_controls_cursor, self.pause_controls_scroll, cap, len(items))
                 elif action == pygame.K_RETURN or action == 'select':
@@ -7259,6 +7289,8 @@ class GameBoy:
                             'wasd_enabled': self.wasd_enabled,
                         }):
                             self._pause_status("Could not save settings")
+                    elif self.pause_controls_cursor == CONTROLS_TURBO_ROW:
+                        self._pause_status("Turbo A/B: Q/E (not remappable)")
                     elif self.pause_controls_cursor == CONTROLS_RESET_ROW:
                         self.wasd_enabled = True
                         self.key_bindings = _default_key_bindings(True)
@@ -7432,7 +7464,7 @@ class GameBoy:
                 backdrop, "Save States", self.SAVE_STATE_ITEMS,
                 self.pause_save_cursor,
                 self._pause_hint("Enter: Save/Load   Esc: Back   F6-F9: Quick keys",
-                                 "Enter: Save/Load   Esc: Back"),
+                                 "Enter: Save/Load   Esc: Back   F6-F9"),
                 status=status, status_hi=True)
         elif page == "confirm_exit":
             self._draw_overlay_menu(
@@ -7447,7 +7479,7 @@ class GameBoy:
                 self.pause_cursor,
                 self._pause_hint(
                     "Up/Down: Move   Enter: Select   Esc: Resume   F6-F9: Save/Load",
-                    "Enter: Select   Esc: Resume"),
+                    "Enter: Select   Esc: Resume   F6-F9"),
                 status=status, status_hi=True)
 
     def render(self, overlays=True):

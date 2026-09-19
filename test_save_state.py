@@ -337,6 +337,29 @@ def main():
         check("legacy v6 load clears sgb_bit_count", gb.mmu.sgb_bit_count == 0)
         check("legacy v6 load clears sgb_cmd", gb.mmu.sgb_cmd == 0)
 
+        # Basenames longer than 255 UTF-8 bytes must not false-reject on load.
+        long_base = ('x' * 256) + '.gbc'
+        long_name = long_base.encode('utf-8', 'replace')[:31]
+        gb.mmu.rom_path = long_base
+        check("long basename identity accepted",
+              gb._rom_identity_ok(len(long_name), 255, bytes(long_name)))
+        gb.mmu.rom_path = rom_path
+
+        # Expanded live SRAM buffer has stale tail cleared on load.
+        ram_path = os.path.join(tmp, "sram.gbc")
+        gb_ram = build_machine(ram_path, cart=0x13)
+        if len(gb_ram.mmu.ram_data) < 0x2000:
+            gb_ram.mmu.ram_data = bytearray(0x2000)
+        gb_ram.mmu.ram_data[0x100] = 0xBE
+        saved_len = len(gb_ram.mmu.ram_data)
+        check("SRAM tail save succeeds", gb_ram.save_state(0) is True)
+        gb_ram.mmu.ram_data.extend(b'\xFF' * 512)
+        gb_ram.mmu.ram_data[saved_len + 10] = 0xFF
+        gb_ram.mmu.ram_data[0x100] = 0
+        check("SRAM tail load succeeds", gb_ram.load_state(0) is True)
+        check("SRAM prefix restored", gb_ram.mmu.ram_data[0x100] == 0xBE)
+        check("SRAM stale tail zeroed", gb_ram.mmu.ram_data[saved_len + 10] == 0)
+
     if _failures:
         print(f"\n{_failures} CHECK(S) FAILED")
         sys.exit(1)

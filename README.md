@@ -48,7 +48,8 @@ Super Game Boy palettes, and full CGB compatibility.
   forced to 1). Boot ROM support (DMG 256B / CGB ~2304B).
 - **Save states** — Snapshot full emulator state (including cartridge SRAM)
   to `<rom>.ss<slot>` with F6 / F8 (save) and F7 / F9 (load). v7 saves
-  record the ROM basename and refuse to load into a different game.
+  record the ROM basename (and length) and refuse to load into a different
+  filename; replacing a ROM file in place is not detected.
 - **Menu system** — ROM browser, window-scale selector, keyboard controls,
   project logo.
 - **Input** — D-pad, A / B, Start, Select via keyboard (customisable
@@ -344,7 +345,8 @@ interpreter on modest hardware.
   **LINK** while the socket is connected.
 - Save states (slots 0 and 1) include cartridge SRAM, MBC6 flash, SGB
   palettes, and in-flight serial state. v7 saves store the ROM basename
-  (with length guard), APU frame-sequencer timing, GDMA stall,
+  (with length guard; same-name file swaps are not detected), APU
+  frame-sequencer timing, GDMA stall,
   double-speed remainder, boot-ROM map flag, per-source joypad state,
   MBC7 EEPROM shift progress, and in-progress Super Game Boy packet
   assembly; v4/v5/v6 saves still load; v1–v3 load without a ROM identity
