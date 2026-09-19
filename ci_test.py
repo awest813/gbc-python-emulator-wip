@@ -18,6 +18,7 @@ tests = [
     [python, os.path.join(HERE, "test_headless.py")],
     [python, os.path.join(HERE, "test_save_state.py")],
     [python, os.path.join(HERE, "test_controls.py")],
+    [python, os.path.join(HERE, "test_hw_features.py")],
 ]
 
 failed = 0
