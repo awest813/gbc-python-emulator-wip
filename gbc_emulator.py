@@ -4523,8 +4523,22 @@ def _decorate_cyclic_setting(text, selected):
     return f"{name}: < {value} >"
 
 
-def _overlay_layout(w, h, n_items, has_hint=True):
-    """Pause-panel metrics that keep title, rows, and hint inside the window."""
+def _sync_list_scroll(cursor, scroll, capacity, n_items):
+    """Keep ``cursor`` inside the visible window ``[scroll, scroll + capacity)``."""
+    n = max(int(n_items), 1)
+    cap = max(1, min(int(capacity), n))
+    cur = int(cursor) % n
+    scr = max(0, int(scroll))
+    if cur < scr:
+        scr = cur
+    elif cur >= scr + cap:
+        scr = cur - cap + 1
+    scr = max(0, min(scr, max(0, n - cap)))
+    return scr, cap
+
+
+def _overlay_layout(w, h, n_items, has_hint=True, has_status=False):
+    """Pause-panel metrics that keep title, rows, hint, and status inside the window."""
     n = max(int(n_items), 1)
     margin = 8
     panel_w = max(220, w - margin * 2)
@@ -4540,13 +4554,14 @@ def _overlay_layout(w, h, n_items, has_hint=True):
         base_item = min(base_item, 16 if h >= 400 else 13)
     title_band = title_size + 14
     hint_band = (hint_size + 14) if has_hint else 8
+    status_band = (hint_size + 10) if has_status else 0
     max_panel_h = max(48, h - margin * 2)
-    item_h = min(36, max(14, (max_panel_h - title_band - hint_band) // n))
+    item_h = min(36, max(14, (max_panel_h - title_band - hint_band - status_band) // n))
     item_size = min(base_item, max(11, item_h - 3))
-    while title_band + n * item_h + hint_band > max_panel_h and item_h > 13:
+    while title_band + n * item_h + hint_band + status_band > max_panel_h and item_h > 13:
         item_h -= 1
         item_size = min(item_size, max(11, item_h - 3))
-    panel_h = min(max_panel_h, title_band + n * item_h + hint_band)
+    panel_h = min(max_panel_h, title_band + n * item_h + hint_band + status_band)
     px = (w - panel_w) // 2
     py = max(margin, (h - panel_h) // 2)
     return {
@@ -4559,8 +4574,27 @@ def _overlay_layout(w, h, n_items, has_hint=True):
         'hint_size': hint_size,
         'title_band': title_band,
         'hint_band': hint_band,
+        'status_band': status_band,
         'item_h': item_h,
+        'max_panel_h': max_panel_h,
     }
+
+
+def _overlay_scroll_capacity(w, h, has_hint=True, has_status=False):
+    """Maximum menu rows that fit in an overlay at minimum row height."""
+    L = _overlay_layout(w, h, 1, has_hint=has_hint, has_status=has_status)
+    fixed = L['title_band'] + L['hint_band'] + L['status_band']
+    return max(1, (L['max_panel_h'] - fixed) // 13)
+
+
+def _read_rom_system_tag(rom_path):
+    """Return ``CGB`` or ``DMG`` from the ROM header CGB flag byte."""
+    try:
+        with open(rom_path, 'rb') as f:
+            f.seek(0x0143)
+            return "CGB" if f.read(1)[0] & 0x80 else "DMG"
+    except OSError:
+        return "???"
 
 
 def _blit_selection_bar(surface, x, y, w, h):
@@ -4626,6 +4660,7 @@ class EmulatorMenu:
         self.wasd_enabled = bool(cfg.get("wasd_enabled", True))
         self.key_bindings = _rebuild_key_map(cfg.get("key_bindings"), self.wasd_enabled)
         self.controls_cursor = 0
+        self.controls_scroll = 0
         self.controls_capture = None  # button key being remapped, or None
         self._sync_settings_items()
         if pygame is None:
@@ -4769,24 +4804,39 @@ class EmulatorMenu:
             self._centre_text(secondary, MENU_SECONDARY_Y, MENU_DIM, 15)
         self._centre_text(primary, MENU_FOOTER_Y, MENU_DIM, 16)
 
-    def _draw_menu(self, items, cursor, start_y, gap, size=28):
+    def _draw_menu(self, items, cursor, start_y, gap, size=28, scroll=0, max_visible=None):
         f = get_font(size)
+        n = len(items)
+        if max_visible is not None and n > max_visible:
+            scroll, cap = _sync_list_scroll(cursor, scroll, max_visible, n)
+            visible = items[scroll:scroll + cap]
+            display_cursor = cursor - scroll
+        else:
+            visible = items
+            display_cursor = cursor
+            scroll = 0
+            cap = n
         max_w = 0
-        for item in items:
+        for item in visible:
             max_w = max(max_w, f.size(item)[0])
         bar_w = min(MENU_W - 80, max(220, max_w + 72))
         bar_h = size + 10
-        for i, item in enumerate(items):
+        if scroll > 0:
+            self._centre_text("^ more", start_y - 16, MENU_DIM, 14)
+        for i, item in enumerate(visible):
             y = start_y + i * gap
-            if i == cursor:
+            if i == display_cursor:
                 _blit_selection_bar(
                     self.screen, (MENU_W - bar_w) // 2, y - 4, bar_w, bar_h)
-            colour = MENU_HI if i == cursor else MENU_FG
-            w = self._centre_text(item, y, colour, size, shadow=(i == cursor))
-            if i == cursor:
+            colour = MENU_HI if i == display_cursor else MENU_FG
+            w = self._centre_text(item, y, colour, size, shadow=(i == display_cursor))
+            if i == display_cursor:
                 cursor_surf = f.render(">", True, MENU_HI)
                 cursor_x = (MENU_W - w) // 2 - cursor_surf.get_width() - 10
                 self.screen.blit(cursor_surf, (cursor_x, y))
+        if scroll + cap < n:
+            self._centre_text("v more", start_y + cap * gap - 6, MENU_DIM, 14)
+        return scroll
 
     def _cycle_menu_setting(self, cursor, direction=1):
         """Cycle a main-menu setting forward (1) or backward (-1)."""
@@ -4987,6 +5037,7 @@ class EmulatorMenu:
                 elif action == pygame.K_RETURN or action == 'select':
                     if self.settings_cursor == 7:
                         self.controls_cursor = 0
+                        self.controls_scroll = 0
                         self.controls_capture = None
                         return "controls"
                     self._cycle_menu_setting(self.settings_cursor, 1)
@@ -5003,8 +5054,12 @@ class EmulatorMenu:
                 items = self._controls_items()
                 if action == pygame.K_UP or action == 'up':
                     self.controls_cursor = (self.controls_cursor - 1) % len(items)
+                    self.controls_scroll, _ = _sync_list_scroll(
+                        self.controls_cursor, self.controls_scroll, 8, len(items))
                 elif action == pygame.K_DOWN or action == 'down':
                     self.controls_cursor = (self.controls_cursor + 1) % len(items)
+                    self.controls_scroll, _ = _sync_list_scroll(
+                        self.controls_cursor, self.controls_scroll, 8, len(items))
                 elif action == pygame.K_RETURN or action == 'select':
                     if self.controls_cursor < 8:
                         self.controls_capture = JOYPAD_BUTTON_KEYS[self.controls_cursor]
@@ -5063,17 +5118,30 @@ class EmulatorMenu:
         name_font = get_font(22)
         if self.rom_scroll > 0:
             self._centre_text("^ more", list_y - 18, MENU_DIM, 14)
+        tag_font = get_font(14)
         for i, rom_path in enumerate(visible):
             y = list_y + i * row_h
             idx = self.rom_scroll + i
             selected = idx == self.rom_cursor
             if selected:
                 _blit_selection_bar(self.screen, 24, y - 3, MENU_W - 48, 28)
+            tag = _read_rom_system_tag(rom_path)
+            tag_s = tag_font.render(tag, True, MENU_HI if selected else MENU_DIM)
+            tag_w = tag_s.get_width() + 10
+            tag_x = 34
+            tag_bg = pygame.Surface((tag_w, tag_s.get_height() + 4))
+            tag_bg.fill(MENU_BG)
+            tag_bg.set_alpha(200)
+            self.screen.blit(tag_bg, (tag_x, y + 1))
+            pygame.draw.rect(self.screen, MENU_HI if selected else MENU_DIM,
+                             (tag_x, y + 1, tag_w, tag_bg.get_height()), 1)
+            self.screen.blit(tag_s, (tag_x + 5, y + 3))
             name = os.path.basename(rom_path)
-            label = _fit_text(name_font, name, MENU_W - 80)
+            name_x = tag_x + tag_w + 8
+            label = _fit_text(name_font, name, MENU_W - name_x - 40)
             colour = MENU_HI if selected else MENU_FG
             s = name_font.render(label, True, colour)
-            self.screen.blit(s, (40, y))
+            self.screen.blit(s, (name_x, y))
         more_below = self.rom_scroll + self.max_visible < len(self.roms)
         info_y = list_y + len(visible) * row_h + 8
         if more_below:
@@ -5110,7 +5178,9 @@ class EmulatorMenu:
             items = list(items)
             idx = JOYPAD_BUTTON_KEYS.index(self.controls_capture)
             items[idx] = f"{JOYPAD_BUTTON_LABELS[idx]}: press a key..."
-        self._draw_menu(items, self.controls_cursor, 60, 32, size=22)
+        self.controls_scroll = self._draw_menu(
+            items, self.controls_cursor, 60, 32, size=22,
+            scroll=self.controls_scroll, max_visible=8)
         hint = "Press a new key   Esc: Cancel" if self.controls_capture else \
             "Enter: Remap / Toggle   Esc: Back"
         self._draw_chrome(
@@ -5251,6 +5321,8 @@ class GameBoy:
         self.key_bindings = _rebuild_key_map(cfg.get('key_bindings'), self.wasd_enabled)
         self.controls_capture = None
         self.pause_controls_cursor = 0
+        self.pause_controls_scroll = 0
+        self.pause_save_cursor = 0
         self._fast_forward = False
         self._show_fps = False
         self._show_input = False
@@ -6420,63 +6492,71 @@ class GameBoy:
         try:
             h = self.screen.get_height()
             f = get_font(18 if h >= 400 else 14)
-            y = 8
             right = self.screen.get_width() - 8
-
-            def _badge(surf, colour=MENU_HI):
-                nonlocal y
-                bg = pygame.Surface((surf.get_width() + 12, surf.get_height() + 6))
-                bg.fill(MENU_BG)
-                bg.set_alpha(210)
-                x = right - bg.get_width()
-                self.screen.blit(bg, (x, y))
-                pygame.draw.rect(self.screen, colour, (x, y, bg.get_width(), bg.get_height()), 1)
-                self.screen.blit(surf, (x + 6, y + 3))
-                y += bg.get_height() + 4
-
+            badges = []
             lc = self.mmu.link_cable
             if lc is not None and lc.is_connected:
-                _badge(f.render("LINK", True, MENU_HI))
+                badges.append(f.render("LINK", True, MENU_HI))
             if getattr(self, '_fast_forward', False):
-                _badge(f.render("FF", True, MENU_HI))
+                badges.append(f.render("FF", True, MENU_HI))
             if getattr(self, '_show_fps', False):
-                _badge(f.render(f"{getattr(self, '_fps_value', 0.0):.0f} fps", True, MENU_HI))
+                badges.append(f.render(f"{getattr(self, '_fps_value', 0.0):.0f} fps", True, MENU_HI))
             if getattr(self, '_show_input', False):
                 jp = self.mmu.joypad_buttons
                 names = (('R', 0), ('L', 1), ('U', 2), ('D', 3),
-                         ('A', 4), ('B', 5), ('Se', 6), ('St', 7))
+                         ('A', 4), ('B', 5), ('Sel', 6), ('Sta', 7))
                 parts = []
-                total_w = 6
                 for label, bit in names:
                     pressed = (jp & (1 << bit)) == 0
-                    ps = f.render(label, True, MENU_HI if pressed else MENU_DIM)
-                    parts.append(ps)
-                    total_w += ps.get_width() + 6
-                row = pygame.Surface((max(total_w, 12), f.get_height()))
+                    parts.append(f.render(label, True, MENU_HI if pressed else MENU_DIM))
+                gap = 6
+                pad_x = 8
+                row_w = pad_x + sum(ps.get_width() for ps in parts) + gap * (len(parts) - 1) + pad_x
+                row_h = f.get_height() + 6
+                row = pygame.Surface((max(row_w, 12), row_h))
                 row.fill(MENU_BG)
-                rx = 0
+                rx = pad_x
                 for ps in parts:
-                    row.blit(ps, (rx, 0))
-                    rx += ps.get_width() + 6
-                _badge(row)
+                    row.blit(ps, (rx, 3))
+                    rx += ps.get_width() + gap
+                badges.append(row)
+            if not badges:
+                return
+            gap = 6
+            pad = 6
+            total_w = pad + sum(
+                b.get_width() + pad for b in badges) + gap * (len(badges) - 1)
+            bar_h = max(b.get_height() + 6 for b in badges)
+            bar = pygame.Surface((total_w, bar_h))
+            bar.fill(MENU_BG)
+            bar.set_alpha(210)
+            x = right - total_w
+            self.screen.blit(bar, (x, 8))
+            pygame.draw.rect(self.screen, MENU_DIM, (x, 8, total_w, bar_h), 1)
+            bx = x + pad
+            for badge in badges:
+                by = 8 + (bar_h - badge.get_height()) // 2
+                self.screen.blit(badge, (bx, by))
+                bx += badge.get_width() + gap
         except (pygame.error, AttributeError):
             pass
 
     # ── In-game pause menu ────────────────────────────────────────────
-    PAUSE_ITEMS = [
-        "Resume",
+    PAUSE_ITEMS = ["Resume", "Save States...", "Settings", "Exit to Menu"]
+    SAVE_STATE_ITEMS = [
         "Save to Slot 0", "Load from Slot 0",
         "Save to Slot 1", "Load from Slot 1",
-        "Settings", "Exit to Menu",
     ]
 
     def _open_pause_menu(self):
         """Enter the paused state; the main loop hands control to _pause_menu_loop."""
         self.paused = True
         self.pause_cursor = 0
+        self.pause_save_cursor = 0
         self.pause_settings_cursor = 0
         self.pause_exit_cursor = 0
         self.pause_controls_cursor = 0
+        self.pause_controls_scroll = 0
         self.controls_capture = None
         self._fast_forward = False
 
@@ -6660,6 +6740,7 @@ class GameBoy:
                 elif action == pygame.K_RETURN or action == 'select':
                     if self.pause_settings_cursor == 7:
                         self.pause_controls_cursor = 0
+                        self.pause_controls_scroll = 0
                         self.controls_capture = None
                         page = "controls"
                     elif self._cycle_pause_setting(self.pause_settings_cursor, 1):
@@ -6674,12 +6755,27 @@ class GameBoy:
                             backdrop = self._capture_pause_backdrop()
                 elif action == pygame.K_ESCAPE or action == 'back':
                     page = "pause"
+            elif page == "save_states":
+                items = self.SAVE_STATE_ITEMS
+                if action in (pygame.K_UP, 'up'):
+                    self.pause_save_cursor = (self.pause_save_cursor - 1) % len(items)
+                elif action in (pygame.K_DOWN, 'down'):
+                    self.pause_save_cursor = (self.pause_save_cursor + 1) % len(items)
+                elif action == pygame.K_RETURN or action == 'select':
+                    page, backdrop = self._activate_save_state_item(backdrop)
+                elif action == pygame.K_ESCAPE or action == 'back':
+                    page = "pause"
             elif page == "controls":
                 items = self._pause_controls_items()
+                cap = _overlay_scroll_capacity(*self.screen.get_size(), has_status=False)
                 if action in (pygame.K_UP, 'up'):
                     self.pause_controls_cursor = (self.pause_controls_cursor - 1) % len(items)
+                    self.pause_controls_scroll, _ = _sync_list_scroll(
+                        self.pause_controls_cursor, self.pause_controls_scroll, cap, len(items))
                 elif action in (pygame.K_DOWN, 'down'):
                     self.pause_controls_cursor = (self.pause_controls_cursor + 1) % len(items)
+                    self.pause_controls_scroll, _ = _sync_list_scroll(
+                        self.pause_controls_cursor, self.pause_controls_scroll, cap, len(items))
                 elif action == pygame.K_RETURN or action == 'select':
                     if self.pause_controls_cursor < 8:
                         self.controls_capture = JOYPAD_BUTTON_KEYS[self.pause_controls_cursor]
@@ -6724,7 +6820,20 @@ class GameBoy:
         choice = self.PAUSE_ITEMS[self.pause_cursor]
         if choice == "Resume":
             self.paused = False
-        elif choice.startswith("Save to Slot "):
+        elif choice == "Save States...":
+            self.pause_save_cursor = 0
+            page = "save_states"
+        elif choice == "Settings":
+            self.pause_settings_cursor = 0
+            page = "settings"
+        elif choice == "Exit to Menu":
+            self.pause_exit_cursor = 0
+            page = "confirm_exit"
+        return page, backdrop
+
+    def _activate_save_state_item(self, backdrop):
+        choice = self.SAVE_STATE_ITEMS[self.pause_save_cursor]
+        if choice.startswith("Save to Slot "):
             slot = int(choice.rsplit(' ', 1)[-1])
             ok = self.save_state(slot)
             detail = getattr(self, '_last_state_detail', None)
@@ -6739,13 +6848,7 @@ class GameBoy:
                 detail = getattr(self, '_last_state_detail', None)
                 self._pause_status(self._format_state_message(
                     'load', slot, getattr(self, '_last_state_error', 'corrupt'), detail))
-        elif choice == "Settings":
-            self.pause_settings_cursor = 0
-            page = "settings"
-        elif choice == "Exit to Menu":
-            self.pause_exit_cursor = 0
-            page = "confirm_exit"
-        return page, backdrop
+        return "save_states", backdrop
 
     def _pause_controls_items(self):
         items = [
@@ -6760,11 +6863,17 @@ class GameBoy:
         items.append("Reset to Default")
         return items
 
-    def _draw_overlay_menu(self, backdrop, title, items, cursor, hint, hint_hi=False):
+    def _draw_overlay_menu(self, backdrop, title, items, cursor, hint, hint_hi=False,
+                           scroll=0, status=None, status_hi=False):
         self.screen.blit(backdrop, (0, 0))
         w, h = self.screen.get_size()
-        n = max(len(items), 1)
-        L = _overlay_layout(w, h, n, has_hint=bool(hint))
+        has_status = bool(status)
+        cap = _overlay_scroll_capacity(w, h, has_hint=bool(hint), has_status=has_status)
+        n_items = max(len(items), 1)
+        scroll, cap = _sync_list_scroll(cursor, scroll, cap, n_items)
+        visible = items[scroll:scroll + cap] if items else [""]
+        display_cursor = cursor - scroll
+        L = _overlay_layout(w, h, len(visible), has_hint=bool(hint), has_status=has_status)
         px, py = L['px'], L['py']
         panel_w, panel_h = L['panel_w'], L['panel_h']
         panel = pygame.Surface((panel_w, panel_h))
@@ -6778,11 +6887,16 @@ class GameBoy:
         self.screen.blit(ts, (px + (panel_w - ts.get_width()) // 2, py + 6))
 
         itf = get_font(L['item_size'])
+        scroll_font = get_font(max(11, L['item_size'] - 4))
         max_item_w = panel_w - 40
-        for i, item in enumerate(items):
-            iy = py + L['title_band'] + i * L['item_h']
+        list_y = py + L['title_band']
+        if scroll > 0:
+            more = scroll_font.render("^ more", True, MENU_DIM)
+            self.screen.blit(more, (px + (panel_w - more.get_width()) // 2, list_y - 2))
+        for i, item in enumerate(visible):
+            iy = list_y + i * L['item_h']
             label = _fit_text(itf, item, max_item_w)
-            if i == cursor:
+            if i == display_cursor:
                 bar_h = max(12, L['item_h'] - 2)
                 _blit_selection_bar(self.screen, px + 6, iy - 1, panel_w - 12, bar_h)
                 colour = MENU_HI
@@ -6790,13 +6904,23 @@ class GameBoy:
                 colour = MENU_FG
             isf = itf.render(label, True, colour)
             ix = px + max(16, (panel_w - isf.get_width()) // 2)
-            if i == cursor:
+            if i == display_cursor:
                 cursor_surf = itf.render(">", True, MENU_HI)
                 self.screen.blit(
                     cursor_surf,
                     (max(px + 10, ix - cursor_surf.get_width() - 6), iy))
             self.screen.blit(isf, (ix, iy))
+        if scroll + cap < n_items:
+            more = scroll_font.render("v more", True, MENU_DIM)
+            vy = list_y + len(visible) * L['item_h'] - 2
+            self.screen.blit(more, (px + (panel_w - more.get_width()) // 2, vy))
 
+        y_footer = py + panel_h
+        if has_status:
+            sf = get_font(L['hint_size'])
+            ss = sf.render(_fit_text(sf, status, panel_w - 16), True, MENU_HI if status_hi else MENU_DIM)
+            y_footer -= L['status_band']
+            self.screen.blit(ss, (px + (panel_w - ss.get_width()) // 2, y_footer + 2))
         if hint:
             hf = get_font(L['hint_size'])
             hs = hf.render(
@@ -6807,17 +6931,20 @@ class GameBoy:
                 (px + (panel_w - hs.get_width()) // 2,
                  py + panel_h - L['hint_band'] + 4))
         pygame.display.flip()
+        return scroll
 
     def _pause_hint(self, wide, narrow):
         return wide if self.screen.get_width() >= 400 else narrow
 
     def _render_pause_page(self, page, backdrop):
+        status = self._pause_msg if self._pause_msg_ttl > 0 else None
         if page == "settings":
             self._draw_overlay_menu(
                 backdrop, "Settings", self._pause_settings_items(),
                 self.pause_settings_cursor,
                 self._pause_hint("Left/Right or Enter: Change   Esc: Back",
-                                 "Left/Right: Change   Esc: Back"))
+                                 "Left/Right: Change   Esc: Back"),
+                status=status, status_hi=True)
         elif page == "controls":
             if self.controls_capture:
                 hint = self._pause_hint("Press a new key   Esc: Cancel",
@@ -6825,23 +6952,32 @@ class GameBoy:
             else:
                 hint = self._pause_hint("Enter: Remap / Toggle   Esc: Back",
                                         "Enter: Remap   Esc: Back")
-            self._draw_overlay_menu(
+            self.pause_controls_scroll = self._draw_overlay_menu(
                 backdrop, "Controls", self._pause_controls_items(),
-                self.pause_controls_cursor, hint)
+                self.pause_controls_cursor, hint,
+                scroll=self.pause_controls_scroll, status=status, status_hi=True)
+        elif page == "save_states":
+            self._draw_overlay_menu(
+                backdrop, "Save States", self.SAVE_STATE_ITEMS,
+                self.pause_save_cursor,
+                self._pause_hint("Enter: Save/Load   Esc: Back   F6-F9: Quick keys",
+                                 "Enter: Save/Load   Esc: Back"),
+                status=status, status_hi=True)
         elif page == "confirm_exit":
             self._draw_overlay_menu(
                 backdrop, "Exit to Menu?",
                 ["Keep Playing", "Exit to Menu"], self.pause_exit_cursor,
                 self._pause_hint("Battery save writes on exit. F6/F8 = quick-save slots.",
-                                 "Battery save on exit"))
+                                 "Battery save on exit"),
+                status=status, status_hi=True)
         else:
-            status = self._pause_msg_ttl > 0 and self._pause_msg
-            hint = status or self._pause_hint(
-                "Up/Down: Move   Enter: Select   Esc: Resume   F6-F9: Save/Load",
-                "Enter: Select   Esc: Resume")
             self._draw_overlay_menu(
                 backdrop, "Paused", self.PAUSE_ITEMS,
-                self.pause_cursor, hint, hint_hi=bool(status))
+                self.pause_cursor,
+                self._pause_hint(
+                    "Up/Down: Move   Enter: Select   Esc: Resume   F6-F9: Save/Load",
+                    "Enter: Select   Esc: Resume"),
+                status=status, status_hi=True)
 
     def render(self, overlays=True):
         """Draws the PPU framebuffer to the Pygame screen."""

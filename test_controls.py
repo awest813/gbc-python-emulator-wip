@@ -288,6 +288,9 @@ def test_turbo_and_reset(ns):
 def test_ui_layout(ns):
     """Menu overlay metrics must keep title, rows, and hint on-screen."""
     _overlay_layout = ns["_overlay_layout"]
+    _sync_list_scroll = ns["_sync_list_scroll"]
+    _overlay_scroll_capacity = ns["_overlay_scroll_capacity"]
+    _read_rom_system_tag = ns["_read_rom_system_tag"]
     _decorate_cyclic_setting = ns["_decorate_cyclic_setting"]
     check("cyclic setting shows chevrons when selected",
           _decorate_cyclic_setting("Window Scale: 4x", True) == "Window Scale: < 4x >")
@@ -295,6 +298,25 @@ def test_ui_layout(ns):
           _decorate_cyclic_setting("Window Scale: 4x", False) == "Window Scale: 4x")
     check("Controls row is not decorated",
           _decorate_cyclic_setting("Controls...", True) == "Controls...")
+    scroll, cap = _sync_list_scroll(9, 0, 4, 11)
+    check("list scroll follows cursor down", scroll == 6 and cap == 4)
+    scroll, cap = _sync_list_scroll(2, 6, 4, 11)
+    check("list scroll follows cursor up", scroll == 2 and cap == 4)
+    check("overlay scroll capacity is positive",
+          _overlay_scroll_capacity(320, 288, has_status=True) >= 3)
+    with tempfile.NamedTemporaryFile(suffix=".gb", delete=False) as tf:
+        rom = bytearray(0x200)
+        rom[0x0143] = 0x80
+        tf.write(rom)
+        dmg_path = tf.name
+    try:
+        check("CGB ROM tag", _read_rom_system_tag(dmg_path) == "CGB")
+        rom[0x0143] = 0x00
+        with open(dmg_path, "wb") as f:
+            f.write(rom)
+        check("DMG ROM tag", _read_rom_system_tag(dmg_path) == "DMG")
+    finally:
+        os.unlink(dmg_path)
     cases = (
         (320, 288, 10, True),
         (320, 288, 5, True),
@@ -303,9 +325,10 @@ def test_ui_layout(ns):
         (640, 576, 10, True),
         (640, 480, 3, False),
         (800, 720, 10, True),
+        (320, 288, 4, True),
     )
     for w, h, n, hint in cases:
-        L = _overlay_layout(w, h, n, has_hint=hint)
+        L = _overlay_layout(w, h, n, has_hint=hint, has_status=(n <= 4))
         check(f"overlay {w}x{h} n={n} stays in window",
               L['px'] >= 0 and L['py'] >= 0
               and L['px'] + L['panel_w'] <= w

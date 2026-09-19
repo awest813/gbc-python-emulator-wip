@@ -179,11 +179,13 @@ file is created automatically in the emulator directory.
 
 ## Menu
 
-- **Load ROM** — Browse and select a `.gb` or `.gbc` file. Press **F5**
+- **Load ROM** — Browse and select a `.gb` or `.gbc` file. Each entry
+  shows a **DMG** or **CGB** badge from the ROM header. Press **F5**
   to refresh the list.
 - **Settings** — Tweak the following options (press **Enter** to cycle each):
   - *Window Scale* — 2× … 5×
   - *Frame Rate* — 59.7 fps / 60 fps / Unlimited
+  - *Audio* — On / Off
   - *Volume* — Mute / Low / Medium / High / Max
   - *Palette* — DMG Green / Grayscale / Amber / Blue / Brown / Pastel
   - *Filter* — Nearest (pixel-sharp) / Smooth (bilinear)
@@ -197,8 +199,9 @@ Press **Escape** while a game is running to open the in-game pause menu.
 Emulation and audio halt, and the current frame is dimmed behind the menu:
 
 - **Resume** — Return to the game (Escape also resumes).
-- **Save to Slot 0 / 1** and **Load from Slot 0 / 1** — Quick-save slots
-  (same as F6–F9).
+- **Save States...** — Sub-menu with save/load for slots 0 and 1
+  (same as F6–F9). Status toasts appear in a dedicated strip above
+  the navigation hint.
 - **Settings** — The same options as the main settings page, applied
   **live** to the running game (palette, shader, filter, volume, audio,
   frame rate, window scale, and Controls remapping all update immediately).
