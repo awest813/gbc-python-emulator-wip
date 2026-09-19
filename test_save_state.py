@@ -195,8 +195,25 @@ def main():
         check("truncated load rolls back PPU mode", gb.ppu.mode == ppu_mode_before)
         check("truncated load reports corrupt file", gb._last_state_error == 'corrupt')
 
-        # v4 saves record the ROM basename; loading a mismatched snapshot fails.
-        check("save_state v4 succeeds", gb.save_state(0) is True)
+        # v5 saves record APU timing, gdma stall, and ROM basename identity.
+        apu_snap = (gb.apu.fs_div, gb.apu._fs_remain, gb.apu.frame_seq_step)
+        gb.mmu.gdma_stall = 500
+        gb.speed_remainder = 1
+        check("save_state v5 succeeds", gb.save_state(0) is True)
+        gb.apu.fs_div = 0
+        gb.apu._fs_remain = 0
+        gb.apu.frame_seq_step = 0
+        gb.mmu.gdma_stall = 0
+        gb.speed_remainder = 0
+        check("load_state restores APU timing", gb.load_state(0) is True)
+        check("APU fs_div restored", gb.apu.fs_div == apu_snap[0])
+        check("APU fs_remain restored", gb.apu._fs_remain == apu_snap[1])
+        check("APU frame_seq restored", gb.apu.frame_seq_step == apu_snap[2])
+        check("GDMA stall restored", gb.mmu.gdma_stall == 500)
+        check("speed remainder restored", gb.speed_remainder == 1)
+        check("scanline sprite cache cleared", gb.ppu._scanline_sprites is None)
+
+        # v5 saves record the ROM basename; loading a mismatched snapshot fails.
         other_path = os.path.join(tmp, "other.gbc")
         shutil.copy(rom_path, other_path)
         shutil.copy(gb._state_path(0), os.path.splitext(other_path)[0] + ".ss0")
@@ -216,7 +233,7 @@ def main():
         check("prefix length mismatch reports wrong_rom", gb._last_state_error == 'wrong_rom')
         gb.mmu.rom_path = rom_path
 
-        # v3 saves without a ROM id block still load on v4 builds.
+        # v3 saves without a ROM id block still load on v5 builds.
         legacy = gb._state_path(1)
         raw = open(gb._state_path(0), "rb").read()
         with open(legacy, "wb") as f:

@@ -5497,9 +5497,11 @@ class GameBoy:
 
     # ── Save state support ─────────────────────────────────────────
     SAVE_STATE_MAGIC = b'GBST'
-    SAVE_STATE_VERSION = 4
+    SAVE_STATE_VERSION = 5
     SAVE_STATE_VERSION_MIN = 1
     _STATE_ROM_ID_BYTES = 32
+    _STATE_TIMING_MAGIC = 0xA5
+    _STATE_TIMING_TAIL = 3  # gdma_stall u16 + speed_remainder u8
     _STATE_CPU_FMT = '<BBBB BB BB HHHH'
 
     @classmethod
@@ -5561,8 +5563,10 @@ class GameBoy:
                 'mbc7_latch_x': mmu.mbc7_latch_x, 'mbc7_latch_y': mmu.mbc7_latch_y,
                 'eeprom_state': mmu.eeprom_state, 'eeprom_do': mmu.eeprom_do,
                 'eeprom_write_en': mmu.eeprom_write_en, 'eeprom_addr': mmu.eeprom_addr,
+                'gdma_stall': mmu.gdma_stall,
             },
             'ppu': {
+                '_scanline_sprites': ppu._scanline_sprites,
                 'mode': ppu.mode, 'scanline_dot': ppu.scanline_dot,
                 'mode3_duration': ppu.mode3_duration,
                 'bg_palette_addr': ppu.bg_palette_addr, 'obj_palette_addr': ppu.obj_palette_addr,
@@ -5612,6 +5616,7 @@ class GameBoy:
                 'ch4_divisor_code': apu.ch4_divisor_code,
                 'wave_ram': bytes(apu.wave_ram),
             },
+            'speed_remainder': getattr(self, 'speed_remainder', 0),
         }
 
     def _restore_subsystems(self, sub):
@@ -5693,6 +5698,7 @@ class GameBoy:
         mmu.eeprom_do = m['eeprom_do']
         mmu.eeprom_write_en = m['eeprom_write_en']
         mmu.eeprom_addr = m['eeprom_addr']
+        mmu.gdma_stall = m.get('gdma_stall', 0)
         p = sub['ppu']
         ppu.mode = p['mode']
         ppu.scanline_dot = p['scanline_dot']
@@ -5707,6 +5713,7 @@ class GameBoy:
         ppu.window_active = p['window_active']
         ppu.bg_palette_data[:] = p['bg_palette_data']
         ppu.obj_palette_data[:] = p['obj_palette_data']
+        ppu._scanline_sprites = p.get('_scanline_sprites')
         for i in range(32):
             ppu._update_cgb_bg_color(i)
             ppu._update_cgb_obj_color(i)
@@ -5778,6 +5785,14 @@ class GameBoy:
         apu.wave_ram[:] = a['wave_ram']
         apu._refresh_nr52()
         self._has_rtc = sub['has_rtc']
+        self.speed_remainder = sub.get('speed_remainder', 0)
+
+    def _restore_post_load(self):
+        """Clear stale caches and re-sync live input sources after load_state."""
+        self.ppu._scanline_sprites = None
+        self.mmu.release_all_joypad()
+        if pygame and getattr(self, 'screen', None) is not None:
+            self._sync_held_inputs()
 
     def _state_backup(self):
         """Capture live CPU + memory before a load attempt (rollback on failure)."""
@@ -5918,17 +5933,21 @@ class GameBoy:
             # WRAM bank snapshots
             for i in range(7):
                 parts.append(mmu.wram_banks[i])
-            # PPU
+            # PPU (reserved bytes carry APU frame-sequencer timing when magic is set)
+            apu = self.apu
+            fs_div_lo = apu.fs_div & 0xFF
+            fs_remain_lo = apu._fs_remain & 0xFF
+            fs_remain_hi = (apu._fs_remain >> 8) & 0xFF
             parts.append(struct.pack('<BBB BBBBB BBBBB BBBB BB',
                                      ppu.mode, ppu.scanline_dot & 0xFF,
                                      (ppu.scanline_dot >> 8) & 0xFF,
                                      ppu.mode3_duration & 0xFF, (ppu.mode3_duration >> 8) & 0xFF,
-                                     0, 0, 0,  # reserved
+                                     fs_div_lo, self._STATE_TIMING_MAGIC, fs_remain_lo,
                                      ppu.bg_palette_addr, ppu.obj_palette_addr, ppu.cgb_opri,
                                      1 if ppu.lcd_was_on else 0, 1 if ppu.is_cgb else 0,
                                      ppu.window_line_counter & 0xFF,
                                      (ppu.window_line_counter >> 8) & 0xFF,
-                                     1 if ppu.window_active else 0, 0, 0,
+                                     1 if ppu.window_active else 0, fs_remain_hi, 0,
                                      1 if ppu.prev_stat_irq else 0))
             parts.append(ppu.bg_palette_data)
             parts.append(ppu.obj_palette_data)
@@ -6014,6 +6033,8 @@ class GameBoy:
                                      mmu.mbc7_latch_x & 0xFFFF, mmu.mbc7_latch_y & 0xFFFF,
                                      mmu.eeprom_state & 0xFF, mmu.eeprom_do & 1,
                                      1 if mmu.eeprom_write_en else 0, mmu.eeprom_addr & 0x7F))
+            parts.append(struct.pack(
+                '<HB', mmu.gdma_stall & 0xFFFF, getattr(self, 'speed_remainder', 0) & 0xFF))
             with open(path, 'wb') as f:
                 for p in parts:
                     f.write(p)
@@ -6211,6 +6232,7 @@ class GameBoy:
             ppu.prev_stat_irq = bool(_w3)
             ppu.window_line_counter = win_lo | (win_hi << 8)
             ppu.window_active = bool(_w0)
+            timing_magic = (_r1 == self._STATE_TIMING_MAGIC)
             _need(64 + 64, "palettes")
             ppu.bg_palette_data[:] = data[pos:pos+64]
             pos += 64
@@ -6230,8 +6252,13 @@ class GameBoy:
             apu.power = bool(ap[ai]); ai += 1
             apu.is_cgb = bool(ap[ai]); ai += 1
             apu.frame_seq_step = ap[ai] & 0x07; ai += 1
-            apu.fs_div = (ap[ai] & 0xFF) << 8; ai += 1
-            apu._sync_fs_remain(apu.fs_div, bool(self.mmu.key1 & 0x80))
+            fs_div_hi = ap[ai] & 0xFF; ai += 1
+            if timing_magic:
+                apu.fs_div = _r0 | (fs_div_hi << 8)
+                apu._fs_remain = _r2 | (_w1 << 8)
+            else:
+                apu.fs_div = fs_div_hi << 8
+                apu._sync_fs_remain(apu.fs_div, bool(self.mmu.key1 & 0x80))
             apu.vol_left = ap[ai] & 0x07; apu.vol_right = ap[ai+1] & 0x07; ai += 2
             apu.pan_left = ap[ai]; apu.pan_right = ap[ai+1]; ai += 2
             apu.sample_accum = ap[ai] | (ap[ai+1] << 8); ai += 2
@@ -6361,6 +6388,13 @@ class GameBoy:
                 mmu.eeprom_addr = eaddr
                 if mmu.mbc_type == 0x20:
                     mmu._remap_rom_bank()
+            if ver >= 5:
+                _need(self._STATE_TIMING_TAIL, "timing")
+                gdma_stall, speed_rem = struct.unpack_from('<HB', data, pos)
+                pos += self._STATE_TIMING_TAIL
+                mmu.gdma_stall = gdma_stall
+                self.speed_remainder = speed_rem & 1
+            self._restore_post_load()
             apu.drain()
             if hasattr(self, '_audio_pending'):
                 self._audio_pending.clear()
@@ -6996,15 +7030,20 @@ class GameBoy:
                 self.running = False
                 self.paused = False
                 return page, backdrop
-            if event.type == pygame.KEYDOWN and event.key in (
-                    pygame.K_F6, pygame.K_F7, pygame.K_F8, pygame.K_F9):
-                quick = {
-                    pygame.K_F6: ('save', 0), pygame.K_F7: ('load', 0),
-                    pygame.K_F8: ('save', 1), pygame.K_F9: ('load', 1),
-                }
-                act, slot = quick[event.key]
-                backdrop = self._pause_quick_state(act, slot, backdrop)
-                continue
+            if event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_r and (event.mod & pygame.KMOD_CTRL):
+                    self.soft_reset()
+                    backdrop = self._capture_pause_backdrop()
+                    self._pause_status("Reset")
+                    continue
+                if event.key in (pygame.K_F6, pygame.K_F7, pygame.K_F8, pygame.K_F9):
+                    quick = {
+                        pygame.K_F6: ('save', 0), pygame.K_F7: ('load', 0),
+                        pygame.K_F8: ('save', 1), pygame.K_F9: ('load', 1),
+                    }
+                    act, slot = quick[event.key]
+                    backdrop = self._pause_quick_state(act, slot, backdrop)
+                    continue
             if page == "controls" and self.controls_capture is not None:
                 if event.type == pygame.KEYDOWN:
                     if event.key == pygame.K_ESCAPE:

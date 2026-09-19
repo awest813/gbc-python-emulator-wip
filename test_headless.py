@@ -661,6 +661,25 @@ def test_apu_power_and_div(ns):
     check("DIV reset clears the APU DIV shadow", gb.apu.fs_div == 0)
 
 
+def test_double_speed_apu_sync(ns):
+    """CGB STOP must resync the APU frame-sequencer countdown."""
+    MMU, CPU, APU = ns["MMU"], ns["CPU"], ns["APU"]
+    m = MMU()
+    m.is_cgb = True
+    m.key1 = 0x01  # prepare double-speed
+    c = CPU(m)
+    apu = APU(m, True)
+    m.apu = apu
+    apu.fs_div = 1234
+    apu._fs_remain = 777
+    apu._sync_fs_remain(apu.fs_div, True)
+    expected_remain = apu._fs_remain
+    apu._fs_remain = 777
+    c.execute(0x10)  # STOP toggles speed when prepare bit is set
+    check("STOP toggles KEY1 double-speed", m.key1 & 0x80)
+    check("APU fs_remain resynced on speed change", apu._fs_remain == expected_remain)
+
+
 def test_cached_oam_sprite_height(ns):
     """Reused scanline OAM must still apply 8x16 sprite height."""
     PPU = ns["PPU"]
@@ -710,6 +729,7 @@ def main():
     print("oam dma sprite load:");     test_oam_dma(ns)
     print("apu power and DIV:");       test_apu_power_and_div(ns)
     print("double-speed timing:");     test_double_speed(ns)
+    print("double-speed apu sync:");   test_double_speed_apu_sync(ns)
     print("cached oam sprite height:"); test_cached_oam_sprite_height(ns)
     print("mbc1 mode-1 low bank:");    test_mbc1_mode1_low_bank(ns)
     print("rom header validation:");   test_rom_header_validation(ns)
