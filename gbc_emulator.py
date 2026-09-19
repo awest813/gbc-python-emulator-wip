@@ -28,6 +28,7 @@ import logging
 import argparse
 import struct
 import socket
+import zlib
 import json
 from collections import deque
 
@@ -128,25 +129,54 @@ PALETTE_LIST = [
 def _shader_none(fb):
     return fb
 
-def _shader_lcd_ghost(fb, prev=None):
+def _shader_lcd_ghost(fb, prev=None, out=None, scratch=None, scratch_b=None):
     if prev is None:
         return fb
+    if scratch is not None and scratch_b is not None and out is not None:
+        np.multiply(fb, 0.80, out=scratch)
+        np.multiply(prev, 0.20, out=scratch_b)
+        np.add(scratch, scratch_b, out=scratch)
+        np.clip(scratch, 0, 255, out=out)
+        return out
     return np.clip(fb * 0.80 + prev * 0.20, 0, 255).astype(np.uint8)
 
-def _shader_crt_scanlines(fb):
-    out = np.copy(fb)
-    out[1::2, :, :] = np.clip(out[1::2, :, :] * 0.65, 0, 255).astype(np.uint8)
+def _shader_crt_scanlines(fb, out=None):
+    if out is None:
+        out = fb.copy()
+    else:
+        np.copyto(out, fb)
+    out[1::2] = (out[1::2].astype(np.uint16) * 65 // 100).astype(np.uint8)
     return out
 
-def _shader_gamma_warm(fb):
-    return np.clip(np.power(fb.astype(np.float32) / 255.0, 1.2) * 255.0, 0, 255).astype(np.uint8)
+def _shader_gamma_warm(fb, out=None, scratch=None):
+    if scratch is None or out is None:
+        return np.clip(np.power(fb.astype(np.float32) / 255.0, 1.2) * 255.0, 0, 255).astype(np.uint8)
+    np.divide(fb, 255.0, out=scratch)
+    np.power(scratch, 1.2, out=scratch)
+    np.multiply(scratch, 255.0, out=scratch)
+    np.clip(scratch, 0, 255, out=out)
+    return out
 
-def _shader_pixel_bloom(fb):
-    blurred = np.zeros_like(fb)
-    for c in range(3):
-        blurred[:, :, c] = (np.roll(fb[:, :, c], 1, 0) + np.roll(fb[:, :, c], -1, 0) +
-                            np.roll(fb[:, :, c], 1, 1) + np.roll(fb[:, :, c], -1, 1)) // 4
-    return np.clip(fb * 0.70 + blurred * 0.30, 0, 255).astype(np.uint8)
+def _shader_pixel_bloom(fb, out=None, acc=None, blend=None):
+    if acc is None or blend is None or out is None:
+        blurred = (np.roll(fb, 1, 0) + np.roll(fb, -1, 0) +
+                   np.roll(fb, 1, 1) + np.roll(fb, -1, 1)) // 4
+        return np.clip(fb * 0.70 + blurred * 0.30, 0, 255).astype(np.uint8)
+    acc.fill(0)
+    acc[1:-1] += fb[:-2]
+    acc[1:-1] += fb[2:]
+    acc[:, 1:-1] += fb[:, :-2]
+    acc[:, 1:-1] += fb[:, 2:]
+    acc[0] += fb[-1]
+    acc[-1] += fb[0]
+    acc[:, 0] += fb[:, -1]
+    acc[:, -1] += fb[:, 0]
+    acc *= 0.25
+    np.multiply(fb, 0.70, out=blend)
+    np.multiply(acc, 0.30, out=acc)
+    np.add(blend, acc, out=blend)
+    np.clip(blend, 0, 255, out=out)
+    return out
 
 def _shader_pocket_green(fb):
     lum = fb.astype(np.float32).dot([0.299, 0.587, 0.114])
@@ -170,6 +200,28 @@ VOLUME_OPTIONS = [("Mute", 0.0), ("Low", 0.25), ("Medium", 0.5), ("High", 0.75),
 FILTER_OPTIONS = [("Nearest", False), ("Smooth", True)]
 WINDOW_SCALE_OPTIONS = [("2x", 2), ("3x", 3), ("4x", 4), ("5x", 5)]
 
+
+_NINTENDO_LOGO = bytes([
+    0x48, 0x06, 0x0E, 0x76, 0xFE, 0xB3, 0x1A, 0x0F, 0xCE, 0x6B, 0xB3, 0x83,
+    0x2D, 0xC1, 0xE5, 0xD6, 0xC9, 0x19, 0x7D, 0x07, 0x4F, 0x1B, 0x7E, 0x33,
+    0x9D, 0xBE, 0x9C, 0xD3, 0x09, 0x6C, 0xD2, 0xA1, 0x4A, 0x9F, 0x53, 0x1A,
+    0x5C, 0x1B, 0x78, 0x20, 0x86, 0xE0, 0x49, 0x38, 0x84, 0xB3, 0x1C,
+])
+
+def _validate_rom_header(rom_data):
+    """Return a list of header problems ('logo', 'checksum') or [] if OK."""
+    if len(rom_data) < 0x150:
+        return ['size']
+    issues = []
+    # Compare the 47-byte logo bitmap; byte 0x133 is the last title byte on HW.
+    if rom_data[0x104:0x104 + len(_NINTENDO_LOGO)] != _NINTENDO_LOGO:
+        issues.append('logo')
+    chk = 0
+    for b in rom_data[0x134:0x14D]:
+        chk = (chk - b - 1) & 0xFF
+    if chk != rom_data[0x14D]:
+        issues.append('checksum')
+    return issues
 
 def _parse_rom_header(rom_path):
     """Parse ROM header bytes and return a short info string, or None on error."""
@@ -258,6 +310,17 @@ FLAG_C = 4  # Carry flag
 
 # Joypad bit order matches P1 (FF00): Right, Left, Up, Down, A, B, Select, Start
 JOYPAD_BUTTON_KEYS = ('right', 'left', 'up', 'down', 'a', 'b', 'select', 'start')
+CONTROLS_WASD_ROW = len(JOYPAD_BUTTON_KEYS)
+CONTROLS_TURBO_ROW = CONTROLS_WASD_ROW + 1
+CONTROLS_RESET_ROW = CONTROLS_WASD_ROW + 2
+
+
+def _advance_controls_cursor(cursor, delta, n_items):
+    """Move the controls-menu cursor, skipping the informational turbo row."""
+    nxt = (cursor + delta) % n_items
+    if nxt == CONTROLS_TURBO_ROW:
+        nxt = (nxt + delta) % n_items
+    return nxt
 JOYPAD_BUTTON_LABELS = ('Right', 'Left', 'Up', 'Down', 'A', 'B', 'Select', 'Start')
 DEFAULT_KEY_BINDINGS = {
     'right':  ['right', 'd'],
@@ -542,14 +605,15 @@ def _load_config():
         return {}
 
 def _save_config(cfg):
-    """Merge `cfg` into the existing JSON config and write it back."""
+    """Merge ``cfg`` into the existing JSON config and write it back."""
     current = _load_config()
     current.update(cfg)
     try:
         with open(_CONFIG_PATH, 'w') as f:
             json.dump(current, f, indent=2)
+        return True
     except OSError:
-        pass
+        return False
 
 
 # Apply persisted (or default) key bindings as soon as pygame is importable.
@@ -643,6 +707,7 @@ class CPU:
         self.trace_enabled = False
         self.branch_trace = deque(maxlen=8192)
         self.invalid_opcode_count = 0
+        self._logged_opcodes = set()
         self.trace_branch = _noop_trace
         self.current_opcode_pc = 0
 
@@ -1003,6 +1068,9 @@ class CPU:
             if mmu.is_cgb and (mmu.key1 & 0x01):
                 mmu.key1 ^= 0x80  # toggle double-speed
                 mmu.key1 &= ~0x01  # clear prepare flag
+                apu = getattr(mmu, 'apu', None)
+                if apu is not None:
+                    apu._sync_fs_remain(apu.fs_div, bool(mmu.key1 & 0x80))
             else:
                 mmu.memory[0xFF40] &= 0x7F  # disable LCD
                 self.halted = True  # wakes on any pending interrupt (joypad)
@@ -1344,7 +1412,10 @@ class CPU:
             self.invalid_opcode_count += 1
             return 4
         self.invalid_opcode_count += 1
-        logging.error(f"Unimplemented Opcode: {opcode:02X} at PC: {self.current_opcode_pc:04X}")
+        if opcode not in self._logged_opcodes:
+            self._logged_opcodes.add(opcode)
+            logging.warning(
+                f"Unimplemented opcode: {opcode:02X} at PC: {self.current_opcode_pc:04X}")
         return 4
 
     def execute_cb(self, cb_opcode):
@@ -1453,8 +1524,9 @@ class CPU:
 class LinkCable:
     """TCP serial link between two emulator instances (local multiplayer).
 
-    Transfers complete in one shot (no bit-clock). Sockets use a short timeout
-    so a stalled partner cannot freeze the emulator indefinitely.
+    The partner byte is fetched when the transfer starts; local SB is then
+    bit-clocked via ``MMU._serial_step`` like hardware. Sockets use a short
+    timeout so a stalled partner cannot freeze the emulator indefinitely.
     """
     TRANSFER_TIMEOUT = 0.25
 
@@ -1515,6 +1587,10 @@ class LinkCable:
             except OSError:
                 pass
             self.server_sock = None
+
+    @property
+    def is_connected(self):
+        return self.sock is not None
 
 
 class MMU:
@@ -2941,6 +3017,8 @@ class PPU:
         # Latched once LY==WY occurs in a frame; the window then stays active for
         # the rest of the frame even if WY is changed, matching hardware.
         self.window_active = False
+        self._scanline_sprites = None  # OAM hits reused between mode-3 entry and sprite pass
+        self._scanline_sprite_height = None
         self._bg_rgb = [0] * 32
         self._obj_rgb = [0] * 32
         unsigned_addrs = tuple(0x8000 + i * 16 for i in range(256))
@@ -3107,11 +3185,10 @@ class PPU:
             if self.mmu.hdma_active:
                 self.mmu._hdma_hblank_step()
 
-    def _enter_mode3(self, ly, lcdc):
+    def _scanline_oam(self, ly, sprite_height):
+        """Return up to 10 OAM entries overlapping scanline ``ly``."""
         mem = self.mmu.memory
-        scx = mem[0xFF43]
-        sprite_height = 16 if (lcdc & 0x04) else 8
-        sprite_count = 0
+        sprites = []
         for i in range(40):
             oam_addr = 0xFE00 + i * 4
             y = mem[oam_addr]
@@ -3120,12 +3197,29 @@ class PPU:
             spr_y = y - 16
             if spr_y > ly or spr_y + sprite_height <= ly:
                 continue
-            sprite_count += 1
-            if sprite_count >= 10:
+            sprites.append((
+                mem[oam_addr + 1] - 8,
+                spr_y,
+                mem[oam_addr + 2],
+                mem[oam_addr + 3],
+            ))
+            if len(sprites) >= 10:
                 break
-        self.mode3_duration = 172 + (scx & 7) + sprite_count * 11
+        return sprites
+
+    def _enter_mode3(self, ly, lcdc):
+        mem = self.mmu.memory
+        scx = mem[0xFF43]
+        sprite_height = 16 if (lcdc & 0x04) else 8
+        sprites = self._scanline_oam(ly, sprite_height)
+        self.mode3_duration = 172 + (scx & 7) + len(sprites) * 11
         if self.is_cgb or (lcdc & 0x01) or (lcdc & 0x20) or (lcdc & 0x02):
+            # Reuse the OAM scan for the sprite render pass on this line.
+            self._scanline_sprites = sprites if (lcdc & 0x02) else None
+            self._scanline_sprite_height = sprite_height if (lcdc & 0x02) else None
             self._render_scanline(ly, lcdc)
+            self._scanline_sprites = None
+            self._scanline_sprite_height = None
         self.mode = 3
         stat = (mem[0xFF41] & 0xFC) | 3
         mem[0xFF41] = stat
@@ -3550,22 +3644,9 @@ class PPU:
         if not (lcdc & 0x02):
             return
         sprite_height = 16 if (lcdc & 0x04) else 8
-        sprites = []
-        for i in range(40):
-            oam_addr = 0xFE00 + i * 4
-            y = mem[oam_addr]
-            x = mem[oam_addr + 1]
-            if y == 0 or y >= 160:
-                continue
-            spr_y = y - 16
-            spr_x = x - 8
-            if spr_y > ly or spr_y + sprite_height <= ly:
-                continue
-            tile = mem[oam_addr + 2]
-            flags = mem[oam_addr + 3]
-            sprites.append((spr_x, spr_y, tile, flags))
-            if len(sprites) >= 10:
-                break
+        sprites = self._scanline_sprites
+        if sprites is None or self._scanline_sprite_height != sprite_height:
+            sprites = self._scanline_oam(ly, sprite_height)
         # CGB: OAM index priority (OPRI=0). DMG / CGB with OPRI=1: sort by X.
         if not self.is_cgb or self.cgb_opri:
             sprites.sort(key=lambda s: s[0])
@@ -3676,6 +3757,7 @@ class Timers:
                 if apu.power or not apu.is_cgb:
                     apu._frame_seq_tick()
             apu.fs_div = 0
+            apu._fs_remain = apu._frame_seq_period(bool(self.mmu.key1 & 0x80))
 
     def step(self, cycles):
         mem = self.mmu.memory
@@ -3745,17 +3827,6 @@ _APU_BOOT_VALUES = {
 }
 
 
-def _bit_falling_edges(old, new, bit):
-    """How many times `bit` of a rising counter fell in (old, new]."""
-    if new <= old:
-        return 0
-    period = 1 << (bit + 1)
-    first = ((old // period) + 1) * period
-    if first > new:
-        return 0
-    return (new - first) // period + 1
-
-
 class APU:
     """Game Boy Audio Processing Unit: two square waves, wave channel, noise channel.
 
@@ -3781,10 +3852,10 @@ class APU:
         self.power = True
         self.buffer = bytearray()
 
-        # Frame sequencer — derived from a base-clock counter so that it stays
-        # synchronised with DIV bit 12.  We track the falling edge of bit 12
-        # (i.e. 1→0 transition) which happens every 8192 base-clock cycles.
-        self.fs_div = 0           # base-clock counter; bit-12 falling edge → frame-seq tick
+        # Frame sequencer — countdown to the next DIV bit-12/13 falling edge.
+        # ``fs_div`` mirrors the CPU DIV counter for save-state compatibility.
+        self.fs_div = 0
+        self._fs_remain = self.FRAME_SEQ_PERIOD
         self.frame_seq_step = 0   # 0-7 step index
 
         # Fractional sample timer: produce one sample every CPU_CLOCK / SAMPLE_RATE cycles
@@ -3887,6 +3958,7 @@ class APU:
                 if self.is_cgb:
                     self.frame_seq_step = 0
                     self.fs_div = 0
+                    self._fs_remain = self._frame_seq_period(bool(self.mmu.key1 & 0x80))
             self.power = new_power
             self._refresh_nr52()
             return
@@ -4099,6 +4171,27 @@ class APU:
         if self.is_cgb:
             self.fs_div = 0
             self.frame_seq_step = 0
+            self._fs_remain = self._frame_seq_period(bool(self.mmu.key1 & 0x80))
+
+    @staticmethod
+    def _frame_seq_period(double_speed):
+        return 16384 if double_speed else 8192
+
+    def _sync_fs_remain(self, div_val, double_speed=False):
+        period = self._frame_seq_period(double_speed)
+        rem = period - (div_val & (period - 1))
+        self._fs_remain = period if rem == 0 else rem
+
+    def _clock_frame_sequencer(self, cpu_cycles, period):
+        if cpu_cycles <= 0:
+            return
+        self._fs_remain -= cpu_cycles
+        if self._fs_remain > 0:
+            return
+        ticks = (-self._fs_remain) // period + 1
+        self._fs_remain += ticks * period
+        for _ in range(ticks):
+            self._frame_seq_tick()
 
     # ── Channel triggers ─────────────────────────────────────────────
 
@@ -4364,18 +4457,15 @@ class APU:
         sn = self.sample_num
         sd = self.sample_den
         if div_old is not None:
-            bit = 13 if double_speed else 12
-            ticks = _bit_falling_edges(div_old, div_new, bit)
+            cpu_cycles = div_new - div_old
             self.fs_div = div_new
         else:
-            old_fs = self.fs_div
-            new_fs = old_fs + cycles
-            self.fs_div = new_fs
-            ticks = _bit_falling_edges(old_fs, new_fs, 12)
+            cpu_cycles = cycles
+            self.fs_div += cycles
         # DMG keeps the sequencer running while the APU is off; CGB does not.
         if self.power or not self.is_cgb:
-            for _ in range(ticks):
-                self._frame_seq_tick()
+            self._clock_frame_sequencer(
+                cpu_cycles, 16384 if double_speed else 8192)
 
         if not self.power:
             # APU off: still produce silence so the audio buffer keeps flowing.
@@ -4482,8 +4572,22 @@ def _decorate_cyclic_setting(text, selected):
     return f"{name}: < {value} >"
 
 
-def _overlay_layout(w, h, n_items, has_hint=True):
-    """Pause-panel metrics that keep title, rows, and hint inside the window."""
+def _sync_list_scroll(cursor, scroll, capacity, n_items):
+    """Keep ``cursor`` inside the visible window ``[scroll, scroll + capacity)``."""
+    n = max(int(n_items), 1)
+    cap = max(1, min(int(capacity), n))
+    cur = int(cursor) % n
+    scr = max(0, int(scroll))
+    if cur < scr:
+        scr = cur
+    elif cur >= scr + cap:
+        scr = cur - cap + 1
+    scr = max(0, min(scr, max(0, n - cap)))
+    return scr, cap
+
+
+def _overlay_layout(w, h, n_items, has_hint=True, has_status=False):
+    """Pause-panel metrics that keep title, rows, hint, and status inside the window."""
     n = max(int(n_items), 1)
     margin = 8
     panel_w = max(220, w - margin * 2)
@@ -4499,13 +4603,14 @@ def _overlay_layout(w, h, n_items, has_hint=True):
         base_item = min(base_item, 16 if h >= 400 else 13)
     title_band = title_size + 14
     hint_band = (hint_size + 14) if has_hint else 8
+    status_band = (hint_size + 10) if has_status else 0
     max_panel_h = max(48, h - margin * 2)
-    item_h = min(36, max(14, (max_panel_h - title_band - hint_band) // n))
+    item_h = min(36, max(14, (max_panel_h - title_band - hint_band - status_band) // n))
     item_size = min(base_item, max(11, item_h - 3))
-    while title_band + n * item_h + hint_band > max_panel_h and item_h > 13:
+    while title_band + n * item_h + hint_band + status_band > max_panel_h and item_h > 13:
         item_h -= 1
         item_size = min(item_size, max(11, item_h - 3))
-    panel_h = min(max_panel_h, title_band + n * item_h + hint_band)
+    panel_h = min(max_panel_h, title_band + n * item_h + hint_band + status_band)
     px = (w - panel_w) // 2
     py = max(margin, (h - panel_h) // 2)
     return {
@@ -4518,8 +4623,27 @@ def _overlay_layout(w, h, n_items, has_hint=True):
         'hint_size': hint_size,
         'title_band': title_band,
         'hint_band': hint_band,
+        'status_band': status_band,
         'item_h': item_h,
+        'max_panel_h': max_panel_h,
     }
+
+
+def _overlay_scroll_capacity(w, h, has_hint=True, has_status=False):
+    """Maximum menu rows that fit in an overlay at minimum row height."""
+    L = _overlay_layout(w, h, 1, has_hint=has_hint, has_status=has_status)
+    fixed = L['title_band'] + L['hint_band'] + L['status_band']
+    return max(1, (L['max_panel_h'] - fixed) // 13)
+
+
+def _read_rom_system_tag(rom_path):
+    """Return ``CGB`` or ``DMG`` from the ROM header CGB flag byte."""
+    try:
+        with open(rom_path, 'rb') as f:
+            f.seek(0x0143)
+            return "CGB" if f.read(1)[0] & 0x80 else "DMG"
+    except OSError:
+        return "???"
 
 
 def _blit_selection_bar(surface, x, y, w, h):
@@ -4585,6 +4709,7 @@ class EmulatorMenu:
         self.wasd_enabled = bool(cfg.get("wasd_enabled", True))
         self.key_bindings = _rebuild_key_map(cfg.get("key_bindings"), self.wasd_enabled)
         self.controls_cursor = 0
+        self.controls_scroll = 0
         self.controls_capture = None  # button key being remapped, or None
         self._sync_settings_items()
         if pygame is None:
@@ -4610,6 +4735,9 @@ class EmulatorMenu:
         self._scan_roms()
 
     def _scan_roms(self):
+        self._rom_info_cache = {}
+        self._rom_tag_cache = {}
+        seen = set()
         self.roms = []
         if not os.path.isdir("roms") and not os.path.isdir("rom"):
             try:
@@ -4622,7 +4750,10 @@ class EmulatorMenu:
             for f in sorted(os.listdir(base)):
                 fp = os.path.join(base, f)
                 if os.path.isfile(fp) and f.lower().endswith(('.gb', '.gbc')):
-                    self.roms.append(fp)
+                    rp = os.path.realpath(fp)
+                    if rp not in seen:
+                        seen.add(rp)
+                        self.roms.append(fp)
             for sub in sorted(os.listdir(base)):
                 d1 = os.path.join(base, sub)
                 if not os.path.isdir(d1):
@@ -4631,7 +4762,10 @@ class EmulatorMenu:
                     for f in sorted(os.listdir(d1)):
                         fp = os.path.join(d1, f)
                         if os.path.isfile(fp) and f.lower().endswith(('.gb', '.gbc')):
-                            self.roms.append(fp)
+                            rp = os.path.realpath(fp)
+                            if rp not in seen:
+                                seen.add(rp)
+                                self.roms.append(fp)
                 except OSError:
                     pass
                 try:
@@ -4643,7 +4777,10 @@ class EmulatorMenu:
                             for f in sorted(os.listdir(d2)):
                                 fp = os.path.join(d2, f)
                                 if os.path.isfile(fp) and f.lower().endswith(('.gb', '.gbc')):
-                                    self.roms.append(fp)
+                                    rp = os.path.realpath(fp)
+                                    if rp not in seen:
+                                        seen.add(rp)
+                                        self.roms.append(fp)
                         except OSError:
                             pass
                 except OSError:
@@ -4660,7 +4797,9 @@ class EmulatorMenu:
             f"Shader: {SHADER_LIST[self.shader_idx][0]}",
             "Controls...",
         ]
-        _save_config(dict(
+
+    def _persist_menu_settings(self):
+        if not _save_config(dict(
             window_scale=self.window_scale,
             fps_limit=FPS_LIMIT_OPTIONS[self.fps_limit_idx][1],
             audio_enabled=AUDIO_OPTIONS[self.audio_idx][1],
@@ -4670,14 +4809,16 @@ class EmulatorMenu:
             shader=self.shader_idx,
             wasd_enabled=self.wasd_enabled,
             key_bindings=self.key_bindings,
-        ))
+        )):
+            self._status("Could not save settings")
 
     def _persist_controls(self):
         self.key_bindings = _rebuild_key_map(self.key_bindings, self.wasd_enabled)
-        _save_config({
+        if not _save_config({
             'wasd_enabled': self.wasd_enabled,
             'key_bindings': self.key_bindings,
-        })
+        }):
+            self._status("Could not save settings")
 
     def _controls_items(self):
         items = [
@@ -4685,6 +4826,7 @@ class EmulatorMenu:
             for i, key in enumerate(JOYPAD_BUTTON_KEYS)
         ]
         items.append(f"WASD as D-Pad: {'On' if self.wasd_enabled else 'Off'}")
+        items.append("Turbo A/B: Q/E (not remappable)")
         items.append("Reset to Default")
         return items
 
@@ -4712,29 +4854,44 @@ class EmulatorMenu:
             self._centre_text(secondary, MENU_SECONDARY_Y, MENU_DIM, 15)
         self._centre_text(primary, MENU_FOOTER_Y, MENU_DIM, 16)
 
-    def _draw_menu(self, items, cursor, start_y, gap, size=28):
+    def _draw_menu(self, items, cursor, start_y, gap, size=28, scroll=0, max_visible=None):
         f = get_font(size)
+        n = len(items)
+        if max_visible is not None and n > max_visible:
+            scroll, cap = _sync_list_scroll(cursor, scroll, max_visible, n)
+            visible = items[scroll:scroll + cap]
+            display_cursor = cursor - scroll
+        else:
+            visible = items
+            display_cursor = cursor
+            scroll = 0
+            cap = n
         max_w = 0
-        for item in items:
+        for item in visible:
             max_w = max(max_w, f.size(item)[0])
         bar_w = min(MENU_W - 80, max(220, max_w + 72))
         bar_h = size + 10
-        for i, item in enumerate(items):
+        if scroll > 0:
+            self._centre_text("^ more", start_y - 16, MENU_DIM, 14)
+        for i, item in enumerate(visible):
             y = start_y + i * gap
-            if i == cursor:
+            if i == display_cursor:
                 _blit_selection_bar(
                     self.screen, (MENU_W - bar_w) // 2, y - 4, bar_w, bar_h)
-            colour = MENU_HI if i == cursor else MENU_FG
-            w = self._centre_text(item, y, colour, size, shadow=(i == cursor))
-            if i == cursor:
+            colour = MENU_HI if i == display_cursor else MENU_FG
+            w = self._centre_text(item, y, colour, size, shadow=(i == display_cursor))
+            if i == display_cursor:
                 cursor_surf = f.render(">", True, MENU_HI)
                 cursor_x = (MENU_W - w) // 2 - cursor_surf.get_width() - 10
                 self.screen.blit(cursor_surf, (cursor_x, y))
+        if scroll + cap < n:
+            self._centre_text("v more", start_y + cap * gap - 6, MENU_DIM, 14)
+        return scroll
 
     def _cycle_menu_setting(self, cursor, direction=1):
         """Cycle a main-menu setting forward (1) or backward (-1)."""
         if cursor == 0:
-            scales = [2, 3, 4, 5]
+            scales = list(_WINDOW_SCALES)
             try:
                 idx = scales.index(self.window_scale)
             except ValueError:
@@ -4755,6 +4912,7 @@ class EmulatorMenu:
         else:
             return
         self._sync_settings_items()
+        self._persist_menu_settings()
 
     def run(self):
         clock = pygame.time.Clock()
@@ -4929,6 +5087,7 @@ class EmulatorMenu:
                 elif action == pygame.K_RETURN or action == 'select':
                     if self.settings_cursor == 7:
                         self.controls_cursor = 0
+                        self.controls_scroll = 0
                         self.controls_capture = None
                         return "controls"
                     self._cycle_menu_setting(self.settings_cursor, 1)
@@ -4944,18 +5103,26 @@ class EmulatorMenu:
             elif page == "controls":
                 items = self._controls_items()
                 if action == pygame.K_UP or action == 'up':
-                    self.controls_cursor = (self.controls_cursor - 1) % len(items)
+                    self.controls_cursor = _advance_controls_cursor(
+                        self.controls_cursor, -1, len(items))
+                    self.controls_scroll, _ = _sync_list_scroll(
+                        self.controls_cursor, self.controls_scroll, 8, len(items))
                 elif action == pygame.K_DOWN or action == 'down':
-                    self.controls_cursor = (self.controls_cursor + 1) % len(items)
+                    self.controls_cursor = _advance_controls_cursor(
+                        self.controls_cursor, 1, len(items))
+                    self.controls_scroll, _ = _sync_list_scroll(
+                        self.controls_cursor, self.controls_scroll, 8, len(items))
                 elif action == pygame.K_RETURN or action == 'select':
-                    if self.controls_cursor < 8:
+                    if self.controls_cursor < CONTROLS_WASD_ROW:
                         self.controls_capture = JOYPAD_BUTTON_KEYS[self.controls_cursor]
                         pygame.key.set_repeat()
-                    elif self.controls_cursor == 8:
+                    elif self.controls_cursor == CONTROLS_WASD_ROW:
                         self.wasd_enabled = not self.wasd_enabled
                         self.key_bindings = _sanitize_key_bindings(self.key_bindings, self.wasd_enabled)
                         self._persist_controls()
-                    else:
+                    elif self.controls_cursor == CONTROLS_TURBO_ROW:
+                        self._status("Turbo A/B: Q/E (not remappable)")
+                    elif self.controls_cursor == CONTROLS_RESET_ROW:
                         self.wasd_enabled = True
                         self.key_bindings = _default_key_bindings(True)
                         self._persist_controls()
@@ -5005,17 +5172,37 @@ class EmulatorMenu:
         name_font = get_font(22)
         if self.rom_scroll > 0:
             self._centre_text("^ more", list_y - 18, MENU_DIM, 14)
+        tag_font = get_font(14)
+        tag_cache = getattr(self, '_rom_tag_cache', None)
+        if tag_cache is None:
+            tag_cache = {}
+            self._rom_tag_cache = tag_cache
         for i, rom_path in enumerate(visible):
             y = list_y + i * row_h
             idx = self.rom_scroll + i
             selected = idx == self.rom_cursor
             if selected:
                 _blit_selection_bar(self.screen, 24, y - 3, MENU_W - 48, 28)
+            tag = tag_cache.get(rom_path)
+            if tag is None:
+                tag = _read_rom_system_tag(rom_path)
+                tag_cache[rom_path] = tag
+            tag_s = tag_font.render(tag, True, MENU_HI if selected else MENU_DIM)
+            tag_w = tag_s.get_width() + 10
+            tag_x = 34
+            tag_bg = pygame.Surface((tag_w, tag_s.get_height() + 4))
+            tag_bg.fill(MENU_BG)
+            tag_bg.set_alpha(200)
+            self.screen.blit(tag_bg, (tag_x, y + 1))
+            pygame.draw.rect(self.screen, MENU_HI if selected else MENU_DIM,
+                             (tag_x, y + 1, tag_w, tag_bg.get_height()), 1)
+            self.screen.blit(tag_s, (tag_x + 5, y + 3))
             name = os.path.basename(rom_path)
-            label = _fit_text(name_font, name, MENU_W - 80)
+            name_x = tag_x + tag_w + 8
+            label = _fit_text(name_font, name, MENU_W - name_x - 40)
             colour = MENU_HI if selected else MENU_FG
             s = name_font.render(label, True, colour)
-            self.screen.blit(s, (40, y))
+            self.screen.blit(s, (name_x, y))
         more_below = self.rom_scroll + self.max_visible < len(self.roms)
         info_y = list_y + len(visible) * row_h + 8
         if more_below:
@@ -5052,13 +5239,15 @@ class EmulatorMenu:
             items = list(items)
             idx = JOYPAD_BUTTON_KEYS.index(self.controls_capture)
             items[idx] = f"{JOYPAD_BUTTON_LABELS[idx]}: press a key..."
-        self._draw_menu(items, self.controls_cursor, 60, 32, size=22)
+        self.controls_scroll = self._draw_menu(
+            items, self.controls_cursor, 60, 32, size=22,
+            scroll=self.controls_scroll, max_visible=8)
         hint = "Press a new key   Esc: Cancel" if self.controls_capture else \
             "Enter: Remap / Toggle   Esc: Back"
         self._draw_chrome(
             hint,
             secondary=None if self.controls_capture else
-            "Tab: Fast-forward   F3: FPS   F4: Input   Ctrl+R: Reset")
+            "In-game: Tab fast-forward, F3 FPS, F4 input, Ctrl+R reset")
 
     def _render_confirm_exit(self):
         self._centre_text("Exit Emulator?", 120, MENU_HI, 36, shadow=True)
@@ -5133,18 +5322,30 @@ class GameBoy:
                     self.cpu.reg.l = 0x4D
                 self._apply_post_boot_io()
             self._load_sav()
+            boot_warnings = []
+            header_issues = _validate_rom_header(rom_data)
+            if header_issues:
+                boot_warnings.append("invalid ROM header")
+            if self.mmu.mbc_type not in _SUPPORTED_CART_TYPES:
+                boot_warnings.append("mapper not emulated")
+            if boot_warnings:
+                self._status_msg = " — ".join(w.capitalize() for w in boot_warnings)
+                self._status_ttl = 240
+            else:
+                self._status_msg = ''
+                self._status_ttl = 0
         else:
             logging.info("No ROM provided. Running dummy infinite loop.")
             self.mmu.memory[0x0100] = 0x00
             self.mmu.memory[0x0101] = 0xC3
             self.mmu.memory[0x0102] = 0x00
             self.mmu.memory[0x0103] = 0x01
+            self._status_msg = ''
+            self._status_ttl = 0
 
         self.speed_remainder = 0  # carries the odd base-clock dot in double-speed mode
         self._rtc_cycle_accum = 0  # throttle MBC3 RTC wall-clock updates to once per frame
         self._has_rtc = self.mmu.has_rtc  # cached flag for step_all hot path
-        self._status_msg = ''
-        self._status_ttl = 0
         self.fps_limit = fps_limit
         self.smooth_scale = smooth_scale
         self.shader = shader if shader is not None else _shader_none
@@ -5154,9 +5355,18 @@ class GameBoy:
         if np is not None:
             self._frame_np = np.empty((SCREEN_HEIGHT, SCREEN_WIDTH, 3), dtype=np.uint8)
             self._blit_np = np.empty((SCREEN_WIDTH, SCREEN_HEIGHT, 3), dtype=np.uint8)
+            self._shader_out = np.empty((SCREEN_HEIGHT, SCREEN_WIDTH, 3), dtype=np.uint8)
+            self._shader_f32 = np.empty((SCREEN_HEIGHT, SCREEN_WIDTH, 3), dtype=np.float32)
+            self._shader_f32_b = np.empty((SCREEN_HEIGHT, SCREEN_WIDTH, 3), dtype=np.float32)
+            self._ghost_store = np.empty((SCREEN_HEIGHT, SCREEN_WIDTH, 3), dtype=np.uint8)
         else:
             self._frame_np = None
             self._blit_np = None
+            self._shader_out = None
+            self._shader_f32 = None
+            self._shader_f32_b = None
+            self._ghost_store = None
+        self._numpy_slow_warned = False
 
         if pygame:
             self.window_scale = _clamp_choice(window_scale, _WINDOW_SCALES, 4)
@@ -5184,6 +5394,8 @@ class GameBoy:
         self.key_bindings = _rebuild_key_map(cfg.get('key_bindings'), self.wasd_enabled)
         self.controls_capture = None
         self.pause_controls_cursor = 0
+        self.pause_controls_scroll = 0
+        self.pause_save_cursor = 0
         self._fast_forward = False
         self._show_fps = False
         self._show_input = False
@@ -5347,8 +5559,419 @@ class GameBoy:
 
     # ── Save state support ─────────────────────────────────────────
     SAVE_STATE_MAGIC = b'GBST'
-    SAVE_STATE_VERSION = 3
+    SAVE_STATE_VERSION = 8
     SAVE_STATE_VERSION_MIN = 1
+    _STATE_ROM_ID_BYTES = 32
+    _STATE_ROM_FP_BYTES = 8   # v8+: ROM byte length + CRC32 fingerprint
+    _STATE_TIMING_MAGIC = 0xA5
+    _STATE_TIMING_TAIL_V5 = 3   # gdma_stall u16 + speed_remainder u8
+    _STATE_EXTRA_TAIL_V6 = 16   # v5 timing + bootrom + joypad + MBC7 EEPROM shift
+    _STATE_SGB_CMD_MAX = 256    # cap assembled SGB command buffer in saves
+    _STATE_CPU_FMT = '<BBBB BB BB HHHH'
+
+    @classmethod
+    def _state_header_bytes(cls, version):
+        extra = cls._STATE_ROM_ID_BYTES if version >= 4 else 0
+        fp = cls._STATE_ROM_FP_BYTES if version >= 8 else 0
+        return 8 + extra + fp
+
+    @classmethod
+    def _state_min_bytes(cls, version=None):
+        ver = cls.SAVE_STATE_VERSION if version is None else version
+        return (cls._state_header_bytes(ver)
+                + struct.calcsize(cls._STATE_CPU_FMT) + 4 + 0x10000)
+
+    def _capture_subsystems(self):
+        """Snapshot MMU/PPU/APU fields that load_state mutates (for rollback)."""
+        mmu = self.mmu
+        ppu = self.ppu
+        apu = self.apu
+        return {
+            'has_rtc': getattr(self, '_has_rtc', mmu.has_rtc),
+            'mmu': {
+                'mbc_type': mmu.mbc_type, 'ram_enabled': mmu.ram_enabled,
+                'rom_bank': mmu.rom_bank, 'ram_bank': mmu.ram_bank,
+                'mbc1_mode': mmu.mbc1_mode, 'num_rom_banks': mmu.num_rom_banks,
+                'num_ram_banks': mmu.num_ram_banks, 'has_ram': mmu.has_ram,
+                'has_battery': mmu.has_battery, 'has_rtc': mmu.has_rtc,
+                'is_cgb': mmu.is_cgb, 'joypad_buttons': mmu.joypad_buttons,
+                '_joy_src': list(mmu._joy_src), 'serial_data': mmu.serial_data,
+                'serial_control': mmu.serial_control, 'vram_bank_select': mmu.vram_bank_select,
+                'key1': mmu.key1, 'rp': mmu.rp, 'svbk': mmu.svbk,
+                'hdma_remaining': mmu.hdma_remaining, 'hdma_src': mmu.hdma_src,
+                'hdma_dst': mmu.hdma_dst, 'dma_remaining': mmu.dma_remaining,
+                'dma_src': mmu.dma_src, 'dma_index': mmu.dma_index,
+                'dma_cycle_acc': mmu.dma_cycle_acc, 'hdma_active': mmu.hdma_active,
+                'mbc1_upper_bank': mmu.mbc1_upper_bank,
+                'rtc_s': mmu.rtc_s, 'rtc_m': mmu.rtc_m, 'rtc_h': mmu.rtc_h,
+                'rtc_dl': mmu.rtc_dl, 'rtc_dh': mmu.rtc_dh,
+                'rtc_latch_state': mmu.rtc_latch_state, 'rtc_last_time': mmu.rtc_last_time,
+                'rtc_latch_s': mmu.rtc_latch_s, 'rtc_latch_m': mmu.rtc_latch_m,
+                'rtc_latch_h': mmu.rtc_latch_h, 'rtc_latch_dl': mmu.rtc_latch_dl,
+                'rtc_latch_dh': mmu.rtc_latch_dh,
+                'vram_bank1': bytes(mmu.vram_bank1),
+                'wram_banks': [bytes(b) for b in mmu.wram_banks],
+                'ram_data': bytes(mmu.ram_data),
+                'serial_bits_left': mmu.serial_bits_left,
+                'serial_cycle_accum': mmu.serial_cycle_accum,
+                'serial_incoming': mmu.serial_incoming, 'is_sgb': mmu.is_sgb,
+                'sgb_mask': mmu.sgb_mask, 'sgb_player_count': mmu.sgb_player_count,
+                'sgb_current_player': mmu.sgb_current_player,
+                'sgb_pal_rgb': list(mmu.sgb_pal_rgb),
+                'sgb_attr': bytes(mmu.sgb_attr),
+                'mbc6_rom_bank_a': mmu.mbc6_rom_bank_a, 'mbc6_rom_bank_b': mmu.mbc6_rom_bank_b,
+                'mbc6_ram_bank_a': mmu.mbc6_ram_bank_a, 'mbc6_ram_bank_b': mmu.mbc6_ram_bank_b,
+                'mbc6_flash_a': mmu.mbc6_flash_a, 'mbc6_flash_b': mmu.mbc6_flash_b,
+                'mbc6_flash_enable': mmu.mbc6_flash_enable, 'mbc6_flash_we': mmu.mbc6_flash_we,
+                'flash_data': bytes(mmu.flash_data),
+                'mbc7_ram_enable2': mmu.mbc7_ram_enable2,
+                'mbc7_latch_ready': mmu.mbc7_latch_ready,
+                'mbc7_latch_x': mmu.mbc7_latch_x, 'mbc7_latch_y': mmu.mbc7_latch_y,
+                'eeprom_state': mmu.eeprom_state, 'eeprom_do': mmu.eeprom_do,
+                'eeprom_write_en': mmu.eeprom_write_en, 'eeprom_addr': mmu.eeprom_addr,
+                'gdma_stall': mmu.gdma_stall,
+                'bootrom_enabled': mmu.bootrom_enabled,
+                '_dpad_last': list(mmu._dpad_last),
+                'eeprom_cs': mmu.eeprom_cs,
+                'eeprom_clk': mmu.eeprom_clk,
+                'eeprom_bits': mmu.eeprom_bits,
+                'eeprom_shift': mmu.eeprom_shift,
+                'sgb_in_packet': mmu.sgb_in_packet,
+                'sgb_bit_count': mmu.sgb_bit_count,
+                'sgb_packet': bytes(mmu.sgb_packet),
+                'sgb_cmd': mmu.sgb_cmd,
+                'sgb_packets_left': mmu.sgb_packets_left,
+                'sgb_cmd_data': bytes(mmu.sgb_cmd_data),
+            },
+            'ppu': {
+                '_scanline_sprites': ppu._scanline_sprites,
+                'mode': ppu.mode, 'scanline_dot': ppu.scanline_dot,
+                'mode3_duration': ppu.mode3_duration,
+                'bg_palette_addr': ppu.bg_palette_addr, 'obj_palette_addr': ppu.obj_palette_addr,
+                'cgb_opri': ppu.cgb_opri, 'lcd_was_on': ppu.lcd_was_on, 'is_cgb': ppu.is_cgb,
+                'prev_stat_irq': ppu.prev_stat_irq,
+                'window_line_counter': ppu.window_line_counter,
+                'window_active': ppu.window_active,
+                'bg_palette_data': bytes(ppu.bg_palette_data),
+                'obj_palette_data': bytes(ppu.obj_palette_data),
+            },
+            'apu': {
+                'power': apu.power, 'is_cgb': apu.is_cgb,
+                'frame_seq_step': apu.frame_seq_step, 'fs_div': apu.fs_div,
+                '_fs_remain': apu._fs_remain,
+                'vol_left': apu.vol_left, 'vol_right': apu.vol_right,
+                'pan_left': apu.pan_left, 'pan_right': apu.pan_right,
+                'sample_accum': apu.sample_accum,
+                'ch1_enabled': apu.ch1_enabled, 'ch1_dac': apu.ch1_dac,
+                'ch1_freq': apu.ch1_freq, 'ch1_freq_timer': apu.ch1_freq_timer,
+                'ch1_duty': apu.ch1_duty, 'ch1_duty_step': apu.ch1_duty_step,
+                'ch1_length_enabled': apu.ch1_length_enabled, 'ch1_length': apu.ch1_length,
+                'ch1_volume': apu.ch1_volume, 'ch1_env_initial': apu.ch1_env_initial,
+                'ch1_env_direction': apu.ch1_env_direction, 'ch1_env_period': apu.ch1_env_period,
+                'ch1_env_timer': apu.ch1_env_timer, 'ch1_sweep_period': apu.ch1_sweep_period,
+                'ch1_sweep_direction': apu.ch1_sweep_direction,
+                'ch1_sweep_shift': apu.ch1_sweep_shift, 'ch1_sweep_timer': apu.ch1_sweep_timer,
+                'ch1_sweep_shadow': apu.ch1_sweep_shadow,
+                'ch1_sweep_enabled': apu.ch1_sweep_enabled,
+                'ch2_enabled': apu.ch2_enabled, 'ch2_dac': apu.ch2_dac,
+                'ch2_freq': apu.ch2_freq, 'ch2_freq_timer': apu.ch2_freq_timer,
+                'ch2_duty': apu.ch2_duty, 'ch2_duty_step': apu.ch2_duty_step,
+                'ch2_length_enabled': apu.ch2_length_enabled, 'ch2_length': apu.ch2_length,
+                'ch2_volume': apu.ch2_volume, 'ch2_env_initial': apu.ch2_env_initial,
+                'ch2_env_direction': apu.ch2_env_direction, 'ch2_env_period': apu.ch2_env_period,
+                'ch2_env_timer': apu.ch2_env_timer,
+                'ch3_enabled': apu.ch3_enabled, 'ch3_dac': apu.ch3_dac,
+                'ch3_freq': apu.ch3_freq, 'ch3_freq_timer': apu.ch3_freq_timer,
+                'ch3_length_enabled': apu.ch3_length_enabled, 'ch3_length': apu.ch3_length,
+                'ch3_vol_shift': apu.ch3_vol_shift, 'ch3_wave_pos': apu.ch3_wave_pos,
+                'ch4_enabled': apu.ch4_enabled, 'ch4_dac': apu.ch4_dac,
+                'ch4_freq_timer': apu.ch4_freq_timer,
+                'ch4_length_enabled': apu.ch4_length_enabled, 'ch4_length': apu.ch4_length,
+                'ch4_volume': apu.ch4_volume, 'ch4_env_initial': apu.ch4_env_initial,
+                'ch4_env_direction': apu.ch4_env_direction, 'ch4_env_period': apu.ch4_env_period,
+                'ch4_env_timer': apu.ch4_env_timer, 'ch4_lfsr': apu.ch4_lfsr,
+                'ch4_shift': apu.ch4_shift, 'ch4_width_mode': apu.ch4_width_mode,
+                'ch4_divisor_code': apu.ch4_divisor_code,
+                'wave_ram': bytes(apu.wave_ram),
+            },
+            'speed_remainder': getattr(self, 'speed_remainder', 0),
+        }
+
+    def _restore_subsystems(self, sub):
+        if not sub:
+            return
+        mmu = self.mmu
+        ppu = self.ppu
+        apu = self.apu
+        m = sub['mmu']
+        mmu.mbc_type = m['mbc_type']
+        mmu.ram_enabled = m['ram_enabled']
+        mmu.rom_bank = m['rom_bank']
+        mmu.ram_bank = m['ram_bank']
+        mmu.mbc1_mode = m['mbc1_mode']
+        mmu.num_rom_banks = m['num_rom_banks']
+        mmu.num_ram_banks = m['num_ram_banks']
+        mmu.has_ram = m['has_ram']
+        mmu.has_battery = m['has_battery']
+        mmu.has_rtc = m['has_rtc']
+        mmu.is_cgb = m['is_cgb']
+        mmu.joypad_buttons = m['joypad_buttons']
+        mmu._joy_src = list(m['_joy_src'])
+        mmu.serial_data = m['serial_data']
+        mmu.serial_control = m['serial_control']
+        mmu.vram_bank_select = m['vram_bank_select']
+        mmu.key1 = m['key1']
+        mmu.rp = m['rp']
+        mmu.svbk = m['svbk']
+        mmu.hdma_remaining = m['hdma_remaining']
+        mmu.hdma_src = m['hdma_src']
+        mmu.hdma_dst = m['hdma_dst']
+        mmu.dma_remaining = m['dma_remaining']
+        mmu.dma_src = m['dma_src']
+        mmu.dma_index = m['dma_index']
+        mmu.dma_cycle_acc = m['dma_cycle_acc']
+        mmu.hdma_active = m['hdma_active']
+        mmu.mbc1_upper_bank = m['mbc1_upper_bank']
+        mmu.rtc_s = m['rtc_s']
+        mmu.rtc_m = m['rtc_m']
+        mmu.rtc_h = m['rtc_h']
+        mmu.rtc_dl = m['rtc_dl']
+        mmu.rtc_dh = m['rtc_dh']
+        mmu.rtc_latch_state = m['rtc_latch_state']
+        mmu.rtc_last_time = m['rtc_last_time']
+        mmu.rtc_latch_s = m['rtc_latch_s']
+        mmu.rtc_latch_m = m['rtc_latch_m']
+        mmu.rtc_latch_h = m['rtc_latch_h']
+        mmu.rtc_latch_dl = m['rtc_latch_dl']
+        mmu.rtc_latch_dh = m['rtc_latch_dh']
+        mmu.vram_bank1[:] = m['vram_bank1']
+        for i, bank in enumerate(m['wram_banks']):
+            mmu.wram_banks[i][:] = bank
+        if len(mmu.ram_data) == len(m['ram_data']):
+            mmu.ram_data[:] = m['ram_data']
+        mmu.serial_bits_left = m['serial_bits_left']
+        mmu.serial_cycle_accum = m['serial_cycle_accum']
+        mmu.serial_incoming = m['serial_incoming']
+        mmu.is_sgb = m['is_sgb']
+        mmu.sgb_mask = m['sgb_mask']
+        mmu.sgb_player_count = m['sgb_player_count']
+        mmu.sgb_current_player = m['sgb_current_player']
+        mmu.sgb_pal_rgb[:] = m['sgb_pal_rgb']
+        mmu.sgb_attr[:] = m['sgb_attr']
+        mmu.mbc6_rom_bank_a = m['mbc6_rom_bank_a']
+        mmu.mbc6_rom_bank_b = m['mbc6_rom_bank_b']
+        mmu.mbc6_ram_bank_a = m['mbc6_ram_bank_a']
+        mmu.mbc6_ram_bank_b = m['mbc6_ram_bank_b']
+        mmu.mbc6_flash_a = m['mbc6_flash_a']
+        mmu.mbc6_flash_b = m['mbc6_flash_b']
+        mmu.mbc6_flash_enable = m['mbc6_flash_enable']
+        mmu.mbc6_flash_we = m['mbc6_flash_we']
+        if len(mmu.flash_data) >= len(m['flash_data']):
+            mmu.flash_data[:len(m['flash_data'])] = m['flash_data']
+        mmu.mbc7_ram_enable2 = m['mbc7_ram_enable2']
+        mmu.mbc7_latch_ready = m['mbc7_latch_ready']
+        mmu.mbc7_latch_x = m['mbc7_latch_x']
+        mmu.mbc7_latch_y = m['mbc7_latch_y']
+        mmu.eeprom_state = m['eeprom_state']
+        mmu.eeprom_do = m['eeprom_do']
+        mmu.eeprom_write_en = m['eeprom_write_en']
+        mmu.eeprom_addr = m['eeprom_addr']
+        mmu.gdma_stall = m.get('gdma_stall', 0)
+        mmu.bootrom_enabled = m.get('bootrom_enabled', False)
+        mmu._dpad_last = list(m.get('_dpad_last', [0, 2]))
+        mmu.eeprom_cs = m.get('eeprom_cs', False)
+        mmu.eeprom_clk = m.get('eeprom_clk', False)
+        mmu.eeprom_bits = m.get('eeprom_bits', 0)
+        mmu.eeprom_shift = m.get('eeprom_shift', 0)
+        mmu.sgb_in_packet = m.get('sgb_in_packet', False)
+        mmu.sgb_bit_count = m.get('sgb_bit_count', 0)
+        if 'sgb_packet' in m:
+            mmu.sgb_packet[:] = m['sgb_packet']
+        mmu.sgb_cmd = m.get('sgb_cmd', 0)
+        mmu.sgb_packets_left = m.get('sgb_packets_left', 0)
+        if 'sgb_cmd_data' in m:
+            mmu.sgb_cmd_data[:] = m['sgb_cmd_data']
+        p = sub['ppu']
+        ppu.mode = p['mode']
+        ppu.scanline_dot = p['scanline_dot']
+        ppu.mode3_duration = p['mode3_duration']
+        ppu.bg_palette_addr = p['bg_palette_addr']
+        ppu.obj_palette_addr = p['obj_palette_addr']
+        ppu.cgb_opri = p['cgb_opri']
+        ppu.lcd_was_on = p['lcd_was_on']
+        ppu.is_cgb = p['is_cgb']
+        ppu.prev_stat_irq = p['prev_stat_irq']
+        ppu.window_line_counter = p['window_line_counter']
+        ppu.window_active = p['window_active']
+        ppu.bg_palette_data[:] = p['bg_palette_data']
+        ppu.obj_palette_data[:] = p['obj_palette_data']
+        ppu._scanline_sprites = p.get('_scanline_sprites')
+        for i in range(32):
+            ppu._update_cgb_bg_color(i)
+            ppu._update_cgb_obj_color(i)
+        a = sub['apu']
+        apu.power = a['power']
+        apu.is_cgb = a['is_cgb']
+        apu.frame_seq_step = a['frame_seq_step']
+        apu.fs_div = a['fs_div']
+        apu._fs_remain = a['_fs_remain']
+        apu.vol_left = a['vol_left']
+        apu.vol_right = a['vol_right']
+        apu.pan_left = a['pan_left']
+        apu.pan_right = a['pan_right']
+        apu.sample_accum = a['sample_accum']
+        apu.ch1_enabled = a['ch1_enabled']
+        apu.ch1_dac = a['ch1_dac']
+        apu.ch1_freq = a['ch1_freq']
+        apu.ch1_freq_timer = a['ch1_freq_timer']
+        apu.ch1_duty = a['ch1_duty']
+        apu.ch1_duty_step = a['ch1_duty_step']
+        apu.ch1_length_enabled = a['ch1_length_enabled']
+        apu.ch1_length = a['ch1_length']
+        apu.ch1_volume = a['ch1_volume']
+        apu.ch1_env_initial = a['ch1_env_initial']
+        apu.ch1_env_direction = a['ch1_env_direction']
+        apu.ch1_env_period = a['ch1_env_period']
+        apu.ch1_env_timer = a['ch1_env_timer']
+        apu.ch1_sweep_period = a['ch1_sweep_period']
+        apu.ch1_sweep_direction = a['ch1_sweep_direction']
+        apu.ch1_sweep_shift = a['ch1_sweep_shift']
+        apu.ch1_sweep_timer = a['ch1_sweep_timer']
+        apu.ch1_sweep_shadow = a['ch1_sweep_shadow']
+        apu.ch1_sweep_enabled = a['ch1_sweep_enabled']
+        apu.ch2_enabled = a['ch2_enabled']
+        apu.ch2_dac = a['ch2_dac']
+        apu.ch2_freq = a['ch2_freq']
+        apu.ch2_freq_timer = a['ch2_freq_timer']
+        apu.ch2_duty = a['ch2_duty']
+        apu.ch2_duty_step = a['ch2_duty_step']
+        apu.ch2_length_enabled = a['ch2_length_enabled']
+        apu.ch2_length = a['ch2_length']
+        apu.ch2_volume = a['ch2_volume']
+        apu.ch2_env_initial = a['ch2_env_initial']
+        apu.ch2_env_direction = a['ch2_env_direction']
+        apu.ch2_env_period = a['ch2_env_period']
+        apu.ch2_env_timer = a['ch2_env_timer']
+        apu.ch3_enabled = a['ch3_enabled']
+        apu.ch3_dac = a['ch3_dac']
+        apu.ch3_freq = a['ch3_freq']
+        apu.ch3_freq_timer = a['ch3_freq_timer']
+        apu.ch3_length_enabled = a['ch3_length_enabled']
+        apu.ch3_length = a['ch3_length']
+        apu.ch3_vol_shift = a['ch3_vol_shift']
+        apu.ch3_wave_pos = a['ch3_wave_pos']
+        apu.ch4_enabled = a['ch4_enabled']
+        apu.ch4_dac = a['ch4_dac']
+        apu.ch4_freq_timer = a['ch4_freq_timer']
+        apu.ch4_length_enabled = a['ch4_length_enabled']
+        apu.ch4_length = a['ch4_length']
+        apu.ch4_volume = a['ch4_volume']
+        apu.ch4_env_initial = a['ch4_env_initial']
+        apu.ch4_env_direction = a['ch4_env_direction']
+        apu.ch4_env_period = a['ch4_env_period']
+        apu.ch4_env_timer = a['ch4_env_timer']
+        apu.ch4_lfsr = a['ch4_lfsr']
+        apu.ch4_shift = a['ch4_shift']
+        apu.ch4_width_mode = a['ch4_width_mode']
+        apu.ch4_divisor_code = a['ch4_divisor_code']
+        apu.wave_ram[:] = a['wave_ram']
+        apu._refresh_nr52()
+        self._has_rtc = sub['has_rtc']
+        self.speed_remainder = sub.get('speed_remainder', 0)
+
+    def _reset_sgb_fsm(self):
+        """Clear in-progress Super Game Boy packet assembly state."""
+        mmu = self.mmu
+        mmu.sgb_in_packet = False
+        mmu.sgb_bit_count = 0
+        mmu.sgb_packet = bytearray(16)
+        mmu.sgb_cmd = 0
+        mmu.sgb_cmd_data = bytearray()
+        mmu.sgb_packets_left = 0
+
+    def _sanitize_serial_after_load(self):
+        """Drop in-flight serial shifts that cannot resume without a live link partner."""
+        mmu = self.mmu
+        if mmu.serial_bits_left <= 0 or (mmu.serial_control & 0x81) != 0x81:
+            return
+        lc = getattr(mmu, 'link_cable', None)
+        if lc is not None and lc.is_connected:
+            return
+        mmu.serial_bits_left = 0
+        mmu.serial_cycle_accum = 0
+        mmu.serial_control &= ~0x80
+        mmu.serial_incoming = 0xFF
+
+    def _restore_post_load(self, ver=None):
+        """Clear stale caches and re-sync live input sources after load_state."""
+        ppu = self.ppu
+        ppu._scanline_sprites = None
+        ppu._scanline_sprite_height = None
+        ppu.bg_palette_idx[:] = b'\x00' * len(ppu.bg_palette_idx)
+        self._sanitize_serial_after_load()
+        if ver is not None and ver < 7:
+            self._reset_sgb_fsm()
+        if pygame and getattr(self, 'screen', None) is not None:
+            self.mmu.release_all_joypad()
+            self._sync_held_inputs()
+
+    def _state_backup(self):
+        """Capture live CPU + memory before a load attempt (rollback on failure)."""
+        cpu = self.cpu
+        reg = cpu.reg
+        return {
+            'memory': bytes(self.mmu.memory),
+            'cpu': (
+                reg.a, reg.f, reg.b, reg.c, reg.d, reg.e, reg.h, reg.l, reg.sp, reg.pc,
+                cpu.halted, cpu.interrupts_master_enabled, cpu.ime_pending, cpu.halt_bug_pending,
+            ),
+            'div_counter': self.timers.div_counter,
+            'tima_accum': self.timers.tima_accum,
+            'subsystems': self._capture_subsystems(),
+        }
+
+    def _state_restore(self, snap):
+        if not snap:
+            return
+        mmu = self.mmu
+        if len(mmu.memory) != 0x10000:
+            mmu.memory = bytearray(0x10000)
+        mmu.memory[:] = snap['memory']
+        (a, f_, b, c, d, e, h, l, sp, pc,
+         halted, ime, ime_pending, halt_bug) = snap['cpu']
+        reg = self.cpu.reg
+        reg.a, reg.f, reg.b, reg.c = a, f_ & 0xF0, b, c
+        reg.d, reg.e, reg.h, reg.l = d, e, h, l
+        reg.sp, reg.pc = sp, pc
+        self.cpu.halted = halted
+        self.cpu.interrupts_master_enabled = ime
+        self.cpu.ime_pending = ime_pending
+        self.cpu.halt_bug_pending = halt_bug
+        self.timers.div_counter = snap['div_counter']
+        self.timers.tima_accum = snap['tima_accum']
+        mmu.memory[0xFF04] = (snap['div_counter'] >> 8) & 0xFF
+        self._restore_subsystems(snap.get('subsystems'))
+
+    @staticmethod
+    def _format_state_message(action, slot, error_code, detail=None):
+        if action == 'save' and error_code is None:
+            return f"State saved to slot {slot}"
+        if action == 'load' and error_code is None:
+            return f"State loaded from slot {slot}"
+        if error_code == 'missing':
+            return f"No save state in slot {slot}"
+        if error_code == 'version':
+            return f"Unsupported save version in slot {slot}"
+        if error_code == 'corrupt':
+            return f"Save file in slot {slot} is corrupted"
+        if error_code == 'wrong_rom':
+            return f"Save state in slot {slot} is for a different ROM"
+        if error_code == 'io':
+            base = f"Could not {action} slot {slot}"
+            return f"{base}: {detail}" if detail else base
+        if action == 'save':
+            return "Failed to save state" + (f": {detail}" if detail else "")
+        return f"Could not load slot {slot}" + (f": {detail}" if detail else "")
 
     def _state_path(self, slot):
         if not self.mmu.rom_path:
@@ -5356,9 +5979,39 @@ class GameBoy:
         base = os.path.splitext(self.mmu.rom_path)[0]
         return f"{base}.ss{slot}"
 
+    def _rom_identity_ok(self, name_len, full_len, saved_name):
+        """Return True when a v4+ save header matches the loaded ROM basename."""
+        if not name_len:
+            return True
+        current_base = os.path.basename(self.mmu.rom_path or '')
+        current_name = current_base.encode('utf-8', 'replace')[:31]
+        current_full_len = min(len(current_base.encode('utf-8', 'replace')), 255)
+        if saved_name != current_name[:name_len]:
+            return False
+        return not (full_len and current_full_len != full_len)
+
+    def _rom_fingerprint_ok(self, rom_size, rom_crc):
+        """Return True when a v8+ save ROM fingerprint matches loaded ROM bytes."""
+        rom = self.mmu.rom_data
+        if len(rom) != rom_size:
+            return False
+        if rom_size == 0:
+            return True
+        return (zlib.crc32(rom) & 0xFFFFFFFF) == (rom_crc & 0xFFFFFFFF)
+
+    def _state_toast(self, action, slot, ok):
+        detail = getattr(self, '_last_state_detail', None)
+        default_err = 'corrupt' if action == 'load' else 'io'
+        err = None if ok else getattr(self, '_last_state_error', default_err)
+        self._status_msg = self._format_state_message(action, slot, err, detail)
+        self._status_ttl = 90
+
     def save_state(self, slot=0):
+        self._last_state_error = None
+        self._last_state_detail = None
         path = self._state_path(slot)
         if not path:
+            self._last_state_error = 'io'
             return False
         try:
             apu = self.apu
@@ -5373,7 +6026,14 @@ class GameBoy:
             apu.drain()
             parts = []
             parts.append(self.SAVE_STATE_MAGIC)
-            parts.append(struct.pack('<BBBB', self.SAVE_STATE_VERSION, slot, 0, 0))
+            rom_base = os.path.basename(mmu.rom_path or '')
+            rom_name = rom_base.encode('utf-8', 'replace')[:31]
+            rom_full_len = min(len(rom_base.encode('utf-8', 'replace')), 255)
+            parts.append(struct.pack(
+                '<BBBB', self.SAVE_STATE_VERSION, slot, len(rom_name), rom_full_len))
+            parts.append(rom_name + b'\x00' * (self._STATE_ROM_ID_BYTES - len(rom_name)))
+            rom_crc = zlib.crc32(mmu.rom_data) & 0xFFFFFFFF if mmu.rom_data else 0
+            parts.append(struct.pack('<II', len(mmu.rom_data), rom_crc))
             # CPU
             reg = cpu.reg
             parts.append(struct.pack('<BBBB BB BB HHHH',
@@ -5416,17 +6076,21 @@ class GameBoy:
             # WRAM bank snapshots
             for i in range(7):
                 parts.append(mmu.wram_banks[i])
-            # PPU
+            # PPU (reserved bytes carry APU frame-sequencer timing when magic is set)
+            apu = self.apu
+            fs_div_lo = apu.fs_div & 0xFF
+            fs_remain_lo = apu._fs_remain & 0xFF
+            fs_remain_hi = (apu._fs_remain >> 8) & 0xFF
             parts.append(struct.pack('<BBB BBBBB BBBBB BBBB BB',
                                      ppu.mode, ppu.scanline_dot & 0xFF,
                                      (ppu.scanline_dot >> 8) & 0xFF,
                                      ppu.mode3_duration & 0xFF, (ppu.mode3_duration >> 8) & 0xFF,
-                                     0, 0, 0,  # reserved
+                                     fs_div_lo, self._STATE_TIMING_MAGIC, fs_remain_lo,
                                      ppu.bg_palette_addr, ppu.obj_palette_addr, ppu.cgb_opri,
                                      1 if ppu.lcd_was_on else 0, 1 if ppu.is_cgb else 0,
                                      ppu.window_line_counter & 0xFF,
                                      (ppu.window_line_counter >> 8) & 0xFF,
-                                     1 if ppu.window_active else 0, 0, 0,
+                                     1 if ppu.window_active else 0, fs_remain_hi, 0,
                                      1 if ppu.prev_stat_irq else 0))
             parts.append(ppu.bg_palette_data)
             parts.append(ppu.obj_palette_data)
@@ -5512,6 +6176,27 @@ class GameBoy:
                                      mmu.mbc7_latch_x & 0xFFFF, mmu.mbc7_latch_y & 0xFFFF,
                                      mmu.eeprom_state & 0xFF, mmu.eeprom_do & 1,
                                      1 if mmu.eeprom_write_en else 0, mmu.eeprom_addr & 0x7F))
+            parts.append(struct.pack(
+                '<HBBBBBBBBBBBBH',
+                mmu.gdma_stall & 0xFFFF,
+                getattr(self, 'speed_remainder', 0) & 0xFF,
+                1 if mmu.bootrom_enabled else 0,
+                mmu._joy_src[0], mmu._joy_src[1], mmu._joy_src[2],
+                mmu._joy_src[3], mmu._joy_src[4],
+                mmu._dpad_last[0], mmu._dpad_last[1],
+                1 if mmu.eeprom_cs else 0,
+                1 if mmu.eeprom_clk else 0,
+                mmu.eeprom_bits & 0xFF,
+                mmu.eeprom_shift & 0xFFFF))
+            sgb_cmd = bytes(mmu.sgb_cmd_data[:self._STATE_SGB_CMD_MAX])
+            parts.append(struct.pack(
+                '<BHBB', 1 if mmu.sgb_in_packet else 0,
+                mmu.sgb_bit_count & 0xFFFF,
+                mmu.sgb_cmd & 0xFF,
+                mmu.sgb_packets_left & 0xFF))
+            parts.append(bytes(mmu.sgb_packet))
+            parts.append(struct.pack('<H', len(sgb_cmd)))
+            parts.append(sgb_cmd)
             with open(path, 'wb') as f:
                 for p in parts:
                     f.write(p)
@@ -5519,26 +6204,51 @@ class GameBoy:
             return True
         except (OSError, struct.error, ValueError) as e:
             logging.warning(f"Could not save state: {e}")
+            self._last_state_error = 'io'
+            self._last_state_detail = str(e)[:60]
             return False
 
     def load_state(self, slot=0):
+        self._last_state_error = None
+        self._last_state_detail = None
         path = self._state_path(slot)
         if not path or not os.path.isfile(path):
+            self._last_state_error = 'missing'
             return False
+        snap = None
         try:
             with open(path, 'rb') as f:
                 data = f.read()
             pos = 0
             if data[pos:pos+4] != self.SAVE_STATE_MAGIC:
                 logging.warning("Save state: bad magic")
+                self._last_state_error = 'corrupt'
                 return False
             pos += 4
             ver = data[pos]
             if ver < self.SAVE_STATE_VERSION_MIN or ver > self.SAVE_STATE_VERSION:
                 logging.warning(f"Save state: unsupported version {ver}")
+                self._last_state_error = 'version'
                 return False
+            if len(data) < self._state_min_bytes(ver):
+                raise ValueError("truncated save state (header)")
             pos += 4
+            if ver >= 4:
+                name_len = data[6]
+                full_len = data[7]
+                saved_name = bytes(data[8:8 + name_len])
+                if not self._rom_identity_ok(name_len, full_len, saved_name):
+                    self._last_state_error = 'wrong_rom'
+                    return False
+                if ver >= 8:
+                    fp_off = 8 + self._STATE_ROM_ID_BYTES
+                    rom_size, rom_crc = struct.unpack_from('<II', data, fp_off)
+                    if not self._rom_fingerprint_ok(rom_size, rom_crc):
+                        self._last_state_error = 'wrong_rom'
+                        return False
+                pos = self._state_header_bytes(ver)
             mmu = self.mmu
+            snap = self._state_backup()
             cpu = self.cpu
             ppu = self.ppu
             apu = self.apu
@@ -5549,7 +6259,7 @@ class GameBoy:
                     raise ValueError(f"truncated save state ({label})")
 
             # CPU
-            cpu_fmt = '<BBBB BB BB HHHH'
+            cpu_fmt = self._STATE_CPU_FMT
             _need(struct.calcsize(cpu_fmt) + 4, "cpu")
             (a, f_, b, c, d, e, h, l, sp, pc, _, _) = struct.unpack_from(cpu_fmt, data, pos)
             pos += struct.calcsize(cpu_fmt)
@@ -5593,8 +6303,7 @@ class GameBoy:
             mmu.has_rtc = bool(has_rtc)
             self._has_rtc = mmu.has_rtc
             mmu.is_cgb = bool(is_cgb)
-            mmu.joypad_buttons = joypad
-            mmu._joy_src = [joypad, 0xFF, 0xFF, 0xFF, 0xFF]
+            saved_joypad = joypad
             mmu.serial_data = serial_data
             mmu.serial_control = serial_control
             mmu.vram_bank_select = vram_bank_select & 1
@@ -5685,6 +6394,7 @@ class GameBoy:
             ppu.prev_stat_irq = bool(_w3)
             ppu.window_line_counter = win_lo | (win_hi << 8)
             ppu.window_active = bool(_w0)
+            timing_magic = (_r1 == self._STATE_TIMING_MAGIC)
             _need(64 + 64, "palettes")
             ppu.bg_palette_data[:] = data[pos:pos+64]
             pos += 64
@@ -5704,7 +6414,13 @@ class GameBoy:
             apu.power = bool(ap[ai]); ai += 1
             apu.is_cgb = bool(ap[ai]); ai += 1
             apu.frame_seq_step = ap[ai] & 0x07; ai += 1
-            apu.fs_div = (ap[ai] & 0xFF) << 8; ai += 1
+            fs_div_hi = ap[ai] & 0xFF; ai += 1
+            if timing_magic:
+                apu.fs_div = _r0 | (fs_div_hi << 8)
+                apu._fs_remain = _r2 | (_w1 << 8)
+            else:
+                apu.fs_div = fs_div_hi << 8
+                apu._sync_fs_remain(apu.fs_div, bool(self.mmu.key1 & 0x80))
             apu.vol_left = ap[ai] & 0x07; apu.vol_right = ap[ai+1] & 0x07; ai += 2
             apu.pan_left = ap[ai]; apu.pan_right = ap[ai+1]; ai += 2
             apu.sample_accum = ap[ai] | (ap[ai+1] << 8); ai += 2
@@ -5782,6 +6498,8 @@ class GameBoy:
                 elif len(mmu.ram_data) > 0:
                     n = min(len(mmu.ram_data), ram_len)
                     mmu.ram_data[:n] = ram_blob[:n]
+                    if ram_len < len(mmu.ram_data):
+                        mmu.ram_data[ram_len:] = b'\x00' * (len(mmu.ram_data) - ram_len)
             if ver >= 3:
                 fmt = '<BHHBBBB'
                 _need(struct.calcsize(fmt), "serial_sgb")
@@ -5820,6 +6538,8 @@ class GameBoy:
                     if len(mmu.flash_data) < flash_len:
                         mmu.flash_data = bytearray(flash_len)
                     mmu.flash_data[:flash_len] = data[pos:pos + flash_len]
+                    if flash_len < len(mmu.flash_data):
+                        mmu.flash_data[flash_len:] = b'\x00' * (len(mmu.flash_data) - flash_len)
                 pos += flash_len
                 fmt = '<BBHHBBBB'
                 _need(struct.calcsize(fmt), "mbc7")
@@ -5834,6 +6554,57 @@ class GameBoy:
                 mmu.eeprom_addr = eaddr
                 if mmu.mbc_type == 0x20:
                     mmu._remap_rom_bank()
+            if ver >= 6:
+                _need(self._STATE_EXTRA_TAIL_V6, "extra")
+                (gdma_stall, speed_rem, bootrom_on,
+                 js0, js1, js2, js3, js4, dp0, dp1,
+                 e_cs, e_clk, e_bits, e_shift) = struct.unpack_from(
+                    '<HBBBBBBBBBBBBH', data, pos)
+                pos += self._STATE_EXTRA_TAIL_V6
+                mmu.gdma_stall = gdma_stall
+                self.speed_remainder = speed_rem & 1
+                mmu.bootrom_enabled = bool(bootrom_on)
+                mmu._joy_src = [js0, js1, js2, js3, js4]
+                mmu._dpad_last = [dp0, dp1]
+                mmu.eeprom_cs = bool(e_cs)
+                mmu.eeprom_clk = bool(e_clk)
+                mmu.eeprom_bits = e_bits
+                mmu.eeprom_shift = e_shift
+                mmu._recompute_joypad()
+                if ver >= 7:
+                    _need(5 + 16 + 2, "sgb_fsm")
+                    (sgb_pkt, sgb_bits, sgb_cmd, sgb_left) = struct.unpack_from(
+                        '<BHBB', data, pos)
+                    pos += 5
+                    mmu.sgb_in_packet = bool(sgb_pkt)
+                    mmu.sgb_bit_count = sgb_bits
+                    mmu.sgb_cmd = sgb_cmd
+                    mmu.sgb_packets_left = sgb_left
+                    mmu.sgb_packet[:] = data[pos:pos + 16]
+                    pos += 16
+                    (cmd_len,) = struct.unpack_from('<H', data, pos)
+                    pos += 2
+                    if cmd_len > self._STATE_SGB_CMD_MAX:
+                        raise ValueError("save state sgb_cmd_data is implausibly large")
+                    _need(cmd_len, "sgb_cmd_data")
+                    mmu.sgb_cmd_data = bytearray(data[pos:pos + cmd_len])
+                    pos += cmd_len
+            elif ver >= 5:
+                _need(self._STATE_TIMING_TAIL_V5, "timing")
+                gdma_stall, speed_rem = struct.unpack_from('<HB', data, pos)
+                pos += self._STATE_TIMING_TAIL_V5
+                mmu.gdma_stall = gdma_stall
+                self.speed_remainder = speed_rem & 1
+                mmu._joy_src = [saved_joypad, 0xFF, 0xFF, 0xFF, 0xFF]
+                mmu._dpad_last = [0, 2]
+                mmu._recompute_joypad()
+            else:
+                mmu.gdma_stall = 0
+                self.speed_remainder = 0
+                mmu._joy_src = [saved_joypad, 0xFF, 0xFF, 0xFF, 0xFF]
+                mmu._dpad_last = [0, 2]
+                mmu._recompute_joypad()
+            self._restore_post_load(ver)
             apu.drain()
             if hasattr(self, '_audio_pending'):
                 self._audio_pending.clear()
@@ -5842,10 +6613,19 @@ class GameBoy:
             self._sync_frames = 0
             logging.info(f"Loaded state from slot {slot}: {os.path.basename(path)}")
             return True
-        except (OSError, struct.error, ValueError, IndexError) as e:
+        except OSError as e:
             logging.warning(f"Could not load state: {e}")
-            if len(self.mmu.memory) != 0x10000:
-                self.mmu.memory = bytearray(0x10000)
+            if snap is not None:
+                self._state_restore(snap)
+            self._last_state_error = 'io'
+            self._last_state_detail = str(e)[:60]
+            return False
+        except (struct.error, ValueError, IndexError) as e:
+            logging.warning(f"Could not load state: {e}")
+            if snap is not None:
+                self._state_restore(snap)
+            self._last_state_error = 'corrupt'
+            self._last_state_detail = str(e)[:60]
             return False
 
     def _pump_audio(self):
@@ -6050,29 +6830,13 @@ class GameBoy:
                     self._open_pause_menu()
                     return
                 elif event.key == pygame.K_F6:
-                    if self.save_state(0):
-                        self._status_msg = "State saved to slot 0"
-                    else:
-                        self._status_msg = "Failed to save state"
-                    self._status_ttl = 90
+                    self._state_toast('save', 0, self.save_state(0))
                 elif event.key == pygame.K_F7:
-                    if self.load_state(0):
-                        self._status_msg = "State loaded from slot 0"
-                    else:
-                        self._status_msg = "No save state in slot 0"
-                    self._status_ttl = 90
+                    self._state_toast('load', 0, self.load_state(0))
                 elif event.key == pygame.K_F8:
-                    if self.save_state(1):
-                        self._status_msg = "State saved to slot 1"
-                    else:
-                        self._status_msg = "Failed to save state"
-                    self._status_ttl = 90
+                    self._state_toast('save', 1, self.save_state(1))
                 elif event.key == pygame.K_F9:
-                    if self.load_state(1):
-                        self._status_msg = "State loaded from slot 1"
-                    else:
-                        self._status_msg = "No save state in slot 1"
-                    self._status_ttl = 90
+                    self._state_toast('load', 1, self.load_state(1))
                 elif event.key == pygame.K_F3:
                     self._show_fps = not self._show_fps
                     self._status_msg = "FPS overlay on" if self._show_fps else "FPS overlay off"
@@ -6209,6 +6973,7 @@ class GameBoy:
         cpu.interrupts_master_enabled = False
         cpu.ime_pending = False
         cpu.halt_bug_pending = False
+        cpu._logged_opcodes.clear()
         cpu.reg.sp = 0xFFFE
         cpu.reg.pc = 0x0100
         if self.mmu.is_cgb:
@@ -6229,6 +6994,7 @@ class GameBoy:
             cpu.reg.e = 0xD8
             cpu.reg.h = 0x01
             cpu.reg.l = 0x4D
+        self.mmu.bootrom_enabled = False
         self._apply_post_boot_io()
         ppu = self.ppu
         ppu.scanline_dot = 0
@@ -6256,55 +7022,71 @@ class GameBoy:
         try:
             h = self.screen.get_height()
             f = get_font(18 if h >= 400 else 14)
-            y = 8
             right = self.screen.get_width() - 8
-
-            def _badge(surf, colour=MENU_HI):
-                nonlocal y
-                bg = pygame.Surface((surf.get_width() + 12, surf.get_height() + 6))
-                bg.fill(MENU_BG)
-                bg.set_alpha(210)
-                x = right - bg.get_width()
-                self.screen.blit(bg, (x, y))
-                pygame.draw.rect(self.screen, colour, (x, y, bg.get_width(), bg.get_height()), 1)
-                self.screen.blit(surf, (x + 6, y + 3))
-                y += bg.get_height() + 4
-
+            badges = []
+            lc = self.mmu.link_cable
+            if lc is not None and lc.is_connected:
+                badges.append(f.render("LINK", True, MENU_HI))
             if getattr(self, '_fast_forward', False):
-                _badge(f.render("FF", True, MENU_HI))
+                badges.append(f.render("FF", True, MENU_HI))
             if getattr(self, '_show_fps', False):
-                _badge(f.render(f"{getattr(self, '_fps_value', 0.0):.0f} fps", True, MENU_HI))
+                badges.append(f.render(f"{getattr(self, '_fps_value', 0.0):.0f} fps", True, MENU_HI))
             if getattr(self, '_show_input', False):
                 jp = self.mmu.joypad_buttons
                 names = (('R', 0), ('L', 1), ('U', 2), ('D', 3),
-                         ('A', 4), ('B', 5), ('Se', 6), ('St', 7))
+                         ('A', 4), ('B', 5), ('Sel', 6), ('Sta', 7))
                 parts = []
-                total_w = 6
                 for label, bit in names:
                     pressed = (jp & (1 << bit)) == 0
-                    ps = f.render(label, True, MENU_HI if pressed else MENU_DIM)
-                    parts.append(ps)
-                    total_w += ps.get_width() + 6
-                row = pygame.Surface((max(total_w, 12), f.get_height()))
+                    parts.append(f.render(label, True, MENU_HI if pressed else MENU_DIM))
+                gap = 6
+                pad_x = 8
+                row_w = pad_x + sum(ps.get_width() for ps in parts) + gap * (len(parts) - 1) + pad_x
+                row_h = f.get_height() + 6
+                row = pygame.Surface((max(row_w, 12), row_h))
                 row.fill(MENU_BG)
-                rx = 0
+                rx = pad_x
                 for ps in parts:
-                    row.blit(ps, (rx, 0))
-                    rx += ps.get_width() + 6
-                _badge(row)
+                    row.blit(ps, (rx, 3))
+                    rx += ps.get_width() + gap
+                badges.append(row)
+            if not badges:
+                return
+            gap = 6
+            pad = 6
+            total_w = pad + sum(
+                b.get_width() + pad for b in badges) + gap * (len(badges) - 1)
+            bar_h = max(b.get_height() + 6 for b in badges)
+            bar = pygame.Surface((total_w, bar_h))
+            bar.fill(MENU_BG)
+            bar.set_alpha(210)
+            x = right - total_w
+            self.screen.blit(bar, (x, 8))
+            pygame.draw.rect(self.screen, MENU_DIM, (x, 8, total_w, bar_h), 1)
+            bx = x + pad
+            for badge in badges:
+                by = 8 + (bar_h - badge.get_height()) // 2
+                self.screen.blit(badge, (bx, by))
+                bx += badge.get_width() + gap
         except (pygame.error, AttributeError):
             pass
 
     # ── In-game pause menu ────────────────────────────────────────────
-    PAUSE_ITEMS = ["Resume", "Save State", "Load State", "Settings", "Exit to Menu"]
+    PAUSE_ITEMS = ["Resume", "Save States...", "Settings", "Exit to Menu"]
+    SAVE_STATE_ITEMS = [
+        "Save to Slot 0", "Load from Slot 0",
+        "Save to Slot 1", "Load from Slot 1",
+    ]
 
     def _open_pause_menu(self):
         """Enter the paused state; the main loop hands control to _pause_menu_loop."""
         self.paused = True
         self.pause_cursor = 0
+        self.pause_save_cursor = 0
         self.pause_settings_cursor = 0
         self.pause_exit_cursor = 0
         self.pause_controls_cursor = 0
+        self.pause_controls_scroll = 0
         self.controls_capture = None
         self._fast_forward = False
 
@@ -6379,7 +7161,7 @@ class GameBoy:
         elif cursor == 7:
             return False
         # Persist settings so they survive restart
-        _save_config(dict(
+        if not _save_config(dict(
             window_scale=WINDOW_SCALE_OPTIONS[si['scale']][1],
             fps_limit=FPS_LIMIT_OPTIONS[si['fps']][1],
             audio_enabled=AUDIO_OPTIONS[si['audio']][1],
@@ -6389,7 +7171,8 @@ class GameBoy:
             shader=si['shader'],
             wasd_enabled=self.wasd_enabled,
             key_bindings=self.key_bindings,
-        ))
+        )):
+            self._pause_status("Could not save settings")
         return resized
 
     def _capture_pause_backdrop(self):
@@ -6426,7 +7209,7 @@ class GameBoy:
             if self._pause_msg_ttl > 0:
                 self._pause_msg_ttl -= 1
             self._render_pause_page(page, backdrop)
-            clock.tick(30)
+            clock.tick(60)
 
         # Resume cleanly: re-sync held keys to the joypad and reset the A/V clock
         # so frame pacing doesn't try to "catch up" on the paused wall-clock time.
@@ -6437,12 +7220,41 @@ class GameBoy:
         self._sync_samples = 0
         self._sync_frames = 0
 
+    def _pause_quick_state(self, action, slot, backdrop):
+        if action == 'save':
+            ok = self.save_state(slot)
+            detail = getattr(self, '_last_state_detail', None)
+            self._pause_status(self._format_state_message(
+                'save', slot, None if ok else getattr(self, '_last_state_error', 'io'), detail))
+            return backdrop
+        if self.load_state(slot):
+            self._pause_status(self._format_state_message('load', slot, None))
+            return self._capture_pause_backdrop()
+        detail = getattr(self, '_last_state_detail', None)
+        self._pause_status(self._format_state_message(
+            'load', slot, getattr(self, '_last_state_error', 'corrupt'), detail))
+        return backdrop
+
     def _handle_pause_events(self, page, backdrop):
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 self.running = False
                 self.paused = False
                 return page, backdrop
+            if event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_r and (event.mod & pygame.KMOD_CTRL):
+                    self.soft_reset()
+                    backdrop = self._capture_pause_backdrop()
+                    self._pause_status("Reset")
+                    continue
+                if event.key in (pygame.K_F6, pygame.K_F7, pygame.K_F8, pygame.K_F9):
+                    quick = {
+                        pygame.K_F6: ('save', 0), pygame.K_F7: ('load', 0),
+                        pygame.K_F8: ('save', 1), pygame.K_F9: ('load', 1),
+                    }
+                    act, slot = quick[event.key]
+                    backdrop = self._pause_quick_state(act, slot, backdrop)
+                    continue
             if page == "controls" and self.controls_capture is not None:
                 if event.type == pygame.KEYDOWN:
                     if event.key == pygame.K_ESCAPE:
@@ -6487,6 +7299,7 @@ class GameBoy:
                 elif action == pygame.K_RETURN or action == 'select':
                     if self.pause_settings_cursor == 7:
                         self.pause_controls_cursor = 0
+                        self.pause_controls_scroll = 0
                         self.controls_capture = None
                         page = "controls"
                     elif self._cycle_pause_setting(self.pause_settings_cursor, 1):
@@ -6501,32 +7314,54 @@ class GameBoy:
                             backdrop = self._capture_pause_backdrop()
                 elif action == pygame.K_ESCAPE or action == 'back':
                     page = "pause"
+            elif page == "save_states":
+                items = self.SAVE_STATE_ITEMS
+                if action in (pygame.K_UP, 'up'):
+                    self.pause_save_cursor = (self.pause_save_cursor - 1) % len(items)
+                elif action in (pygame.K_DOWN, 'down'):
+                    self.pause_save_cursor = (self.pause_save_cursor + 1) % len(items)
+                elif action == pygame.K_RETURN or action == 'select':
+                    page, backdrop = self._activate_save_state_item(backdrop)
+                elif action == pygame.K_ESCAPE or action == 'back':
+                    page = "pause"
             elif page == "controls":
                 items = self._pause_controls_items()
+                cap = _overlay_scroll_capacity(*self.screen.get_size(), has_status=True)
                 if action in (pygame.K_UP, 'up'):
-                    self.pause_controls_cursor = (self.pause_controls_cursor - 1) % len(items)
+                    self.pause_controls_cursor = _advance_controls_cursor(
+                        self.pause_controls_cursor, -1, len(items))
+                    self.pause_controls_scroll, _ = _sync_list_scroll(
+                        self.pause_controls_cursor, self.pause_controls_scroll, cap, len(items))
                 elif action in (pygame.K_DOWN, 'down'):
-                    self.pause_controls_cursor = (self.pause_controls_cursor + 1) % len(items)
+                    self.pause_controls_cursor = _advance_controls_cursor(
+                        self.pause_controls_cursor, 1, len(items))
+                    self.pause_controls_scroll, _ = _sync_list_scroll(
+                        self.pause_controls_cursor, self.pause_controls_scroll, cap, len(items))
                 elif action == pygame.K_RETURN or action == 'select':
-                    if self.pause_controls_cursor < 8:
+                    if self.pause_controls_cursor < CONTROLS_WASD_ROW:
                         self.controls_capture = JOYPAD_BUTTON_KEYS[self.pause_controls_cursor]
-                    elif self.pause_controls_cursor == 8:
+                    elif self.pause_controls_cursor == CONTROLS_WASD_ROW:
                         self.wasd_enabled = not self.wasd_enabled
                         self.key_bindings = _sanitize_key_bindings(self.key_bindings, self.wasd_enabled)
                         self.key_bindings = _rebuild_key_map(self.key_bindings, self.wasd_enabled)
-                        _save_config({
+                        if not _save_config({
                             'key_bindings': self.key_bindings,
                             'wasd_enabled': self.wasd_enabled,
-                        })
-                    else:
+                        }):
+                            self._pause_status("Could not save settings")
+                    elif self.pause_controls_cursor == CONTROLS_TURBO_ROW:
+                        self._pause_status("Turbo A/B: Q/E (not remappable)")
+                    elif self.pause_controls_cursor == CONTROLS_RESET_ROW:
                         self.wasd_enabled = True
                         self.key_bindings = _default_key_bindings(True)
                         self.key_bindings = _rebuild_key_map(self.key_bindings, True)
-                        _save_config({
+                        if not _save_config({
                             'key_bindings': self.key_bindings,
                             'wasd_enabled': True,
-                        })
-                        self._pause_status("Controls reset to default")
+                        }):
+                            self._pause_status("Could not save settings")
+                        else:
+                            self._pause_status("Controls reset to default")
                 elif action == pygame.K_ESCAPE or action == 'back':
                     self.controls_capture = None
                     page = "settings"
@@ -6548,15 +7383,9 @@ class GameBoy:
         choice = self.PAUSE_ITEMS[self.pause_cursor]
         if choice == "Resume":
             self.paused = False
-        elif choice == "Save State":
-            ok = self.save_state(0)
-            self._pause_status("State saved to slot 0" if ok else "Failed to save state")
-        elif choice == "Load State":
-            if self.load_state(0):
-                self._pause_status("State loaded from slot 0")
-                backdrop = self._capture_pause_backdrop()
-            else:
-                self._pause_status("No save state in slot 0")
+        elif choice == "Save States...":
+            self.pause_save_cursor = 0
+            page = "save_states"
         elif choice == "Settings":
             self.pause_settings_cursor = 0
             page = "settings"
@@ -6564,6 +7393,25 @@ class GameBoy:
             self.pause_exit_cursor = 0
             page = "confirm_exit"
         return page, backdrop
+
+    def _activate_save_state_item(self, backdrop):
+        choice = self.SAVE_STATE_ITEMS[self.pause_save_cursor]
+        if choice.startswith("Save to Slot "):
+            slot = int(choice.rsplit(' ', 1)[-1])
+            ok = self.save_state(slot)
+            detail = getattr(self, '_last_state_detail', None)
+            self._pause_status(self._format_state_message(
+                'save', slot, None if ok else getattr(self, '_last_state_error', 'io'), detail))
+        elif choice.startswith("Load from Slot "):
+            slot = int(choice.rsplit(' ', 1)[-1])
+            if self.load_state(slot):
+                self._pause_status(self._format_state_message('load', slot, None))
+                backdrop = self._capture_pause_backdrop()
+            else:
+                detail = getattr(self, '_last_state_detail', None)
+                self._pause_status(self._format_state_message(
+                    'load', slot, getattr(self, '_last_state_error', 'corrupt'), detail))
+        return "save_states", backdrop
 
     def _pause_controls_items(self):
         items = [
@@ -6574,14 +7422,21 @@ class GameBoy:
             idx = JOYPAD_BUTTON_KEYS.index(self.controls_capture)
             items[idx] = f"{JOYPAD_BUTTON_LABELS[idx]}: Press a key..."
         items.append(f"WASD as D-Pad: {'On' if self.wasd_enabled else 'Off'}")
+        items.append("Turbo A/B: Q/E (not remappable)")
         items.append("Reset to Default")
         return items
 
-    def _draw_overlay_menu(self, backdrop, title, items, cursor, hint, hint_hi=False):
+    def _draw_overlay_menu(self, backdrop, title, items, cursor, hint, hint_hi=False,
+                           scroll=0, status=None, status_hi=False):
         self.screen.blit(backdrop, (0, 0))
         w, h = self.screen.get_size()
-        n = max(len(items), 1)
-        L = _overlay_layout(w, h, n, has_hint=bool(hint))
+        has_status = bool(status)
+        cap = _overlay_scroll_capacity(w, h, has_hint=bool(hint), has_status=has_status)
+        n_items = max(len(items), 1)
+        scroll, cap = _sync_list_scroll(cursor, scroll, cap, n_items)
+        visible = items[scroll:scroll + cap] if items else [""]
+        display_cursor = cursor - scroll
+        L = _overlay_layout(w, h, len(visible), has_hint=bool(hint), has_status=has_status)
         px, py = L['px'], L['py']
         panel_w, panel_h = L['panel_w'], L['panel_h']
         panel = pygame.Surface((panel_w, panel_h))
@@ -6595,11 +7450,16 @@ class GameBoy:
         self.screen.blit(ts, (px + (panel_w - ts.get_width()) // 2, py + 6))
 
         itf = get_font(L['item_size'])
+        scroll_font = get_font(max(11, L['item_size'] - 4))
         max_item_w = panel_w - 40
-        for i, item in enumerate(items):
-            iy = py + L['title_band'] + i * L['item_h']
+        list_y = py + L['title_band']
+        if scroll > 0:
+            more = scroll_font.render("^ more", True, MENU_DIM)
+            self.screen.blit(more, (px + (panel_w - more.get_width()) // 2, list_y - 2))
+        for i, item in enumerate(visible):
+            iy = list_y + i * L['item_h']
             label = _fit_text(itf, item, max_item_w)
-            if i == cursor:
+            if i == display_cursor:
                 bar_h = max(12, L['item_h'] - 2)
                 _blit_selection_bar(self.screen, px + 6, iy - 1, panel_w - 12, bar_h)
                 colour = MENU_HI
@@ -6607,13 +7467,23 @@ class GameBoy:
                 colour = MENU_FG
             isf = itf.render(label, True, colour)
             ix = px + max(16, (panel_w - isf.get_width()) // 2)
-            if i == cursor:
+            if i == display_cursor:
                 cursor_surf = itf.render(">", True, MENU_HI)
                 self.screen.blit(
                     cursor_surf,
                     (max(px + 10, ix - cursor_surf.get_width() - 6), iy))
             self.screen.blit(isf, (ix, iy))
+        if scroll + cap < n_items:
+            more = scroll_font.render("v more", True, MENU_DIM)
+            vy = list_y + len(visible) * L['item_h'] - 2
+            self.screen.blit(more, (px + (panel_w - more.get_width()) // 2, vy))
 
+        y_footer = py + panel_h
+        if has_status:
+            sf = get_font(L['hint_size'])
+            ss = sf.render(_fit_text(sf, status, panel_w - 16), True, MENU_HI if status_hi else MENU_DIM)
+            y_footer -= L['status_band']
+            self.screen.blit(ss, (px + (panel_w - ss.get_width()) // 2, y_footer + 2))
         if hint:
             hf = get_font(L['hint_size'])
             hs = hf.render(
@@ -6624,40 +7494,80 @@ class GameBoy:
                 (px + (panel_w - hs.get_width()) // 2,
                  py + panel_h - L['hint_band'] + 4))
         pygame.display.flip()
+        return scroll
 
     def _pause_hint(self, wide, narrow):
         return wide if self.screen.get_width() >= 400 else narrow
 
     def _render_pause_page(self, page, backdrop):
+        status = self._pause_msg if self._pause_msg_ttl > 0 else None
         if page == "settings":
             self._draw_overlay_menu(
                 backdrop, "Settings", self._pause_settings_items(),
                 self.pause_settings_cursor,
                 self._pause_hint("Left/Right or Enter: Change   Esc: Back",
-                                 "Left/Right: Change   Esc: Back"))
+                                 "Left/Right: Change   Esc: Back"),
+                status=status, status_hi=True)
         elif page == "controls":
             if self.controls_capture:
                 hint = self._pause_hint("Press a new key   Esc: Cancel",
                                         "Press a key   Esc: Cancel")
             else:
-                hint = self._pause_hint("Enter: Remap / Toggle   Esc: Back",
-                                        "Enter: Remap   Esc: Back")
-            self._draw_overlay_menu(
+                hint = self._pause_hint(
+                    "Enter: Remap / Toggle   Esc: Back   Tab/F3/F4/Ctrl+R in-game",
+                    "Enter: Remap   Esc: Back")
+            self.pause_controls_scroll = self._draw_overlay_menu(
                 backdrop, "Controls", self._pause_controls_items(),
-                self.pause_controls_cursor, hint)
+                self.pause_controls_cursor, hint,
+                scroll=self.pause_controls_scroll, status=status, status_hi=True)
+        elif page == "save_states":
+            self._draw_overlay_menu(
+                backdrop, "Save States", self.SAVE_STATE_ITEMS,
+                self.pause_save_cursor,
+                self._pause_hint("Enter: Save/Load   Esc: Back   F6-F9: Quick keys",
+                                 "Enter: Save/Load   Esc: Back   F6-F9"),
+                status=status, status_hi=True)
         elif page == "confirm_exit":
             self._draw_overlay_menu(
                 backdrop, "Exit to Menu?",
                 ["Keep Playing", "Exit to Menu"], self.pause_exit_cursor,
-                self._pause_hint("Tip: F6 saves progress first", "F6 saves first"))
+                self._pause_hint("Battery save writes on exit. F6/F8 = quick-save slots.",
+                                 "Battery save on exit"),
+                status=status, status_hi=True)
         else:
-            status = self._pause_msg_ttl > 0 and self._pause_msg
-            hint = status or self._pause_hint(
-                "Up/Down: Move   Enter: Select   Esc: Resume",
-                "Enter: Select   Esc: Resume")
             self._draw_overlay_menu(
                 backdrop, "Paused", self.PAUSE_ITEMS,
-                self.pause_cursor, hint, hint_hi=bool(status))
+                self.pause_cursor,
+                self._pause_hint(
+                    "Up/Down: Move   Enter: Select   Esc: Resume   F6-F9: Save/Load",
+                    "Enter: Select   Esc: Resume   F6-F9"),
+                status=status, status_hi=True)
+
+    def _apply_display_shader(self, fnp):
+        """Run the active post-process shader using pre-allocated scratch buffers."""
+        shader = self.shader
+        if shader is _shader_none:
+            return fnp
+        out = self._shader_out
+        if shader is _shader_lcd_ghost:
+            prev = self._prev_shader_frame
+            if prev is None:
+                np.copyto(self._ghost_store, fnp)
+                self._prev_shader_frame = self._ghost_store
+                return fnp
+            arr = _shader_lcd_ghost(
+                fnp, prev, out=out,
+                scratch=self._shader_f32, scratch_b=self._shader_f32_b)
+            np.copyto(prev, fnp)
+            return arr
+        if shader is _shader_crt_scanlines:
+            return _shader_crt_scanlines(fnp, out)
+        if shader is _shader_gamma_warm:
+            return _shader_gamma_warm(fnp, out, self._shader_f32)
+        if shader is _shader_pixel_bloom:
+            return _shader_pixel_bloom(
+                fnp, out=out, acc=self._shader_f32, blend=self._shader_f32_b)
+        return shader(fnp)
 
     def render(self, overlays=True):
         """Draws the PPU framebuffer to the Pygame screen."""
@@ -6670,15 +7580,14 @@ class GameBoy:
             fnp[:, :, 0] = (packed >> 16) & 0xFF
             fnp[:, :, 1] = (packed >> 8) & 0xFF
             fnp[:, :, 2] = packed & 0xFF
-            arr = fnp
-            if self.shader is _shader_lcd_ghost:
-                arr = self.shader(arr, prev=self._prev_shader_frame)
-                self._prev_shader_frame = arr.copy()
-            else:
-                arr = self.shader(arr)
+            arr = self._apply_display_shader(fnp)
             np.copyto(self._blit_np, arr.transpose(1, 0, 2))
             surf = pygame.surfarray.make_surface(self._blit_np)
         else:
+            if pygame and not self._numpy_slow_warned:
+                self._numpy_slow_warned = True
+                self._status_msg = "Install numpy for faster rendering (pip install numpy)"
+                self._status_ttl = 180
             surf = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT))
             pxa = pygame.PixelArray(surf)
             fb = self.ppu.framebuffer

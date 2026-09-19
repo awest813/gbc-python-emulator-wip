@@ -281,13 +281,38 @@ def test_turbo_and_reset(ns):
         check("soft reset clears HALT", gb.cpu.halted is False)
         check("soft reset clears IF", gb.mmu.memory[0xFF0F] == 0)
         check("soft reset clears IME", gb.cpu.interrupts_master_enabled is False)
+        gb.mmu.load_bootrom(bytes([0xBE] * 256))
+        check("boot ROM is mapped before reset", gb.mmu.bootrom_enabled is True)
+        gb.soft_reset()
+        check("soft reset unmaps boot ROM", gb.mmu.bootrom_enabled is False)
     finally:
         os.unlink(path)
+
+
+def test_controls_rows(ns):
+    keys = ns["JOYPAD_BUTTON_KEYS"]
+    wasd = ns["CONTROLS_WASD_ROW"]
+    turbo = ns["CONTROLS_TURBO_ROW"]
+    reset = ns["CONTROLS_RESET_ROW"]
+    advance = ns["_advance_controls_cursor"]
+    check("controls WASD row index", wasd == len(keys))
+    check("controls turbo row index", turbo == wasd + 1)
+    check("controls reset row index", reset == wasd + 2)
+    menu = ns["EmulatorMenu"]()
+    items = menu._controls_items()
+    check("turbo row is informational", items[turbo].startswith("Turbo"))
+    check("reset is last controls row", items[reset] == "Reset to Default")
+    n = len(items)
+    check("down from WASD skips turbo", advance(wasd, 1, n) == reset)
+    check("up from reset skips turbo", advance(reset, -1, n) == wasd)
 
 
 def test_ui_layout(ns):
     """Menu overlay metrics must keep title, rows, and hint on-screen."""
     _overlay_layout = ns["_overlay_layout"]
+    _sync_list_scroll = ns["_sync_list_scroll"]
+    _overlay_scroll_capacity = ns["_overlay_scroll_capacity"]
+    _read_rom_system_tag = ns["_read_rom_system_tag"]
     _decorate_cyclic_setting = ns["_decorate_cyclic_setting"]
     check("cyclic setting shows chevrons when selected",
           _decorate_cyclic_setting("Window Scale: 4x", True) == "Window Scale: < 4x >")
@@ -295,6 +320,25 @@ def test_ui_layout(ns):
           _decorate_cyclic_setting("Window Scale: 4x", False) == "Window Scale: 4x")
     check("Controls row is not decorated",
           _decorate_cyclic_setting("Controls...", True) == "Controls...")
+    scroll, cap = _sync_list_scroll(9, 0, 4, 11)
+    check("list scroll follows cursor down", scroll == 6 and cap == 4)
+    scroll, cap = _sync_list_scroll(2, 6, 4, 11)
+    check("list scroll follows cursor up", scroll == 2 and cap == 4)
+    check("overlay scroll capacity is positive",
+          _overlay_scroll_capacity(320, 288, has_status=True) >= 3)
+    with tempfile.NamedTemporaryFile(suffix=".gb", delete=False) as tf:
+        rom = bytearray(0x200)
+        rom[0x0143] = 0x80
+        tf.write(rom)
+        dmg_path = tf.name
+    try:
+        check("CGB ROM tag", _read_rom_system_tag(dmg_path) == "CGB")
+        rom[0x0143] = 0x00
+        with open(dmg_path, "wb") as f:
+            f.write(rom)
+        check("DMG ROM tag", _read_rom_system_tag(dmg_path) == "DMG")
+    finally:
+        os.unlink(dmg_path)
     cases = (
         (320, 288, 10, True),
         (320, 288, 5, True),
@@ -303,9 +347,10 @@ def test_ui_layout(ns):
         (640, 576, 10, True),
         (640, 480, 3, False),
         (800, 720, 10, True),
+        (320, 288, 4, True),
     )
     for w, h, n, hint in cases:
-        L = _overlay_layout(w, h, n, has_hint=hint)
+        L = _overlay_layout(w, h, n, has_hint=hint, has_status=(n <= 4))
         check(f"overlay {w}x{h} n={n} stays in window",
               L['px'] >= 0 and L['py'] >= 0
               and L['px'] + L['panel_w'] <= w
@@ -435,6 +480,7 @@ def main():
     print("joypad sources:");          test_joypad_sources(ns)
     print("socd cleaning:");           test_socd(ns)
     print("key bindings:");            test_key_bindings(ns)
+    print("controls rows:");           test_controls_rows(ns)
     print("config merge:");            test_config_merge(ns)
     print("gamepad start combo:");     test_gamepad_start_does_not_auto_pause(ns)
     print("inc preserves carry:");     test_inc_preserves_carry(ns)

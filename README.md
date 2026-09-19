@@ -47,7 +47,9 @@ Super Game Boy palettes, and full CGB compatibility.
   write-protection rules (STAT read-only bits 0-2 / 6, unused bits
   forced to 1). Boot ROM support (DMG 256B / CGB ~2304B).
 - **Save states** — Snapshot full emulator state (including cartridge SRAM)
-  to `<rom>.ss<slot>` with F6 / F8 (save) and F7 / F9 (load).
+  to `<rom>.ss<slot>` with F6 / F8 (save) and F7 / F9 (load). v8 saves
+  record the ROM basename plus a CRC32 fingerprint and refuse to load into
+  a different game or a same-name file swap.
 - **Menu system** — ROM browser, window-scale selector, keyboard controls,
   project logo.
 - **Input** — D-pad, A / B, Start, Select via keyboard (customisable
@@ -87,10 +89,12 @@ python gbc_emulator.py
 
 ```bash
 python gbc_emulator.py path/to/rom.gb
+python gbc_emulator.py path/to/rom.gbc --bootrom path/to/boot.bin
 ```
 
 `--nomenu` is still accepted and means the same thing. A missing ROM path
-prints an error instead of dropping into the menu.
+prints an error instead of dropping into the menu. `--bootrom` loads an
+optional DMG (256 B) or CGB (~2304 B) boot ROM before the cartridge starts.
 
 ### Chromebook (Crostini Linux)
 
@@ -129,6 +133,9 @@ prints an error instead of dropping into the menu.
 | F5 (in menu)   | Refresh ROMs  |
 | F6 / F8        | Save state (slot 0 / 1) |
 | F7 / F9        | Load state (slot 0 / 1) |
+
+When a link cable is connected, a **LINK** badge appears in the HUD
+(top-right, with the FPS / input overlays).
 
 Keys are customisable: **Settings → Controls...** (also available from the
 in-game pause menu). Press Enter on a button to capture a new key. Esc, Tab,
@@ -173,11 +180,13 @@ file is created automatically in the emulator directory.
 
 ## Menu
 
-- **Load ROM** — Browse and select a `.gb` or `.gbc` file. Press **F5**
+- **Load ROM** — Browse and select a `.gb` or `.gbc` file. Each entry
+  shows a **DMG** or **CGB** badge from the ROM header. Press **F5**
   to refresh the list.
 - **Settings** — Tweak the following options (press **Enter** to cycle each):
   - *Window Scale* — 2× … 5×
   - *Frame Rate* — 59.7 fps / 60 fps / Unlimited
+  - *Audio* — On / Off
   - *Volume* — Mute / Low / Medium / High / Max
   - *Palette* — DMG Green / Grayscale / Amber / Blue / Brown / Pastel
   - *Filter* — Nearest (pixel-sharp) / Smooth (bilinear)
@@ -188,10 +197,14 @@ file is created automatically in the emulator directory.
 ## Pause menu
 
 Press **Escape** while a game is running to open the in-game pause menu.
-Emulation and audio halt, and the current frame is dimmed behind the menu:
+Emulation and audio halt, and the current frame is dimmed behind the menu.
+**F6–F9** quick-save/load and **Ctrl+R** soft reset still work while the
+pause overlay is open:
 
 - **Resume** — Return to the game (Escape also resumes).
-- **Save State** / **Load State** — Quick-save or restore slot 0.
+- **Save States...** — Sub-menu with save/load for slots 0 and 1
+  (same as F6–F9). Status toasts appear in a dedicated strip above
+  the navigation hint.
 - **Settings** — The same options as the main settings page, applied
   **live** to the running game (palette, shader, filter, volume, audio,
   frame rate, window scale, and Controls remapping all update immediately).
@@ -237,6 +250,10 @@ Performance-critical helpers:
   empty samples per video frame.
 - Halted CPUs skip ahead to the next PPU mode or TIMA event instead of
   burning 4 T-cycles per `step_all` call (~17k times per frame).
+- APU frame-sequencer countdown and reused OAM scans (~10% higher synthetic
+  throughput vs. the pre-audit baseline on `smoke_test.py`).
+- On boot, invalid Nintendo logos / header checksums and unsupported mappers
+  show a warning toast without blocking the load.
 
 ## Project Layout
 
@@ -289,10 +306,9 @@ python test_controls.py
 ```
 
 All four portable tests are self-contained (no display, no local ROMs) and exit
-non-zero on failure, so they work as CI checks.
-
-A fourth portable test covers Super Game Boy packets, MBC6/MBC7 mappers,
-cycle-accurate serial bit-clocking, and CGB double-speed cartridge wait-states:
+non-zero on failure, so they work as CI checks. The fourth test covers Super
+Game Boy packets, MBC6/MBC7 mappers, cycle-accurate serial bit-clocking, and
+CGB double-speed cartridge wait-states:
 
 ```bash
 python test_hw_features.py
@@ -325,9 +341,19 @@ interpreter on modest hardware.
 - Link-cable multiplayer is CLI-only (`--link-server PORT` /
   `--link-connect HOST:PORT` with a ROM path). Bytes are exchanged at
   transfer start, then shifted locally one bit at a time. A stalled
-  partner times out instead of freezing the emulator.
+  partner times out instead of freezing the emulator. The HUD shows
+  **LINK** while the socket is connected.
 - Save states (slots 0 and 1) include cartridge SRAM, MBC6 flash, SGB
-  palettes, and in-flight serial state. Battery-backed `.sav` files are
+  palettes, and in-flight serial state. v8 saves store the ROM basename,
+  byte length, and CRC32 fingerprint (with length guard), APU
+  frame-sequencer timing, GDMA stall, double-speed remainder, boot-ROM
+  map flag, per-source joypad state, MBC7 EEPROM shift progress, and
+  in-progress Super Game Boy packet assembly; v4–v7 saves still load
+  without a CRC check; v1–v3 load without a ROM identity check. Loading
+  v6 or older clears any partial SGB packet state. Failed
+  loads roll back live CPU/MMU/PPU/APU state. In-flight serial shifts are
+  cleared on load unless a link partner is connected.
+  Battery-backed `.sav` files are
   written on exit. MBC3 RTC is stored after SRAM in VBA-M's 44-byte
   format so day/night continues while the emulator is closed. Older
   48-byte custom trailers still load.

@@ -4,6 +4,8 @@ Exits non-zero on any failure. No display and no local ROM files required.
 """
 import os
 import sys
+import threading
+import time
 
 os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
@@ -212,8 +214,35 @@ def test_sgb_palettes_and_mlt(ns):
     check("player id advances to player 2", (m.read_byte(0xFF00) & 0x0F) == 0x0E)
 
 
+def test_link_cable_loopback(ns):
+    """TCP link cable exchanges bytes between two emulator instances."""
+    LinkCable = ns["LinkCable"]
+    port = 28777
+    server = LinkCable()
+    client = LinkCable()
+    partner_byte = []
+
+    def run_server():
+        server.start_server(port)
+        if server.sock is not None:
+            partner_byte.append(server.transfer(0xAA))
+
+    t = threading.Thread(target=run_server, daemon=True)
+    t.start()
+    time.sleep(0.05)
+    client.connect("127.0.0.1", port)
+    check("link client connects", client.is_connected)
+    got = client.transfer(0x55)
+    t.join(timeout=2)
+    check("link server received partner byte", partner_byte == [0x55])
+    check("link client received partner byte", got == 0xAA)
+    client.close()
+    server.close()
+
+
 def main():
     ns = load_module()
+    print("link cable loopback:");   test_link_cable_loopback(ns)
     print("serial bit-clock:");      test_serial_bit_clock(ns)
     print("CGB cart wait-states:");  test_cart_wait_states(ns)
     print("MBC6 banking:");          test_mbc6_banking(ns)

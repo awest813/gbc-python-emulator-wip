@@ -419,10 +419,9 @@ def test_apu_frame_sync(ns):
 
     apu.fs_div = 0
     apu.frame_seq_step = 0
+    apu._fs_remain = apu._frame_seq_period(False)
     apu.step(CYCLES_PER_FRAME)
     check("frame sequencer wraps 8 ticks per video frame", apu.frame_seq_step == 0)
-    check("bit-12 falling edges in one frame",
-          ns["_bit_falling_edges"](0, CYCLES_PER_FRAME, 12) == 8)
 
 
 def test_gameboy_frame_audio(ns):
@@ -662,6 +661,78 @@ def test_apu_power_and_div(ns):
     check("DIV reset clears the APU DIV shadow", gb.apu.fs_div == 0)
 
 
+def test_double_speed_apu_sync(ns):
+    """CGB STOP must resync the APU frame-sequencer countdown."""
+    MMU, CPU, APU = ns["MMU"], ns["CPU"], ns["APU"]
+    m = MMU()
+    m.is_cgb = True
+    m.key1 = 0x01  # prepare double-speed
+    c = CPU(m)
+    apu = APU(m, True)
+    m.apu = apu
+    apu.fs_div = 1234
+    apu._fs_remain = 777
+    apu._sync_fs_remain(apu.fs_div, True)
+    expected_remain = apu._fs_remain
+    apu._fs_remain = 777
+    c.execute(0x10)  # STOP toggles speed when prepare bit is set
+    check("STOP toggles KEY1 double-speed", m.key1 & 0x80)
+    check("APU fs_remain resynced on speed change", apu._fs_remain == expected_remain)
+
+
+def test_cached_oam_sprite_height(ns):
+    """Reused scanline OAM must still apply 8x16 sprite height."""
+    PPU = ns["PPU"]
+    m, p, mem = _setup_cgb_ppu(ns)
+    lo, hi = _tile_bytes(3)
+    mem[0x8020] = lo
+    mem[0x8021] = hi
+    mem[0xFF40] = 0x97  # LCD on, OBJ on, 8x16 sprites
+    mem[0xFE00] = 32
+    mem[0xFE01] = 20
+    mem[0xFE02] = 2
+    mem[0xFE03] = 0x01
+    p._scanline_sprites = p._scanline_oam(16, 16)
+    p._render_sprites(16)
+    check("cached OAM scan renders 8x16 sprites without error",
+          fb_px(p.framebuffer, 16) != 0)
+
+
+def test_boot_warning_toast(ns):
+    """ROM header warnings must survive GameBoy.__init__ setup."""
+    GameBoy = ns["GameBoy"]
+    with tempfile.NamedTemporaryFile(suffix=".gbc", delete=False) as tf:
+        rom = bytearray(0x8000)
+        rom[0x0143] = 0x80
+        rom[0x0147] = 0x00
+        rom[0x0100:0x0105] = bytes([0x00, 0x18, 0xFD, 0x00, 0x00])
+        tf.write(rom)
+        path = tf.name
+    try:
+        gb = GameBoy(rom_path=path, audio_enabled=False, window_scale=2)
+        check("boot warning toast is shown",
+              gb._status_ttl > 0 and "header" in gb._status_msg.lower())
+    finally:
+        os.unlink(path)
+
+
+def test_rom_header_validation(ns):
+    validate = ns["_validate_rom_header"]
+    logo = ns["_NINTENDO_LOGO"]
+    rom = bytearray(0x8000)
+    rom[0x104:0x104 + len(logo)] = logo
+    chk = 0
+    for b in rom[0x134:0x14D]:
+        chk = (chk - b - 1) & 0xFF
+    rom[0x14D] = chk
+    check("valid synthetic header passes", validate(bytes(rom)) == [])
+    rom[0x104] = 0x00
+    check("bad logo flagged", 'logo' in validate(bytes(rom)))
+    rom[0x104:0x104 + len(logo)] = logo
+    rom[0x14D] ^= 0xFF
+    check("bad checksum flagged", 'checksum' in validate(bytes(rom)))
+
+
 def main():
     ns = load_module()
     print("opcode checks:");           test_opcodes(ns)
@@ -676,7 +747,11 @@ def main():
     print("oam dma sprite load:");     test_oam_dma(ns)
     print("apu power and DIV:");       test_apu_power_and_div(ns)
     print("double-speed timing:");     test_double_speed(ns)
+    print("double-speed apu sync:");   test_double_speed_apu_sync(ns)
+    print("cached oam sprite height:"); test_cached_oam_sprite_height(ns)
     print("mbc1 mode-1 low bank:");    test_mbc1_mode1_low_bank(ns)
+    print("boot warning toast:");      test_boot_warning_toast(ns)
+    print("rom header validation:");   test_rom_header_validation(ns)
     print("\nALL CHECKS PASSED")
 
 
