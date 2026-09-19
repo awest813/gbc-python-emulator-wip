@@ -47,9 +47,9 @@ Super Game Boy palettes, and full CGB compatibility.
   write-protection rules (STAT read-only bits 0-2 / 6, unused bits
   forced to 1). Boot ROM support (DMG 256B / CGB ~2304B).
 - **Save states** — Snapshot full emulator state (including cartridge SRAM)
-  to `<rom>.ss<slot>` with F6 / F8 (save) and F7 / F9 (load). v7 saves
-  record the ROM basename (and length) and refuse to load into a different
-  filename; replacing a ROM file in place is not detected.
+  to `<rom>.ss<slot>` with F6 / F8 (save) and F7 / F9 (load). v8 saves
+  record the ROM basename plus a CRC32 fingerprint and refuse to load into
+  a different game or a same-name file swap.
 - **Menu system** — ROM browser, window-scale selector, keyboard controls,
   project logo.
 - **Input** — D-pad, A / B, Start, Select via keyboard (customisable
@@ -344,13 +344,13 @@ interpreter on modest hardware.
   partner times out instead of freezing the emulator. The HUD shows
   **LINK** while the socket is connected.
 - Save states (slots 0 and 1) include cartridge SRAM, MBC6 flash, SGB
-  palettes, and in-flight serial state. v7 saves store the ROM basename
-  (with length guard; same-name file swaps are not detected), APU
-  frame-sequencer timing, GDMA stall,
-  double-speed remainder, boot-ROM map flag, per-source joypad state,
-  MBC7 EEPROM shift progress, and in-progress Super Game Boy packet
-  assembly; v4/v5/v6 saves still load; v1–v3 load without a ROM identity
-  check. Loading v6 or older clears any partial SGB packet state. Failed
+  palettes, and in-flight serial state. v8 saves store the ROM basename,
+  byte length, and CRC32 fingerprint (with length guard), APU
+  frame-sequencer timing, GDMA stall, double-speed remainder, boot-ROM
+  map flag, per-source joypad state, MBC7 EEPROM shift progress, and
+  in-progress Super Game Boy packet assembly; v4–v7 saves still load
+  without a CRC check; v1–v3 load without a ROM identity check. Loading
+  v6 or older clears any partial SGB packet state. Failed
   loads roll back live CPU/MMU/PPU/APU state. In-flight serial shifts are
   cleared on load unless a link partner is connected.
   Battery-backed `.sav` files are

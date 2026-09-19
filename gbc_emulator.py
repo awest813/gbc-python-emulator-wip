@@ -28,6 +28,7 @@ import logging
 import argparse
 import struct
 import socket
+import zlib
 import json
 from collections import deque
 
@@ -156,10 +157,26 @@ def _shader_gamma_warm(fb, out=None, scratch=None):
     np.clip(scratch, 0, 255, out=out)
     return out
 
-def _shader_pixel_bloom(fb):
-    blurred = (np.roll(fb, 1, 0) + np.roll(fb, -1, 0) +
-               np.roll(fb, 1, 1) + np.roll(fb, -1, 1)) // 4
-    return np.clip(fb * 0.70 + blurred * 0.30, 0, 255).astype(np.uint8)
+def _shader_pixel_bloom(fb, out=None, acc=None, blend=None):
+    if acc is None or blend is None or out is None:
+        blurred = (np.roll(fb, 1, 0) + np.roll(fb, -1, 0) +
+                   np.roll(fb, 1, 1) + np.roll(fb, -1, 1)) // 4
+        return np.clip(fb * 0.70 + blurred * 0.30, 0, 255).astype(np.uint8)
+    acc.fill(0)
+    acc[1:-1] += fb[:-2]
+    acc[1:-1] += fb[2:]
+    acc[:, 1:-1] += fb[:, :-2]
+    acc[:, 1:-1] += fb[:, 2:]
+    acc[0] += fb[-1]
+    acc[-1] += fb[0]
+    acc[:, 0] += fb[:, -1]
+    acc[:, -1] += fb[:, 0]
+    acc *= 0.25
+    np.multiply(fb, 0.70, out=blend)
+    np.multiply(acc, 0.30, out=acc)
+    np.add(blend, acc, out=blend)
+    np.clip(blend, 0, 255, out=out)
+    return out
 
 def _shader_pocket_green(fb):
     lum = fb.astype(np.float32).dot([0.299, 0.587, 0.114])
@@ -5542,9 +5559,10 @@ class GameBoy:
 
     # ── Save state support ─────────────────────────────────────────
     SAVE_STATE_MAGIC = b'GBST'
-    SAVE_STATE_VERSION = 7
+    SAVE_STATE_VERSION = 8
     SAVE_STATE_VERSION_MIN = 1
     _STATE_ROM_ID_BYTES = 32
+    _STATE_ROM_FP_BYTES = 8   # v8+: ROM byte length + CRC32 fingerprint
     _STATE_TIMING_MAGIC = 0xA5
     _STATE_TIMING_TAIL_V5 = 3   # gdma_stall u16 + speed_remainder u8
     _STATE_EXTRA_TAIL_V6 = 16   # v5 timing + bootrom + joypad + MBC7 EEPROM shift
@@ -5554,7 +5572,8 @@ class GameBoy:
     @classmethod
     def _state_header_bytes(cls, version):
         extra = cls._STATE_ROM_ID_BYTES if version >= 4 else 0
-        return 8 + extra
+        fp = cls._STATE_ROM_FP_BYTES if version >= 8 else 0
+        return 8 + extra + fp
 
     @classmethod
     def _state_min_bytes(cls, version=None):
@@ -5971,6 +5990,15 @@ class GameBoy:
             return False
         return not (full_len and current_full_len != full_len)
 
+    def _rom_fingerprint_ok(self, rom_size, rom_crc):
+        """Return True when a v8+ save ROM fingerprint matches loaded ROM bytes."""
+        rom = self.mmu.rom_data
+        if len(rom) != rom_size:
+            return False
+        if rom_size == 0:
+            return True
+        return (zlib.crc32(rom) & 0xFFFFFFFF) == (rom_crc & 0xFFFFFFFF)
+
     def _state_toast(self, action, slot, ok):
         detail = getattr(self, '_last_state_detail', None)
         default_err = 'corrupt' if action == 'load' else 'io'
@@ -6004,6 +6032,8 @@ class GameBoy:
             parts.append(struct.pack(
                 '<BBBB', self.SAVE_STATE_VERSION, slot, len(rom_name), rom_full_len))
             parts.append(rom_name + b'\x00' * (self._STATE_ROM_ID_BYTES - len(rom_name)))
+            rom_crc = zlib.crc32(mmu.rom_data) & 0xFFFFFFFF if mmu.rom_data else 0
+            parts.append(struct.pack('<II', len(mmu.rom_data), rom_crc))
             # CPU
             reg = cpu.reg
             parts.append(struct.pack('<BBBB BB BB HHHH',
@@ -6210,6 +6240,12 @@ class GameBoy:
                 if not self._rom_identity_ok(name_len, full_len, saved_name):
                     self._last_state_error = 'wrong_rom'
                     return False
+                if ver >= 8:
+                    fp_off = 8 + self._STATE_ROM_ID_BYTES
+                    rom_size, rom_crc = struct.unpack_from('<II', data, fp_off)
+                    if not self._rom_fingerprint_ok(rom_size, rom_crc):
+                        self._last_state_error = 'wrong_rom'
+                        return False
                 pos = self._state_header_bytes(ver)
             mmu = self.mmu
             snap = self._state_backup()
@@ -7528,6 +7564,9 @@ class GameBoy:
             return _shader_crt_scanlines(fnp, out)
         if shader is _shader_gamma_warm:
             return _shader_gamma_warm(fnp, out, self._shader_f32)
+        if shader is _shader_pixel_bloom:
+            return _shader_pixel_bloom(
+                fnp, out=out, acc=self._shader_f32, blend=self._shader_f32_b)
         return shader(fnp)
 
     def render(self, overlays=True):

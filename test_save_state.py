@@ -10,6 +10,7 @@ Exits non-zero on any failure.
 """
 import os
 import shutil
+import struct
 import sys
 import tempfile
 
@@ -38,6 +39,43 @@ def check(name, ok):
     print(f"  {'ok' if ok else 'FAIL'}: {name}")
     if not ok:
         _failures += 1
+
+
+def _save_body_start(raw):
+    return GameBoy._state_header_bytes(raw[4])
+
+
+def _v2_body_end(raw):
+    """Byte offset where a v2 save ends (before v3 serial/SGB extensions)."""
+    pos = _save_body_start(raw)
+    pos += struct.calcsize(GameBoy._STATE_CPU_FMT) + 4 + 0x10000
+    pos += struct.calcsize('<BBBBBBBBBBBBBBBBBBB')
+    pos += struct.calcsize('<iiiHBBBBBB')
+    pos += struct.calcsize('<BBBBBB d') + 5
+    pos += 0x2000 + 7 * 0x1000
+    pos += struct.calcsize('<BBB BBBBB BBBBB BBBB BB') + 128
+    apu_size = 13 + 16 + 12 + 10 + 12 + 14 + 1
+    pos += apu_size + 16 + 8
+    ram_len = struct.unpack_from('<I', raw, pos)[0]
+    return pos + 4 + ram_len
+
+
+def _legacy_v2_bytes(raw):
+    body = _save_body_start(raw)
+    return raw[:4] + bytes([2, 0, 0, 0]) + raw[body:_v2_body_end(raw)]
+
+
+def _legacy_v1_bytes(raw):
+    body = _save_body_start(raw)
+    end = _v2_body_end(raw)
+    hdma_off = (body + struct.calcsize(GameBoy._STATE_CPU_FMT) + 4 + 0x10000
+                + struct.calcsize('<BBBBBBBBBBBBBBBBBBB'))
+    fields = struct.unpack('<iiiHBBBBBB', raw[hdma_off:hdma_off + 20])
+    v1_hdma = struct.pack(
+        '<iiBBBBBBBBBB', fields[0], fields[1],
+        fields[2] & 0xFF, 1 if fields[7] else 0, fields[4] & 0xFF,
+        0, 0, 0, 0, 0, 0, 0)
+    return raw[:4] + bytes([1, 0, 0, 0]) + raw[body:hdma_off] + v1_hdma + raw[hdma_off + 20:end]
 
 
 class _MockLinkCable:
@@ -282,11 +320,11 @@ def main():
         check("prefix length mismatch reports wrong_rom", gb._last_state_error == 'wrong_rom')
         gb.mmu.rom_path = rom_path
 
-        # v3 saves without a ROM id block still load on v6 builds.
+        # v3 saves without a ROM id block still load on current builds.
         legacy = gb._state_path(1)
         raw = open(gb._state_path(0), "rb").read()
         with open(legacy, "wb") as f:
-            f.write(raw[:4] + bytes([3, 1, 0, 0]) + raw[40:])
+            f.write(raw[:4] + bytes([3, 1, 0, 0]) + raw[_save_body_start(raw):])
         gb.mmu.gdma_stall = 500
         gb.speed_remainder = 1
         check("legacy v3 save loads", gb.load_state(1) is True)
@@ -344,11 +382,57 @@ def main():
         check("sgb_packets_left restored", gb.mmu.sgb_packets_left == sgb_snap[4])
         check("sgb_cmd_data restored", bytes(gb.mmu.sgb_cmd_data) == sgb_snap[5])
 
+        # v8 saves reject same-name ROMs whose bytes changed (CRC fingerprint).
+        check("v8 CRC save succeeds", gb.save_state(0) is True)
+        snap_pc = gb.cpu.reg.pc
+        gb.mmu.rom_data[0x150] ^= 0xFF
+        check("same-name CRC mismatch rejected", gb.load_state(0) is False)
+        check("CRC mismatch reports wrong_rom", gb._last_state_error == 'wrong_rom')
+        gb.mmu.rom_data[0x150] ^= 0xFF
+        check("matching CRC load succeeds", gb.load_state(0) is True)
+        check("CRC load restores PC", gb.cpu.reg.pc == snap_pc)
+
+        # v7 saves without a ROM fingerprint still load on v8 builds.
+        v7_path = gb._state_path(1)
+        raw = open(gb._state_path(0), "rb").read()
+        hdr = _save_body_start(raw)
+        with open(v7_path, "wb") as f:
+            f.write(raw[:4] + bytes([7]) + raw[5:40] + raw[hdr:])
+        check("legacy v7 save loads", gb.load_state(1) is True)
+
+        # v2 and v1 legacy layouts still load.
+        gb.mmu.hdma_remaining = 123
+        check("legacy layout marker save", gb.save_state(0) is True)
+        raw = open(gb._state_path(0), "rb").read()
+        v2_path = os.path.join(tmp, "legacy_v2.ss0")
+        with open(v2_path, "wb") as f:
+            f.write(_legacy_v2_bytes(raw))
+        shutil.copy(v2_path, gb._state_path(0))
+        gb.mmu.hdma_remaining = 0
+        check("legacy v2 save loads", gb.load_state(0) is True)
+        check("legacy v2 restores HDMA remaining", gb.mmu.hdma_remaining == 123)
+
+        v1_path = os.path.join(tmp, "legacy_v1.ss0")
+        with open(v1_path, "wb") as f:
+            f.write(_legacy_v1_bytes(raw))
+        shutil.copy(v1_path, gb._state_path(0))
+        gb.mmu.hdma_remaining = 0
+        check("legacy v1 save loads", gb.load_state(0) is True)
+        check("legacy v1 restores HDMA remaining", gb.mmu.hdma_remaining == 123)
+
+        # Unsupported save versions fail before mutating live state.
+        bad_path = gb._state_path(1)
+        with open(bad_path, "wb") as f:
+            f.write(raw[:4] + bytes([99, 0, 0, 0]) + raw[hdr:])
+        gb.mmu.rom_bank = 55
+        check("unsupported version rejected", gb.load_state(1) is False)
+        check("unsupported version code", gb._last_state_error == 'version')
+        check("unsupported version leaves rom_bank", gb.mmu.rom_bank == 55)
+
         # v6 saves without an SGB tail clear in-progress packet assembly on load.
         v6_path = gb._state_path(1)
-        v7_raw = open(gb._state_path(0), "rb").read()
         sgb_tail = 5 + 16 + 2 + len(sgb_snap[5])
-        v6_raw = v7_raw[:4] + bytes([6]) + v7_raw[5:-sgb_tail]
+        v6_raw = raw[:4] + bytes([6]) + raw[5:40] + raw[hdr:-sgb_tail]
         with open(v6_path, "wb") as f:
             f.write(v6_raw)
         gb.mmu.sgb_in_packet = True
