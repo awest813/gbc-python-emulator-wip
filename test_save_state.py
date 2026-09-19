@@ -38,11 +38,11 @@ def check(name, ok):
         _failures += 1
 
 
-def build_machine(rom_path):
+def build_machine(rom_path, cart=0x00):
     """Wire a headless GameBoy around a freshly loaded synthetic CGB ROM."""
     rom = bytearray(0x8000)
     rom[0x0143] = 0x80  # CGB compatible
-    rom[0x0147] = 0x00  # ROM ONLY
+    rom[0x0147] = cart
     # Enable the LCD, set a BG palette colour, then spin in a tight JR loop so
     # the PPU/APU keep advancing while we accumulate some non-trivial state.
     prog = [0x3E, 0x91, 0xE0, 0x40, 0x00, 0x18, 0xFD]
@@ -238,7 +238,37 @@ def main():
         raw = open(gb._state_path(0), "rb").read()
         with open(legacy, "wb") as f:
             f.write(raw[:4] + bytes([3, 1, 0, 0]) + raw[40:])
+        gb.mmu.gdma_stall = 500
+        gb.speed_remainder = 1
         check("legacy v3 save loads", gb.load_state(1) is True)
+        check("legacy v3 load clears gdma stall", gb.mmu.gdma_stall == 0)
+        check("legacy v3 load clears speed remainder", gb.speed_remainder == 0)
+
+        # MBC3 RTC fields round-trip through save states.
+        rtc_path = os.path.join(tmp, "rtc.gbc")
+        gb_rtc = build_machine(rtc_path, cart=0x0F)
+        gb_rtc._has_rtc = True
+        gb_rtc.mmu.rtc_s = 25
+        gb_rtc.mmu.rtc_m = 11
+        gb_rtc.mmu.rtc_h = 3
+        gb_rtc.mmu.rtc_dl = 4
+        check("MBC3 RTC save succeeds", gb_rtc.save_state(0) is True)
+        gb_rtc.mmu.rtc_s = 0
+        gb_rtc.mmu.rtc_m = 0
+        check("MBC3 RTC load succeeds", gb_rtc.load_state(0) is True)
+        check("MBC3 RTC seconds restored", gb_rtc.mmu.rtc_s == 25)
+        check("MBC3 RTC minutes restored", gb_rtc.mmu.rtc_m == 11)
+
+        # MBC6 flash round-trips through save states.
+        mbc6_path = os.path.join(tmp, "mbc6.gbc")
+        gb6 = build_machine(mbc6_path, cart=0x20)
+        if len(gb6.mmu.flash_data) < 0x2000:
+            gb6.mmu.flash_data = bytearray(0x20000)
+        gb6.mmu.flash_data[0x1234] = 0xBE
+        check("MBC6 flash save succeeds", gb6.save_state(0) is True)
+        gb6.mmu.flash_data[0x1234] = 0
+        check("MBC6 flash load succeeds", gb6.load_state(0) is True)
+        check("MBC6 flash byte restored", gb6.mmu.flash_data[0x1234] == 0xBE)
 
     if _failures:
         print(f"\n{_failures} CHECK(S) FAILED")

@@ -285,6 +285,20 @@ def test_turbo_and_reset(ns):
         os.unlink(path)
 
 
+def test_controls_rows(ns):
+    keys = ns["JOYPAD_BUTTON_KEYS"]
+    wasd = ns["CONTROLS_WASD_ROW"]
+    turbo = ns["CONTROLS_TURBO_ROW"]
+    reset = ns["CONTROLS_RESET_ROW"]
+    check("controls WASD row index", wasd == len(keys))
+    check("controls turbo row index", turbo == wasd + 1)
+    check("controls reset row index", reset == wasd + 2)
+    menu = ns["EmulatorMenu"]()
+    items = menu._controls_items()
+    check("turbo row is informational", items[turbo].startswith("Turbo"))
+    check("reset is last controls row", items[reset] == "Reset to Default")
+
+
 def test_ui_layout(ns):
     """Menu overlay metrics must keep title, rows, and hint on-screen."""
     _overlay_layout = ns["_overlay_layout"]
@@ -458,6 +472,7 @@ def main():
     print("joypad sources:");          test_joypad_sources(ns)
     print("socd cleaning:");           test_socd(ns)
     print("key bindings:");            test_key_bindings(ns)
+    print("controls rows:");           test_controls_rows(ns)
     print("config merge:");            test_config_merge(ns)
     print("gamepad start combo:");     test_gamepad_start_does_not_auto_pause(ns)
     print("inc preserves carry:");     test_inc_preserves_carry(ns)

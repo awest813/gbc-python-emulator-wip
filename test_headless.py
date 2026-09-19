@@ -698,6 +698,24 @@ def test_cached_oam_sprite_height(ns):
           fb_px(p.framebuffer, 16) != 0)
 
 
+def test_boot_warning_toast(ns):
+    """ROM header warnings must survive GameBoy.__init__ setup."""
+    GameBoy = ns["GameBoy"]
+    with tempfile.NamedTemporaryFile(suffix=".gbc", delete=False) as tf:
+        rom = bytearray(0x8000)
+        rom[0x0143] = 0x80
+        rom[0x0147] = 0x00
+        rom[0x0100:0x0105] = bytes([0x00, 0x18, 0xFD, 0x00, 0x00])
+        tf.write(rom)
+        path = tf.name
+    try:
+        gb = GameBoy(rom_path=path, audio_enabled=False, window_scale=2)
+        check("boot warning toast is shown",
+              gb._status_ttl > 0 and "header" in gb._status_msg.lower())
+    finally:
+        os.unlink(path)
+
+
 def test_rom_header_validation(ns):
     validate = ns["_validate_rom_header"]
     logo = ns["_NINTENDO_LOGO"]
@@ -732,6 +750,7 @@ def main():
     print("double-speed apu sync:");   test_double_speed_apu_sync(ns)
     print("cached oam sprite height:"); test_cached_oam_sprite_height(ns)
     print("mbc1 mode-1 low bank:");    test_mbc1_mode1_low_bank(ns)
+    print("boot warning toast:");      test_boot_warning_toast(ns)
     print("rom header validation:");   test_rom_header_validation(ns)
     print("\nALL CHECKS PASSED")
 

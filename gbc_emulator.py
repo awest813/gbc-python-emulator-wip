@@ -278,6 +278,9 @@ FLAG_C = 4  # Carry flag
 
 # Joypad bit order matches P1 (FF00): Right, Left, Up, Down, A, B, Select, Start
 JOYPAD_BUTTON_KEYS = ('right', 'left', 'up', 'down', 'a', 'b', 'select', 'start')
+CONTROLS_WASD_ROW = len(JOYPAD_BUTTON_KEYS)
+CONTROLS_TURBO_ROW = CONTROLS_WASD_ROW + 1
+CONTROLS_RESET_ROW = CONTROLS_WASD_ROW + 2
 JOYPAD_BUTTON_LABELS = ('Right', 'Left', 'Up', 'Down', 'A', 'B', 'Select', 'Start')
 DEFAULT_KEY_BINDINGS = {
     'right':  ['right', 'd'],
@@ -5065,14 +5068,14 @@ class EmulatorMenu:
                     self.controls_scroll, _ = _sync_list_scroll(
                         self.controls_cursor, self.controls_scroll, 8, len(items))
                 elif action == pygame.K_RETURN or action == 'select':
-                    if self.controls_cursor < 8:
+                    if self.controls_cursor < CONTROLS_WASD_ROW:
                         self.controls_capture = JOYPAD_BUTTON_KEYS[self.controls_cursor]
                         pygame.key.set_repeat()
-                    elif self.controls_cursor == 8:
+                    elif self.controls_cursor == CONTROLS_WASD_ROW:
                         self.wasd_enabled = not self.wasd_enabled
                         self.key_bindings = _sanitize_key_bindings(self.key_bindings, self.wasd_enabled)
                         self._persist_controls()
-                    else:
+                    elif self.controls_cursor == CONTROLS_RESET_ROW:
                         self.wasd_enabled = True
                         self.key_bindings = _default_key_bindings(True)
                         self._persist_controls()
@@ -5281,18 +5284,21 @@ class GameBoy:
             if boot_warnings:
                 self._status_msg = " — ".join(w.capitalize() for w in boot_warnings)
                 self._status_ttl = 240
+            else:
+                self._status_msg = ''
+                self._status_ttl = 0
         else:
             logging.info("No ROM provided. Running dummy infinite loop.")
             self.mmu.memory[0x0100] = 0x00
             self.mmu.memory[0x0101] = 0xC3
             self.mmu.memory[0x0102] = 0x00
             self.mmu.memory[0x0103] = 0x01
+            self._status_msg = ''
+            self._status_ttl = 0
 
         self.speed_remainder = 0  # carries the odd base-clock dot in double-speed mode
         self._rtc_cycle_accum = 0  # throttle MBC3 RTC wall-clock updates to once per frame
         self._has_rtc = self.mmu.has_rtc  # cached flag for step_all hot path
-        self._status_msg = ''
-        self._status_ttl = 0
         self.fps_limit = fps_limit
         self.smooth_scale = smooth_scale
         self.shader = shader if shader is not None else _shader_none
@@ -6394,6 +6400,9 @@ class GameBoy:
                 pos += self._STATE_TIMING_TAIL
                 mmu.gdma_stall = gdma_stall
                 self.speed_remainder = speed_rem & 1
+            else:
+                mmu.gdma_stall = 0
+                self.speed_remainder = 0
             self._restore_post_load()
             apu.drain()
             if hasattr(self, '_audio_pending'):
@@ -7125,9 +7134,9 @@ class GameBoy:
                     self.pause_controls_scroll, _ = _sync_list_scroll(
                         self.pause_controls_cursor, self.pause_controls_scroll, cap, len(items))
                 elif action == pygame.K_RETURN or action == 'select':
-                    if self.pause_controls_cursor < 8:
+                    if self.pause_controls_cursor < CONTROLS_WASD_ROW:
                         self.controls_capture = JOYPAD_BUTTON_KEYS[self.pause_controls_cursor]
-                    elif self.pause_controls_cursor == 8:
+                    elif self.pause_controls_cursor == CONTROLS_WASD_ROW:
                         self.wasd_enabled = not self.wasd_enabled
                         self.key_bindings = _sanitize_key_bindings(self.key_bindings, self.wasd_enabled)
                         self.key_bindings = _rebuild_key_map(self.key_bindings, self.wasd_enabled)
@@ -7136,7 +7145,7 @@ class GameBoy:
                             'wasd_enabled': self.wasd_enabled,
                         }):
                             self._pause_status("Could not save settings")
-                    else:
+                    elif self.pause_controls_cursor == CONTROLS_RESET_ROW:
                         self.wasd_enabled = True
                         self.key_bindings = _default_key_bindings(True)
                         self.key_bindings = _rebuild_key_map(self.key_bindings, True)
