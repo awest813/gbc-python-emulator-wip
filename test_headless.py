@@ -419,10 +419,9 @@ def test_apu_frame_sync(ns):
 
     apu.fs_div = 0
     apu.frame_seq_step = 0
+    apu._fs_remain = apu._frame_seq_period(False)
     apu.step(CYCLES_PER_FRAME)
     check("frame sequencer wraps 8 ticks per video frame", apu.frame_seq_step == 0)
-    check("bit-12 falling edges in one frame",
-          ns["_bit_falling_edges"](0, CYCLES_PER_FRAME, 12) == 8)
 
 
 def test_gameboy_frame_audio(ns):

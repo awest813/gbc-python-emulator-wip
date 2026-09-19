@@ -134,18 +134,16 @@ def _shader_lcd_ghost(fb, prev=None):
     return np.clip(fb * 0.80 + prev * 0.20, 0, 255).astype(np.uint8)
 
 def _shader_crt_scanlines(fb):
-    out = np.copy(fb)
-    out[1::2, :, :] = np.clip(out[1::2, :, :] * 0.65, 0, 255).astype(np.uint8)
+    out = fb.copy()
+    out[1::2] = (out[1::2].astype(np.uint16) * 65 // 100).astype(np.uint8)
     return out
 
 def _shader_gamma_warm(fb):
     return np.clip(np.power(fb.astype(np.float32) / 255.0, 1.2) * 255.0, 0, 255).astype(np.uint8)
 
 def _shader_pixel_bloom(fb):
-    blurred = np.zeros_like(fb)
-    for c in range(3):
-        blurred[:, :, c] = (np.roll(fb[:, :, c], 1, 0) + np.roll(fb[:, :, c], -1, 0) +
-                            np.roll(fb[:, :, c], 1, 1) + np.roll(fb[:, :, c], -1, 1)) // 4
+    blurred = (np.roll(fb, 1, 0) + np.roll(fb, -1, 0) +
+               np.roll(fb, 1, 1) + np.roll(fb, -1, 1)) // 4
     return np.clip(fb * 0.70 + blurred * 0.30, 0, 255).astype(np.uint8)
 
 def _shader_pocket_green(fb):
@@ -2941,6 +2939,7 @@ class PPU:
         # Latched once LY==WY occurs in a frame; the window then stays active for
         # the rest of the frame even if WY is changed, matching hardware.
         self.window_active = False
+        self._scanline_sprites = None  # OAM hits reused between mode-3 entry and sprite pass
         self._bg_rgb = [0] * 32
         self._obj_rgb = [0] * 32
         unsigned_addrs = tuple(0x8000 + i * 16 for i in range(256))
@@ -3107,11 +3106,10 @@ class PPU:
             if self.mmu.hdma_active:
                 self.mmu._hdma_hblank_step()
 
-    def _enter_mode3(self, ly, lcdc):
+    def _scanline_oam(self, ly, sprite_height):
+        """Return up to 10 OAM entries overlapping scanline ``ly``."""
         mem = self.mmu.memory
-        scx = mem[0xFF43]
-        sprite_height = 16 if (lcdc & 0x04) else 8
-        sprite_count = 0
+        sprites = []
         for i in range(40):
             oam_addr = 0xFE00 + i * 4
             y = mem[oam_addr]
@@ -3120,12 +3118,27 @@ class PPU:
             spr_y = y - 16
             if spr_y > ly or spr_y + sprite_height <= ly:
                 continue
-            sprite_count += 1
-            if sprite_count >= 10:
+            sprites.append((
+                mem[oam_addr + 1] - 8,
+                spr_y,
+                mem[oam_addr + 2],
+                mem[oam_addr + 3],
+            ))
+            if len(sprites) >= 10:
                 break
-        self.mode3_duration = 172 + (scx & 7) + sprite_count * 11
+        return sprites
+
+    def _enter_mode3(self, ly, lcdc):
+        mem = self.mmu.memory
+        scx = mem[0xFF43]
+        sprite_height = 16 if (lcdc & 0x04) else 8
+        sprites = self._scanline_oam(ly, sprite_height)
+        self.mode3_duration = 172 + (scx & 7) + len(sprites) * 11
         if self.is_cgb or (lcdc & 0x01) or (lcdc & 0x20) or (lcdc & 0x02):
+            # Reuse the OAM scan for the sprite render pass on this line.
+            self._scanline_sprites = sprites if (lcdc & 0x02) else None
             self._render_scanline(ly, lcdc)
+            self._scanline_sprites = None
         self.mode = 3
         stat = (mem[0xFF41] & 0xFC) | 3
         mem[0xFF41] = stat
@@ -3549,23 +3562,10 @@ class PPU:
         # when sprites are disabled — saves ~11,520 OAM reads/frame.
         if not (lcdc & 0x02):
             return
-        sprite_height = 16 if (lcdc & 0x04) else 8
-        sprites = []
-        for i in range(40):
-            oam_addr = 0xFE00 + i * 4
-            y = mem[oam_addr]
-            x = mem[oam_addr + 1]
-            if y == 0 or y >= 160:
-                continue
-            spr_y = y - 16
-            spr_x = x - 8
-            if spr_y > ly or spr_y + sprite_height <= ly:
-                continue
-            tile = mem[oam_addr + 2]
-            flags = mem[oam_addr + 3]
-            sprites.append((spr_x, spr_y, tile, flags))
-            if len(sprites) >= 10:
-                break
+        sprites = self._scanline_sprites
+        if sprites is None:
+            sprite_height = 16 if (lcdc & 0x04) else 8
+            sprites = self._scanline_oam(ly, sprite_height)
         # CGB: OAM index priority (OPRI=0). DMG / CGB with OPRI=1: sort by X.
         if not self.is_cgb or self.cgb_opri:
             sprites.sort(key=lambda s: s[0])
@@ -3676,6 +3676,7 @@ class Timers:
                 if apu.power or not apu.is_cgb:
                     apu._frame_seq_tick()
             apu.fs_div = 0
+            apu._fs_remain = apu._frame_seq_period(bool(self.mmu.key1 & 0x80))
 
     def step(self, cycles):
         mem = self.mmu.memory
@@ -3745,17 +3746,6 @@ _APU_BOOT_VALUES = {
 }
 
 
-def _bit_falling_edges(old, new, bit):
-    """How many times `bit` of a rising counter fell in (old, new]."""
-    if new <= old:
-        return 0
-    period = 1 << (bit + 1)
-    first = ((old // period) + 1) * period
-    if first > new:
-        return 0
-    return (new - first) // period + 1
-
-
 class APU:
     """Game Boy Audio Processing Unit: two square waves, wave channel, noise channel.
 
@@ -3781,10 +3771,10 @@ class APU:
         self.power = True
         self.buffer = bytearray()
 
-        # Frame sequencer — derived from a base-clock counter so that it stays
-        # synchronised with DIV bit 12.  We track the falling edge of bit 12
-        # (i.e. 1→0 transition) which happens every 8192 base-clock cycles.
-        self.fs_div = 0           # base-clock counter; bit-12 falling edge → frame-seq tick
+        # Frame sequencer — countdown to the next DIV bit-12/13 falling edge.
+        # ``fs_div`` mirrors the CPU DIV counter for save-state compatibility.
+        self.fs_div = 0
+        self._fs_remain = self.FRAME_SEQ_PERIOD
         self.frame_seq_step = 0   # 0-7 step index
 
         # Fractional sample timer: produce one sample every CPU_CLOCK / SAMPLE_RATE cycles
@@ -3887,6 +3877,7 @@ class APU:
                 if self.is_cgb:
                     self.frame_seq_step = 0
                     self.fs_div = 0
+                    self._fs_remain = self._frame_seq_period(bool(self.mmu.key1 & 0x80))
             self.power = new_power
             self._refresh_nr52()
             return
@@ -4099,6 +4090,27 @@ class APU:
         if self.is_cgb:
             self.fs_div = 0
             self.frame_seq_step = 0
+            self._fs_remain = self._frame_seq_period(bool(self.mmu.key1 & 0x80))
+
+    @staticmethod
+    def _frame_seq_period(double_speed):
+        return 16384 if double_speed else 8192
+
+    def _sync_fs_remain(self, div_val, double_speed=False):
+        period = self._frame_seq_period(double_speed)
+        rem = period - (div_val & (period - 1))
+        self._fs_remain = period if rem == 0 else rem
+
+    def _clock_frame_sequencer(self, cpu_cycles, period):
+        if cpu_cycles <= 0:
+            return
+        self._fs_remain -= cpu_cycles
+        if self._fs_remain > 0:
+            return
+        ticks = (-self._fs_remain) // period + 1
+        self._fs_remain += ticks * period
+        for _ in range(ticks):
+            self._frame_seq_tick()
 
     # ── Channel triggers ─────────────────────────────────────────────
 
@@ -4364,18 +4376,15 @@ class APU:
         sn = self.sample_num
         sd = self.sample_den
         if div_old is not None:
-            bit = 13 if double_speed else 12
-            ticks = _bit_falling_edges(div_old, div_new, bit)
+            cpu_cycles = div_new - div_old
             self.fs_div = div_new
         else:
-            old_fs = self.fs_div
-            new_fs = old_fs + cycles
-            self.fs_div = new_fs
-            ticks = _bit_falling_edges(old_fs, new_fs, 12)
+            cpu_cycles = cycles
+            self.fs_div += cycles
         # DMG keeps the sequencer running while the APU is off; CGB does not.
         if self.power or not self.is_cgb:
-            for _ in range(ticks):
-                self._frame_seq_tick()
+            self._clock_frame_sequencer(
+                cpu_cycles, 16384 if double_speed else 8192)
 
         if not self.power:
             # APU off: still produce silence so the audio buffer keeps flowing.
@@ -5705,6 +5714,7 @@ class GameBoy:
             apu.is_cgb = bool(ap[ai]); ai += 1
             apu.frame_seq_step = ap[ai] & 0x07; ai += 1
             apu.fs_div = (ap[ai] & 0xFF) << 8; ai += 1
+            apu._sync_fs_remain(apu.fs_div, bool(self.mmu.key1 & 0x80))
             apu.vol_left = ap[ai] & 0x07; apu.vol_right = ap[ai+1] & 0x07; ai += 2
             apu.pan_left = ap[ai]; apu.pan_right = ap[ai+1]; ai += 2
             apu.sample_accum = ap[ai] | (ap[ai+1] << 8); ai += 2
