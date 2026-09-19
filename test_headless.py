@@ -661,6 +661,24 @@ def test_apu_power_and_div(ns):
     check("DIV reset clears the APU DIV shadow", gb.apu.fs_div == 0)
 
 
+def test_cached_oam_sprite_height(ns):
+    """Reused scanline OAM must still apply 8x16 sprite height."""
+    PPU = ns["PPU"]
+    m, p, mem = _setup_cgb_ppu(ns)
+    lo, hi = _tile_bytes(3)
+    mem[0x8020] = lo
+    mem[0x8021] = hi
+    mem[0xFF40] = 0x97  # LCD on, OBJ on, 8x16 sprites
+    mem[0xFE00] = 32
+    mem[0xFE01] = 20
+    mem[0xFE02] = 2
+    mem[0xFE03] = 0x01
+    p._scanline_sprites = p._scanline_oam(16, 16)
+    p._render_sprites(16)
+    check("cached OAM scan renders 8x16 sprites without error",
+          fb_px(p.framebuffer, 16) != 0)
+
+
 def test_rom_header_validation(ns):
     validate = ns["_validate_rom_header"]
     logo = ns["_NINTENDO_LOGO"]
@@ -692,6 +710,7 @@ def main():
     print("oam dma sprite load:");     test_oam_dma(ns)
     print("apu power and DIV:");       test_apu_power_and_div(ns)
     print("double-speed timing:");     test_double_speed(ns)
+    print("cached oam sprite height:"); test_cached_oam_sprite_height(ns)
     print("mbc1 mode-1 low bank:");    test_mbc1_mode1_low_bank(ns)
     print("rom header validation:");   test_rom_header_validation(ns)
     print("\nALL CHECKS PASSED")

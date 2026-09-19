@@ -184,9 +184,15 @@ def main():
             f.write(b"GBST" + bytes([3, 0, 0, 0]) + b"\x00" * 200)
         mem_len = len(gb.mmu.memory)
         pc_before = gb.cpu.reg.pc
+        gb.mmu.rom_bank = 99
+        gb.ppu.mode = 5
+        rom_bank_before = 99
+        ppu_mode_before = 5
         check("truncated load returns False", gb.load_state(0) is False)
         check("truncated load leaves 64KB memory", len(gb.mmu.memory) == mem_len == 0x10000)
         check("truncated load rolls back CPU state", gb.cpu.reg.pc == pc_before)
+        check("truncated load rolls back MMU banking", gb.mmu.rom_bank == rom_bank_before)
+        check("truncated load rolls back PPU mode", gb.ppu.mode == ppu_mode_before)
         check("truncated load reports corrupt file", gb._last_state_error == 'corrupt')
 
         # v4 saves record the ROM basename; loading a mismatched snapshot fails.
@@ -199,6 +205,16 @@ def main():
         check("wrong ROM reports mismatch", gb._last_state_error == 'wrong_rom')
         gb.mmu.rom_path = rom_path
         check("matching ROM load succeeds", gb.load_state(0) is True)
+
+        # v4 full-length guard rejects basenames that share a prefix but differ in length.
+        check("save_state for prefix guard", gb.save_state(0) is True)
+        longer = os.path.join(tmp, "synthetic.gbc.backup")
+        shutil.copy(rom_path, longer)
+        shutil.copy(gb._state_path(0), os.path.splitext(longer)[0] + ".ss0")
+        gb.mmu.rom_path = longer
+        check("same-prefix longer basename rejected", gb.load_state(0) is False)
+        check("prefix length mismatch reports wrong_rom", gb._last_state_error == 'wrong_rom')
+        gb.mmu.rom_path = rom_path
 
         # v3 saves without a ROM id block still load on v4 builds.
         legacy = gb._state_path(1)

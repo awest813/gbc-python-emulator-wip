@@ -196,7 +196,8 @@ file is created automatically in the emulator directory.
 ## Pause menu
 
 Press **Escape** while a game is running to open the in-game pause menu.
-Emulation and audio halt, and the current frame is dimmed behind the menu:
+Emulation and audio halt, and the current frame is dimmed behind the menu.
+**F6–F9** quick-save/load still work while the pause overlay is open:
 
 - **Resume** — Return to the game (Escape also resumes).
 - **Save States...** — Sub-menu with save/load for slots 0 and 1

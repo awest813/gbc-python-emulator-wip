@@ -1025,6 +1025,9 @@ class CPU:
             if mmu.is_cgb and (mmu.key1 & 0x01):
                 mmu.key1 ^= 0x80  # toggle double-speed
                 mmu.key1 &= ~0x01  # clear prepare flag
+                apu = getattr(mmu, 'apu', None)
+                if apu is not None:
+                    apu._sync_fs_remain(apu.fs_div, bool(mmu.key1 & 0x80))
             else:
                 mmu.memory[0xFF40] &= 0x7F  # disable LCD
                 self.halted = True  # wakes on any pending interrupt (joypad)
@@ -3594,9 +3597,9 @@ class PPU:
         # when sprites are disabled — saves ~11,520 OAM reads/frame.
         if not (lcdc & 0x02):
             return
+        sprite_height = 16 if (lcdc & 0x04) else 8
         sprites = self._scanline_sprites
         if sprites is None:
-            sprite_height = 16 if (lcdc & 0x04) else 8
             sprites = self._scanline_oam(ly, sprite_height)
         # CGB: OAM index priority (OPRI=0). DMG / CGB with OPRI=1: sort by X.
         if not self.is_cgb or self.cgb_opri:
@@ -4687,6 +4690,7 @@ class EmulatorMenu:
 
     def _scan_roms(self):
         self._rom_info_cache = {}
+        self._rom_tag_cache = {}
         seen = set()
         self.roms = []
         if not os.path.isdir("roms") and not os.path.isdir("rom"):
@@ -5119,13 +5123,20 @@ class EmulatorMenu:
         if self.rom_scroll > 0:
             self._centre_text("^ more", list_y - 18, MENU_DIM, 14)
         tag_font = get_font(14)
+        tag_cache = getattr(self, '_rom_tag_cache', None)
+        if tag_cache is None:
+            tag_cache = {}
+            self._rom_tag_cache = tag_cache
         for i, rom_path in enumerate(visible):
             y = list_y + i * row_h
             idx = self.rom_scroll + i
             selected = idx == self.rom_cursor
             if selected:
                 _blit_selection_bar(self.screen, 24, y - 3, MENU_W - 48, 28)
-            tag = _read_rom_system_tag(rom_path)
+            tag = tag_cache.get(rom_path)
+            if tag is None:
+                tag = _read_rom_system_tag(rom_path)
+                tag_cache[rom_path] = tag
             tag_s = tag_font.render(tag, True, MENU_HI if selected else MENU_DIM)
             tag_w = tag_s.get_width() + 10
             tag_x = 34
@@ -5502,6 +5513,272 @@ class GameBoy:
         return (cls._state_header_bytes(ver)
                 + struct.calcsize(cls._STATE_CPU_FMT) + 4 + 0x10000)
 
+    def _capture_subsystems(self):
+        """Snapshot MMU/PPU/APU fields that load_state mutates (for rollback)."""
+        mmu = self.mmu
+        ppu = self.ppu
+        apu = self.apu
+        return {
+            'has_rtc': getattr(self, '_has_rtc', mmu.has_rtc),
+            'mmu': {
+                'mbc_type': mmu.mbc_type, 'ram_enabled': mmu.ram_enabled,
+                'rom_bank': mmu.rom_bank, 'ram_bank': mmu.ram_bank,
+                'mbc1_mode': mmu.mbc1_mode, 'num_rom_banks': mmu.num_rom_banks,
+                'num_ram_banks': mmu.num_ram_banks, 'has_ram': mmu.has_ram,
+                'has_battery': mmu.has_battery, 'has_rtc': mmu.has_rtc,
+                'is_cgb': mmu.is_cgb, 'joypad_buttons': mmu.joypad_buttons,
+                '_joy_src': list(mmu._joy_src), 'serial_data': mmu.serial_data,
+                'serial_control': mmu.serial_control, 'vram_bank_select': mmu.vram_bank_select,
+                'key1': mmu.key1, 'rp': mmu.rp, 'svbk': mmu.svbk,
+                'hdma_remaining': mmu.hdma_remaining, 'hdma_src': mmu.hdma_src,
+                'hdma_dst': mmu.hdma_dst, 'dma_remaining': mmu.dma_remaining,
+                'dma_src': mmu.dma_src, 'dma_index': mmu.dma_index,
+                'dma_cycle_acc': mmu.dma_cycle_acc, 'hdma_active': mmu.hdma_active,
+                'mbc1_upper_bank': mmu.mbc1_upper_bank,
+                'rtc_s': mmu.rtc_s, 'rtc_m': mmu.rtc_m, 'rtc_h': mmu.rtc_h,
+                'rtc_dl': mmu.rtc_dl, 'rtc_dh': mmu.rtc_dh,
+                'rtc_latch_state': mmu.rtc_latch_state, 'rtc_last_time': mmu.rtc_last_time,
+                'rtc_latch_s': mmu.rtc_latch_s, 'rtc_latch_m': mmu.rtc_latch_m,
+                'rtc_latch_h': mmu.rtc_latch_h, 'rtc_latch_dl': mmu.rtc_latch_dl,
+                'rtc_latch_dh': mmu.rtc_latch_dh,
+                'vram_bank1': bytes(mmu.vram_bank1),
+                'wram_banks': [bytes(b) for b in mmu.wram_banks],
+                'ram_data': bytes(mmu.ram_data),
+                'serial_bits_left': mmu.serial_bits_left,
+                'serial_cycle_accum': mmu.serial_cycle_accum,
+                'serial_incoming': mmu.serial_incoming, 'is_sgb': mmu.is_sgb,
+                'sgb_mask': mmu.sgb_mask, 'sgb_player_count': mmu.sgb_player_count,
+                'sgb_current_player': mmu.sgb_current_player,
+                'sgb_pal_rgb': list(mmu.sgb_pal_rgb),
+                'sgb_attr': bytes(mmu.sgb_attr),
+                'mbc6_rom_bank_a': mmu.mbc6_rom_bank_a, 'mbc6_rom_bank_b': mmu.mbc6_rom_bank_b,
+                'mbc6_ram_bank_a': mmu.mbc6_ram_bank_a, 'mbc6_ram_bank_b': mmu.mbc6_ram_bank_b,
+                'mbc6_flash_a': mmu.mbc6_flash_a, 'mbc6_flash_b': mmu.mbc6_flash_b,
+                'mbc6_flash_enable': mmu.mbc6_flash_enable, 'mbc6_flash_we': mmu.mbc6_flash_we,
+                'flash_data': bytes(mmu.flash_data),
+                'mbc7_ram_enable2': mmu.mbc7_ram_enable2,
+                'mbc7_latch_ready': mmu.mbc7_latch_ready,
+                'mbc7_latch_x': mmu.mbc7_latch_x, 'mbc7_latch_y': mmu.mbc7_latch_y,
+                'eeprom_state': mmu.eeprom_state, 'eeprom_do': mmu.eeprom_do,
+                'eeprom_write_en': mmu.eeprom_write_en, 'eeprom_addr': mmu.eeprom_addr,
+            },
+            'ppu': {
+                'mode': ppu.mode, 'scanline_dot': ppu.scanline_dot,
+                'mode3_duration': ppu.mode3_duration,
+                'bg_palette_addr': ppu.bg_palette_addr, 'obj_palette_addr': ppu.obj_palette_addr,
+                'cgb_opri': ppu.cgb_opri, 'lcd_was_on': ppu.lcd_was_on, 'is_cgb': ppu.is_cgb,
+                'prev_stat_irq': ppu.prev_stat_irq,
+                'window_line_counter': ppu.window_line_counter,
+                'window_active': ppu.window_active,
+                'bg_palette_data': bytes(ppu.bg_palette_data),
+                'obj_palette_data': bytes(ppu.obj_palette_data),
+            },
+            'apu': {
+                'power': apu.power, 'is_cgb': apu.is_cgb,
+                'frame_seq_step': apu.frame_seq_step, 'fs_div': apu.fs_div,
+                '_fs_remain': apu._fs_remain,
+                'vol_left': apu.vol_left, 'vol_right': apu.vol_right,
+                'pan_left': apu.pan_left, 'pan_right': apu.pan_right,
+                'sample_accum': apu.sample_accum,
+                'ch1_enabled': apu.ch1_enabled, 'ch1_dac': apu.ch1_dac,
+                'ch1_freq': apu.ch1_freq, 'ch1_freq_timer': apu.ch1_freq_timer,
+                'ch1_duty': apu.ch1_duty, 'ch1_duty_step': apu.ch1_duty_step,
+                'ch1_length_enabled': apu.ch1_length_enabled, 'ch1_length': apu.ch1_length,
+                'ch1_volume': apu.ch1_volume, 'ch1_env_initial': apu.ch1_env_initial,
+                'ch1_env_direction': apu.ch1_env_direction, 'ch1_env_period': apu.ch1_env_period,
+                'ch1_env_timer': apu.ch1_env_timer, 'ch1_sweep_period': apu.ch1_sweep_period,
+                'ch1_sweep_direction': apu.ch1_sweep_direction,
+                'ch1_sweep_shift': apu.ch1_sweep_shift, 'ch1_sweep_timer': apu.ch1_sweep_timer,
+                'ch1_sweep_shadow': apu.ch1_sweep_shadow,
+                'ch1_sweep_enabled': apu.ch1_sweep_enabled,
+                'ch2_enabled': apu.ch2_enabled, 'ch2_dac': apu.ch2_dac,
+                'ch2_freq': apu.ch2_freq, 'ch2_freq_timer': apu.ch2_freq_timer,
+                'ch2_duty': apu.ch2_duty, 'ch2_duty_step': apu.ch2_duty_step,
+                'ch2_length_enabled': apu.ch2_length_enabled, 'ch2_length': apu.ch2_length,
+                'ch2_volume': apu.ch2_volume, 'ch2_env_initial': apu.ch2_env_initial,
+                'ch2_env_direction': apu.ch2_env_direction, 'ch2_env_period': apu.ch2_env_period,
+                'ch2_env_timer': apu.ch2_env_timer,
+                'ch3_enabled': apu.ch3_enabled, 'ch3_dac': apu.ch3_dac,
+                'ch3_freq': apu.ch3_freq, 'ch3_freq_timer': apu.ch3_freq_timer,
+                'ch3_length_enabled': apu.ch3_length_enabled, 'ch3_length': apu.ch3_length,
+                'ch3_vol_shift': apu.ch3_vol_shift, 'ch3_wave_pos': apu.ch3_wave_pos,
+                'ch4_enabled': apu.ch4_enabled, 'ch4_dac': apu.ch4_dac,
+                'ch4_freq_timer': apu.ch4_freq_timer,
+                'ch4_length_enabled': apu.ch4_length_enabled, 'ch4_length': apu.ch4_length,
+                'ch4_volume': apu.ch4_volume, 'ch4_env_initial': apu.ch4_env_initial,
+                'ch4_env_direction': apu.ch4_env_direction, 'ch4_env_period': apu.ch4_env_period,
+                'ch4_env_timer': apu.ch4_env_timer, 'ch4_lfsr': apu.ch4_lfsr,
+                'ch4_shift': apu.ch4_shift, 'ch4_width_mode': apu.ch4_width_mode,
+                'ch4_divisor_code': apu.ch4_divisor_code,
+                'wave_ram': bytes(apu.wave_ram),
+            },
+        }
+
+    def _restore_subsystems(self, sub):
+        if not sub:
+            return
+        mmu = self.mmu
+        ppu = self.ppu
+        apu = self.apu
+        m = sub['mmu']
+        mmu.mbc_type = m['mbc_type']
+        mmu.ram_enabled = m['ram_enabled']
+        mmu.rom_bank = m['rom_bank']
+        mmu.ram_bank = m['ram_bank']
+        mmu.mbc1_mode = m['mbc1_mode']
+        mmu.num_rom_banks = m['num_rom_banks']
+        mmu.num_ram_banks = m['num_ram_banks']
+        mmu.has_ram = m['has_ram']
+        mmu.has_battery = m['has_battery']
+        mmu.has_rtc = m['has_rtc']
+        mmu.is_cgb = m['is_cgb']
+        mmu.joypad_buttons = m['joypad_buttons']
+        mmu._joy_src = list(m['_joy_src'])
+        mmu.serial_data = m['serial_data']
+        mmu.serial_control = m['serial_control']
+        mmu.vram_bank_select = m['vram_bank_select']
+        mmu.key1 = m['key1']
+        mmu.rp = m['rp']
+        mmu.svbk = m['svbk']
+        mmu.hdma_remaining = m['hdma_remaining']
+        mmu.hdma_src = m['hdma_src']
+        mmu.hdma_dst = m['hdma_dst']
+        mmu.dma_remaining = m['dma_remaining']
+        mmu.dma_src = m['dma_src']
+        mmu.dma_index = m['dma_index']
+        mmu.dma_cycle_acc = m['dma_cycle_acc']
+        mmu.hdma_active = m['hdma_active']
+        mmu.mbc1_upper_bank = m['mbc1_upper_bank']
+        mmu.rtc_s = m['rtc_s']
+        mmu.rtc_m = m['rtc_m']
+        mmu.rtc_h = m['rtc_h']
+        mmu.rtc_dl = m['rtc_dl']
+        mmu.rtc_dh = m['rtc_dh']
+        mmu.rtc_latch_state = m['rtc_latch_state']
+        mmu.rtc_last_time = m['rtc_last_time']
+        mmu.rtc_latch_s = m['rtc_latch_s']
+        mmu.rtc_latch_m = m['rtc_latch_m']
+        mmu.rtc_latch_h = m['rtc_latch_h']
+        mmu.rtc_latch_dl = m['rtc_latch_dl']
+        mmu.rtc_latch_dh = m['rtc_latch_dh']
+        mmu.vram_bank1[:] = m['vram_bank1']
+        for i, bank in enumerate(m['wram_banks']):
+            mmu.wram_banks[i][:] = bank
+        if len(mmu.ram_data) == len(m['ram_data']):
+            mmu.ram_data[:] = m['ram_data']
+        mmu.serial_bits_left = m['serial_bits_left']
+        mmu.serial_cycle_accum = m['serial_cycle_accum']
+        mmu.serial_incoming = m['serial_incoming']
+        mmu.is_sgb = m['is_sgb']
+        mmu.sgb_mask = m['sgb_mask']
+        mmu.sgb_player_count = m['sgb_player_count']
+        mmu.sgb_current_player = m['sgb_current_player']
+        mmu.sgb_pal_rgb[:] = m['sgb_pal_rgb']
+        mmu.sgb_attr[:] = m['sgb_attr']
+        mmu.mbc6_rom_bank_a = m['mbc6_rom_bank_a']
+        mmu.mbc6_rom_bank_b = m['mbc6_rom_bank_b']
+        mmu.mbc6_ram_bank_a = m['mbc6_ram_bank_a']
+        mmu.mbc6_ram_bank_b = m['mbc6_ram_bank_b']
+        mmu.mbc6_flash_a = m['mbc6_flash_a']
+        mmu.mbc6_flash_b = m['mbc6_flash_b']
+        mmu.mbc6_flash_enable = m['mbc6_flash_enable']
+        mmu.mbc6_flash_we = m['mbc6_flash_we']
+        if len(mmu.flash_data) >= len(m['flash_data']):
+            mmu.flash_data[:len(m['flash_data'])] = m['flash_data']
+        mmu.mbc7_ram_enable2 = m['mbc7_ram_enable2']
+        mmu.mbc7_latch_ready = m['mbc7_latch_ready']
+        mmu.mbc7_latch_x = m['mbc7_latch_x']
+        mmu.mbc7_latch_y = m['mbc7_latch_y']
+        mmu.eeprom_state = m['eeprom_state']
+        mmu.eeprom_do = m['eeprom_do']
+        mmu.eeprom_write_en = m['eeprom_write_en']
+        mmu.eeprom_addr = m['eeprom_addr']
+        p = sub['ppu']
+        ppu.mode = p['mode']
+        ppu.scanline_dot = p['scanline_dot']
+        ppu.mode3_duration = p['mode3_duration']
+        ppu.bg_palette_addr = p['bg_palette_addr']
+        ppu.obj_palette_addr = p['obj_palette_addr']
+        ppu.cgb_opri = p['cgb_opri']
+        ppu.lcd_was_on = p['lcd_was_on']
+        ppu.is_cgb = p['is_cgb']
+        ppu.prev_stat_irq = p['prev_stat_irq']
+        ppu.window_line_counter = p['window_line_counter']
+        ppu.window_active = p['window_active']
+        ppu.bg_palette_data[:] = p['bg_palette_data']
+        ppu.obj_palette_data[:] = p['obj_palette_data']
+        for i in range(32):
+            ppu._update_cgb_bg_color(i)
+            ppu._update_cgb_obj_color(i)
+        a = sub['apu']
+        apu.power = a['power']
+        apu.is_cgb = a['is_cgb']
+        apu.frame_seq_step = a['frame_seq_step']
+        apu.fs_div = a['fs_div']
+        apu._fs_remain = a['_fs_remain']
+        apu.vol_left = a['vol_left']
+        apu.vol_right = a['vol_right']
+        apu.pan_left = a['pan_left']
+        apu.pan_right = a['pan_right']
+        apu.sample_accum = a['sample_accum']
+        apu.ch1_enabled = a['ch1_enabled']
+        apu.ch1_dac = a['ch1_dac']
+        apu.ch1_freq = a['ch1_freq']
+        apu.ch1_freq_timer = a['ch1_freq_timer']
+        apu.ch1_duty = a['ch1_duty']
+        apu.ch1_duty_step = a['ch1_duty_step']
+        apu.ch1_length_enabled = a['ch1_length_enabled']
+        apu.ch1_length = a['ch1_length']
+        apu.ch1_volume = a['ch1_volume']
+        apu.ch1_env_initial = a['ch1_env_initial']
+        apu.ch1_env_direction = a['ch1_env_direction']
+        apu.ch1_env_period = a['ch1_env_period']
+        apu.ch1_env_timer = a['ch1_env_timer']
+        apu.ch1_sweep_period = a['ch1_sweep_period']
+        apu.ch1_sweep_direction = a['ch1_sweep_direction']
+        apu.ch1_sweep_shift = a['ch1_sweep_shift']
+        apu.ch1_sweep_timer = a['ch1_sweep_timer']
+        apu.ch1_sweep_shadow = a['ch1_sweep_shadow']
+        apu.ch1_sweep_enabled = a['ch1_sweep_enabled']
+        apu.ch2_enabled = a['ch2_enabled']
+        apu.ch2_dac = a['ch2_dac']
+        apu.ch2_freq = a['ch2_freq']
+        apu.ch2_freq_timer = a['ch2_freq_timer']
+        apu.ch2_duty = a['ch2_duty']
+        apu.ch2_duty_step = a['ch2_duty_step']
+        apu.ch2_length_enabled = a['ch2_length_enabled']
+        apu.ch2_length = a['ch2_length']
+        apu.ch2_volume = a['ch2_volume']
+        apu.ch2_env_initial = a['ch2_env_initial']
+        apu.ch2_env_direction = a['ch2_env_direction']
+        apu.ch2_env_period = a['ch2_env_period']
+        apu.ch2_env_timer = a['ch2_env_timer']
+        apu.ch3_enabled = a['ch3_enabled']
+        apu.ch3_dac = a['ch3_dac']
+        apu.ch3_freq = a['ch3_freq']
+        apu.ch3_freq_timer = a['ch3_freq_timer']
+        apu.ch3_length_enabled = a['ch3_length_enabled']
+        apu.ch3_length = a['ch3_length']
+        apu.ch3_vol_shift = a['ch3_vol_shift']
+        apu.ch3_wave_pos = a['ch3_wave_pos']
+        apu.ch4_enabled = a['ch4_enabled']
+        apu.ch4_dac = a['ch4_dac']
+        apu.ch4_freq_timer = a['ch4_freq_timer']
+        apu.ch4_length_enabled = a['ch4_length_enabled']
+        apu.ch4_length = a['ch4_length']
+        apu.ch4_volume = a['ch4_volume']
+        apu.ch4_env_initial = a['ch4_env_initial']
+        apu.ch4_env_direction = a['ch4_env_direction']
+        apu.ch4_env_period = a['ch4_env_period']
+        apu.ch4_env_timer = a['ch4_env_timer']
+        apu.ch4_lfsr = a['ch4_lfsr']
+        apu.ch4_shift = a['ch4_shift']
+        apu.ch4_width_mode = a['ch4_width_mode']
+        apu.ch4_divisor_code = a['ch4_divisor_code']
+        apu.wave_ram[:] = a['wave_ram']
+        apu._refresh_nr52()
+        self._has_rtc = sub['has_rtc']
+
     def _state_backup(self):
         """Capture live CPU + memory before a load attempt (rollback on failure)."""
         cpu = self.cpu
@@ -5514,6 +5791,7 @@ class GameBoy:
             ),
             'div_counter': self.timers.div_counter,
             'tima_accum': self.timers.tima_accum,
+            'subsystems': self._capture_subsystems(),
         }
 
     def _state_restore(self, snap):
@@ -5536,6 +5814,7 @@ class GameBoy:
         self.timers.div_counter = snap['div_counter']
         self.timers.tima_accum = snap['tima_accum']
         mmu.memory[0xFF04] = (snap['div_counter'] >> 8) & 0xFF
+        self._restore_subsystems(snap.get('subsystems'))
 
     @staticmethod
     def _format_state_message(action, slot, error_code, detail=None):
@@ -5591,9 +5870,11 @@ class GameBoy:
             apu.drain()
             parts = []
             parts.append(self.SAVE_STATE_MAGIC)
-            rom_name = os.path.basename(mmu.rom_path or '').encode('utf-8', 'replace')[:31]
+            rom_base = os.path.basename(mmu.rom_path or '')
+            rom_name = rom_base.encode('utf-8', 'replace')[:31]
+            rom_full_len = min(len(rom_base.encode('utf-8', 'replace')), 255)
             parts.append(struct.pack(
-                '<BBBB', self.SAVE_STATE_VERSION, slot, len(rom_name), 0))
+                '<BBBB', self.SAVE_STATE_VERSION, slot, len(rom_name), rom_full_len))
             parts.append(rom_name + b'\x00' * (self._STATE_ROM_ID_BYTES - len(rom_name)))
             # CPU
             reg = cpu.reg
@@ -5771,10 +6052,14 @@ class GameBoy:
             pos += 4
             if ver >= 4:
                 name_len = data[6]
+                full_len = data[7]
                 saved_name = bytes(data[8:8 + name_len])
-                current_name = os.path.basename(self.mmu.rom_path or '').encode(
-                    'utf-8', 'replace')[:31]
-                if name_len and saved_name != current_name[:name_len]:
+                current_base = os.path.basename(self.mmu.rom_path or '')
+                current_name = current_base.encode('utf-8', 'replace')[:31]
+                current_full_len = len(current_base.encode('utf-8', 'replace'))
+                if name_len and (
+                        saved_name != current_name[:name_len]
+                        or (full_len and current_full_len != full_len)):
                     self._last_state_error = 'wrong_rom'
                     return False
                 pos = self._state_header_bytes(ver)
@@ -6690,12 +6975,36 @@ class GameBoy:
         self._sync_samples = 0
         self._sync_frames = 0
 
+    def _pause_quick_state(self, action, slot, backdrop):
+        if action == 'save':
+            ok = self.save_state(slot)
+            detail = getattr(self, '_last_state_detail', None)
+            self._pause_status(self._format_state_message(
+                'save', slot, None if ok else getattr(self, '_last_state_error', 'io'), detail))
+            return backdrop
+        if self.load_state(slot):
+            self._pause_status(self._format_state_message('load', slot, None))
+            return self._capture_pause_backdrop()
+        detail = getattr(self, '_last_state_detail', None)
+        self._pause_status(self._format_state_message(
+            'load', slot, getattr(self, '_last_state_error', 'corrupt'), detail))
+        return backdrop
+
     def _handle_pause_events(self, page, backdrop):
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 self.running = False
                 self.paused = False
                 return page, backdrop
+            if event.type == pygame.KEYDOWN and event.key in (
+                    pygame.K_F6, pygame.K_F7, pygame.K_F8, pygame.K_F9):
+                quick = {
+                    pygame.K_F6: ('save', 0), pygame.K_F7: ('load', 0),
+                    pygame.K_F8: ('save', 1), pygame.K_F9: ('load', 1),
+                }
+                act, slot = quick[event.key]
+                backdrop = self._pause_quick_state(act, slot, backdrop)
+                continue
             if page == "controls" and self.controls_capture is not None:
                 if event.type == pygame.KEYDOWN:
                     if event.key == pygame.K_ESCAPE:
@@ -6767,7 +7076,7 @@ class GameBoy:
                     page = "pause"
             elif page == "controls":
                 items = self._pause_controls_items()
-                cap = _overlay_scroll_capacity(*self.screen.get_size(), has_status=False)
+                cap = _overlay_scroll_capacity(*self.screen.get_size(), has_status=True)
                 if action in (pygame.K_UP, 'up'):
                     self.pause_controls_cursor = (self.pause_controls_cursor - 1) % len(items)
                     self.pause_controls_scroll, _ = _sync_list_scroll(
