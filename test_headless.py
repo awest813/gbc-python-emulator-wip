@@ -665,7 +665,7 @@ def test_rom_header_validation(ns):
     validate = ns["_validate_rom_header"]
     logo = ns["_NINTENDO_LOGO"]
     rom = bytearray(0x8000)
-    rom[0x104:0x134] = logo
+    rom[0x104:0x104 + len(logo)] = logo
     chk = 0
     for b in rom[0x134:0x14D]:
         chk = (chk - b - 1) & 0xFF
@@ -673,7 +673,7 @@ def test_rom_header_validation(ns):
     check("valid synthetic header passes", validate(bytes(rom)) == [])
     rom[0x104] = 0x00
     check("bad logo flagged", 'logo' in validate(bytes(rom)))
-    rom[0x104:0x134] = logo
+    rom[0x104:0x104 + len(logo)] = logo
     rom[0x14D] ^= 0xFF
     check("bad checksum flagged", 'checksum' in validate(bytes(rom)))
 

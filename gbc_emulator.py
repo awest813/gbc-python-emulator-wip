@@ -173,7 +173,7 @@ _NINTENDO_LOGO = bytes([
     0x48, 0x06, 0x0E, 0x76, 0xFE, 0xB3, 0x1A, 0x0F, 0xCE, 0x6B, 0xB3, 0x83,
     0x2D, 0xC1, 0xE5, 0xD6, 0xC9, 0x19, 0x7D, 0x07, 0x4F, 0x1B, 0x7E, 0x33,
     0x9D, 0xBE, 0x9C, 0xD3, 0x09, 0x6C, 0xD2, 0xA1, 0x4A, 0x9F, 0x53, 0x1A,
-    0x5C, 0x1B, 0x78, 0x20, 0x86, 0xE0, 0x49, 0x38, 0x84, 0xB3, 0x1C, 0x00,
+    0x5C, 0x1B, 0x78, 0x20, 0x86, 0xE0, 0x49, 0x38, 0x84, 0xB3, 0x1C,
 ])
 
 def _validate_rom_header(rom_data):
@@ -181,7 +181,8 @@ def _validate_rom_header(rom_data):
     if len(rom_data) < 0x150:
         return ['size']
     issues = []
-    if rom_data[0x104:0x134] != _NINTENDO_LOGO:
+    # Compare the 47-byte logo bitmap; byte 0x133 is the last title byte on HW.
+    if rom_data[0x104:0x104 + len(_NINTENDO_LOGO)] != _NINTENDO_LOGO:
         issues.append('logo')
     chk = 0
     for b in rom_data[0x134:0x14D]:
@@ -5491,8 +5492,16 @@ class GameBoy:
         base = os.path.splitext(self.mmu.rom_path)[0]
         return f"{base}.ss{slot}"
 
+    def _state_toast(self, action, slot, ok):
+        detail = getattr(self, '_last_state_detail', None)
+        default_err = 'corrupt' if action == 'load' else 'io'
+        err = None if ok else getattr(self, '_last_state_error', default_err)
+        self._status_msg = self._format_state_message(action, slot, err, detail)
+        self._status_ttl = 90
+
     def save_state(self, slot=0):
         self._last_state_error = None
+        self._last_state_detail = None
         path = self._state_path(slot)
         if not path:
             self._last_state_error = 'io'
@@ -6220,29 +6229,13 @@ class GameBoy:
                     self._open_pause_menu()
                     return
                 elif event.key == pygame.K_F6:
-                    ok = self.save_state(0)
-                    detail = getattr(self, '_last_state_detail', None)
-                    self._status_msg = self._format_state_message(
-                        'save', 0, None if ok else getattr(self, '_last_state_error', 'io'), detail)
-                    self._status_ttl = 90
+                    self._state_toast('save', 0, self.save_state(0))
                 elif event.key == pygame.K_F7:
-                    ok = self.load_state(0)
-                    detail = getattr(self, '_last_state_detail', None)
-                    self._status_msg = self._format_state_message(
-                        'load', 0, None if ok else getattr(self, '_last_state_error', 'corrupt'), detail)
-                    self._status_ttl = 90
+                    self._state_toast('load', 0, self.load_state(0))
                 elif event.key == pygame.K_F8:
-                    ok = self.save_state(1)
-                    detail = getattr(self, '_last_state_detail', None)
-                    self._status_msg = self._format_state_message(
-                        'save', 1, None if ok else getattr(self, '_last_state_error', 'io'), detail)
-                    self._status_ttl = 90
+                    self._state_toast('save', 1, self.save_state(1))
                 elif event.key == pygame.K_F9:
-                    ok = self.load_state(1)
-                    detail = getattr(self, '_last_state_detail', None)
-                    self._status_msg = self._format_state_message(
-                        'load', 1, None if ok else getattr(self, '_last_state_error', 'corrupt'), detail)
-                    self._status_ttl = 90
+                    self._state_toast('load', 1, self.load_state(1))
                 elif event.key == pygame.K_F3:
                     self._show_fps = not self._show_fps
                     self._status_msg = "FPS overlay on" if self._show_fps else "FPS overlay off"
@@ -6379,6 +6372,7 @@ class GameBoy:
         cpu.interrupts_master_enabled = False
         cpu.ime_pending = False
         cpu.halt_bug_pending = False
+        cpu._logged_opcodes.clear()
         cpu.reg.sp = 0xFFFE
         cpu.reg.pc = 0x0100
         if self.mmu.is_cgb:

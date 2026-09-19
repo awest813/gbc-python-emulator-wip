@@ -47,7 +47,8 @@ Super Game Boy palettes, and full CGB compatibility.
   write-protection rules (STAT read-only bits 0-2 / 6, unused bits
   forced to 1). Boot ROM support (DMG 256B / CGB ~2304B).
 - **Save states** — Snapshot full emulator state (including cartridge SRAM)
-  to `<rom>.ss<slot>` with F6 / F8 (save) and F7 / F9 (load).
+  to `<rom>.ss<slot>` with F6 / F8 (save) and F7 / F9 (load). v4 saves
+  record the ROM basename and refuse to load into a different game.
 - **Menu system** — ROM browser, window-scale selector, keyboard controls,
   project logo.
 - **Input** — D-pad, A / B, Start, Select via keyboard (customisable
@@ -132,6 +133,9 @@ optional DMG (256 B) or CGB (~2304 B) boot ROM before the cartridge starts.
 | F6 / F8        | Save state (slot 0 / 1) |
 | F7 / F9        | Load state (slot 0 / 1) |
 
+When a link cable is connected, a **LINK** badge appears in the HUD
+(top-right, with the FPS / input overlays).
+
 Keys are customisable: **Settings → Controls...** (also available from the
 in-game pause menu). Press Enter on a button to capture a new key. Esc, Tab,
 and F2–F9 are reserved. Bindings are stored in `gbc_config.json`.
@@ -193,7 +197,8 @@ Press **Escape** while a game is running to open the in-game pause menu.
 Emulation and audio halt, and the current frame is dimmed behind the menu:
 
 - **Resume** — Return to the game (Escape also resumes).
-- **Save State** / **Load State** — Quick-save or restore slot 0.
+- **Save to Slot 0 / 1** and **Load from Slot 0 / 1** — Quick-save slots
+  (same as F6–F9).
 - **Settings** — The same options as the main settings page, applied
   **live** to the running game (palette, shader, filter, volume, audio,
   frame rate, window scale, and Controls remapping all update immediately).
@@ -239,6 +244,10 @@ Performance-critical helpers:
   empty samples per video frame.
 - Halted CPUs skip ahead to the next PPU mode or TIMA event instead of
   burning 4 T-cycles per `step_all` call (~17k times per frame).
+- APU frame-sequencer countdown and reused OAM scans (~10% higher synthetic
+  throughput vs. the pre-audit baseline on `smoke_test.py`).
+- On boot, invalid Nintendo logos / header checksums and unsupported mappers
+  show a warning toast without blocking the load.
 
 ## Project Layout
 
@@ -326,9 +335,12 @@ interpreter on modest hardware.
 - Link-cable multiplayer is CLI-only (`--link-server PORT` /
   `--link-connect HOST:PORT` with a ROM path). Bytes are exchanged at
   transfer start, then shifted locally one bit at a time. A stalled
-  partner times out instead of freezing the emulator.
+  partner times out instead of freezing the emulator. The HUD shows
+  **LINK** while the socket is connected.
 - Save states (slots 0 and 1) include cartridge SRAM, MBC6 flash, SGB
-  palettes, and in-flight serial state. Battery-backed `.sav` files are
+  palettes, and in-flight serial state. v4 saves also store the ROM
+  basename and reject mismatched loads. v1–v3 saves still load. Failed
+  loads roll back live CPU/memory state. Battery-backed `.sav` files are
   written on exit. MBC3 RTC is stored after SRAM in VBA-M's 44-byte
   format so day/night continues while the emulator is closed. Older
   48-byte custom trailers still load.
