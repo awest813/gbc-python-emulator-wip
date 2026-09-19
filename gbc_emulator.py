@@ -5503,12 +5503,13 @@ class GameBoy:
 
     # ── Save state support ─────────────────────────────────────────
     SAVE_STATE_MAGIC = b'GBST'
-    SAVE_STATE_VERSION = 6
+    SAVE_STATE_VERSION = 7
     SAVE_STATE_VERSION_MIN = 1
     _STATE_ROM_ID_BYTES = 32
     _STATE_TIMING_MAGIC = 0xA5
     _STATE_TIMING_TAIL_V5 = 3   # gdma_stall u16 + speed_remainder u8
     _STATE_EXTRA_TAIL_V6 = 16   # v5 timing + bootrom + joypad + MBC7 EEPROM shift
+    _STATE_SGB_CMD_MAX = 256    # cap assembled SGB command buffer in saves
     _STATE_CPU_FMT = '<BBBB BB BB HHHH'
 
     @classmethod
@@ -5577,6 +5578,12 @@ class GameBoy:
                 'eeprom_clk': mmu.eeprom_clk,
                 'eeprom_bits': mmu.eeprom_bits,
                 'eeprom_shift': mmu.eeprom_shift,
+                'sgb_in_packet': mmu.sgb_in_packet,
+                'sgb_bit_count': mmu.sgb_bit_count,
+                'sgb_packet': bytes(mmu.sgb_packet),
+                'sgb_cmd': mmu.sgb_cmd,
+                'sgb_packets_left': mmu.sgb_packets_left,
+                'sgb_cmd_data': bytes(mmu.sgb_cmd_data),
             },
             'ppu': {
                 '_scanline_sprites': ppu._scanline_sprites,
@@ -5718,6 +5725,14 @@ class GameBoy:
         mmu.eeprom_clk = m.get('eeprom_clk', False)
         mmu.eeprom_bits = m.get('eeprom_bits', 0)
         mmu.eeprom_shift = m.get('eeprom_shift', 0)
+        mmu.sgb_in_packet = m.get('sgb_in_packet', False)
+        mmu.sgb_bit_count = m.get('sgb_bit_count', 0)
+        if 'sgb_packet' in m:
+            mmu.sgb_packet[:] = m['sgb_packet']
+        mmu.sgb_cmd = m.get('sgb_cmd', 0)
+        mmu.sgb_packets_left = m.get('sgb_packets_left', 0)
+        if 'sgb_cmd_data' in m:
+            mmu.sgb_cmd_data[:] = m['sgb_cmd_data']
         p = sub['ppu']
         ppu.mode = p['mode']
         ppu.scanline_dot = p['scanline_dot']
@@ -5806,6 +5821,16 @@ class GameBoy:
         self._has_rtc = sub['has_rtc']
         self.speed_remainder = sub.get('speed_remainder', 0)
 
+    def _reset_sgb_fsm(self):
+        """Clear in-progress Super Game Boy packet assembly state."""
+        mmu = self.mmu
+        mmu.sgb_in_packet = False
+        mmu.sgb_bit_count = 0
+        mmu.sgb_packet = bytearray(16)
+        mmu.sgb_cmd = 0
+        mmu.sgb_cmd_data = bytearray()
+        mmu.sgb_packets_left = 0
+
     def _sanitize_serial_after_load(self):
         """Drop in-flight serial shifts that cannot resume without a live link partner."""
         mmu = self.mmu
@@ -5819,10 +5844,12 @@ class GameBoy:
         mmu.serial_control &= ~0x80
         mmu.serial_incoming = 0xFF
 
-    def _restore_post_load(self):
+    def _restore_post_load(self, ver=None):
         """Clear stale caches and re-sync live input sources after load_state."""
         self.ppu._scanline_sprites = None
         self._sanitize_serial_after_load()
+        if ver is not None and ver < 7:
+            self._reset_sgb_fsm()
         if pygame and getattr(self, 'screen', None) is not None:
             self.mmu.release_all_joypad()
             self._sync_held_inputs()
@@ -6078,6 +6105,15 @@ class GameBoy:
                 1 if mmu.eeprom_clk else 0,
                 mmu.eeprom_bits & 0xFF,
                 mmu.eeprom_shift & 0xFFFF))
+            sgb_cmd = bytes(mmu.sgb_cmd_data[:self._STATE_SGB_CMD_MAX])
+            parts.append(struct.pack(
+                '<BHBB', 1 if mmu.sgb_in_packet else 0,
+                mmu.sgb_bit_count & 0xFFFF,
+                mmu.sgb_cmd & 0xFF,
+                mmu.sgb_packets_left & 0xFF))
+            parts.append(bytes(mmu.sgb_packet))
+            parts.append(struct.pack('<H', len(sgb_cmd)))
+            parts.append(sgb_cmd)
             with open(path, 'wb') as f:
                 for p in parts:
                     f.write(p)
@@ -6447,6 +6483,24 @@ class GameBoy:
                 mmu.eeprom_bits = e_bits
                 mmu.eeprom_shift = e_shift
                 mmu._recompute_joypad()
+                if ver >= 7:
+                    _need(5 + 16 + 2, "sgb_fsm")
+                    (sgb_pkt, sgb_bits, sgb_cmd, sgb_left) = struct.unpack_from(
+                        '<BHBB', data, pos)
+                    pos += 5
+                    mmu.sgb_in_packet = bool(sgb_pkt)
+                    mmu.sgb_bit_count = sgb_bits
+                    mmu.sgb_cmd = sgb_cmd
+                    mmu.sgb_packets_left = sgb_left
+                    mmu.sgb_packet[:] = data[pos:pos + 16]
+                    pos += 16
+                    (cmd_len,) = struct.unpack_from('<H', data, pos)
+                    pos += 2
+                    if cmd_len > self._STATE_SGB_CMD_MAX:
+                        raise ValueError("save state sgb_cmd_data is implausibly large")
+                    _need(cmd_len, "sgb_cmd_data")
+                    mmu.sgb_cmd_data = bytearray(data[pos:pos + cmd_len])
+                    pos += cmd_len
             elif ver >= 5:
                 _need(self._STATE_TIMING_TAIL_V5, "timing")
                 gdma_stall, speed_rem = struct.unpack_from('<HB', data, pos)
@@ -6462,7 +6516,7 @@ class GameBoy:
                 mmu._joy_src = [saved_joypad, 0xFF, 0xFF, 0xFF, 0xFF]
                 mmu._dpad_last = [0, 2]
                 mmu._recompute_joypad()
-            self._restore_post_load()
+            self._restore_post_load(ver)
             apu.drain()
             if hasattr(self, '_audio_pending'):
                 self._audio_pending.clear()

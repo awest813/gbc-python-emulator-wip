@@ -297,6 +297,46 @@ def main():
         check("MBC6 flash load succeeds", gb6.load_state(0) is True)
         check("MBC6 flash byte restored", gb6.mmu.flash_data[0x1234] == 0xBE)
 
+        # v7 saves mid-packet Super Game Boy FSM state.
+        sgb_snap = (
+            True, 42, bytes(range(16)), 0x0A, 3, bytearray([0x01, 0x02, 0x03, 0x04]),
+        )
+        gb.mmu.sgb_in_packet = sgb_snap[0]
+        gb.mmu.sgb_bit_count = sgb_snap[1]
+        gb.mmu.sgb_packet[:] = sgb_snap[2]
+        gb.mmu.sgb_cmd = sgb_snap[3]
+        gb.mmu.sgb_packets_left = sgb_snap[4]
+        gb.mmu.sgb_cmd_data = bytearray(sgb_snap[5])
+        check("SGB FSM save succeeds", gb.save_state(0) is True)
+        gb.mmu.sgb_in_packet = False
+        gb.mmu.sgb_bit_count = 0
+        gb.mmu.sgb_packet[:] = bytes(16)
+        gb.mmu.sgb_cmd = 0
+        gb.mmu.sgb_packets_left = 0
+        gb.mmu.sgb_cmd_data = bytearray()
+        check("SGB FSM load succeeds", gb.load_state(0) is True)
+        check("sgb_in_packet restored", gb.mmu.sgb_in_packet == sgb_snap[0])
+        check("sgb_bit_count restored", gb.mmu.sgb_bit_count == sgb_snap[1])
+        check("sgb_packet restored", bytes(gb.mmu.sgb_packet) == sgb_snap[2])
+        check("sgb_cmd restored", gb.mmu.sgb_cmd == sgb_snap[3])
+        check("sgb_packets_left restored", gb.mmu.sgb_packets_left == sgb_snap[4])
+        check("sgb_cmd_data restored", bytes(gb.mmu.sgb_cmd_data) == sgb_snap[5])
+
+        # v6 saves without an SGB tail clear in-progress packet assembly on load.
+        v6_path = gb._state_path(1)
+        v7_raw = open(gb._state_path(0), "rb").read()
+        sgb_tail = 5 + 16 + 2 + len(sgb_snap[5])
+        v6_raw = v7_raw[:4] + bytes([6]) + v7_raw[5:-sgb_tail]
+        with open(v6_path, "wb") as f:
+            f.write(v6_raw)
+        gb.mmu.sgb_in_packet = True
+        gb.mmu.sgb_bit_count = 99
+        gb.mmu.sgb_cmd = 0xFF
+        check("legacy v6 save loads", gb.load_state(1) is True)
+        check("legacy v6 load clears sgb_in_packet", gb.mmu.sgb_in_packet is False)
+        check("legacy v6 load clears sgb_bit_count", gb.mmu.sgb_bit_count == 0)
+        check("legacy v6 load clears sgb_cmd", gb.mmu.sgb_cmd == 0)
+
     if _failures:
         print(f"\n{_failures} CHECK(S) FAILED")
         sys.exit(1)
