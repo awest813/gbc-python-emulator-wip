@@ -169,6 +169,27 @@ FILTER_OPTIONS = [("Nearest", False), ("Smooth", True)]
 WINDOW_SCALE_OPTIONS = [("2x", 2), ("3x", 3), ("4x", 4), ("5x", 5)]
 
 
+_NINTENDO_LOGO = bytes([
+    0x48, 0x06, 0x0E, 0x76, 0xFE, 0xB3, 0x1A, 0x0F, 0xCE, 0x6B, 0xB3, 0x83,
+    0x2D, 0xC1, 0xE5, 0xD6, 0xC9, 0x19, 0x7D, 0x07, 0x4F, 0x1B, 0x7E, 0x33,
+    0x9D, 0xBE, 0x9C, 0xD3, 0x09, 0x6C, 0xD2, 0xA1, 0x4A, 0x9F, 0x53, 0x1A,
+    0x5C, 0x1B, 0x78, 0x20, 0x86, 0xE0, 0x49, 0x38, 0x84, 0xB3, 0x1C, 0x00,
+])
+
+def _validate_rom_header(rom_data):
+    """Return a list of header problems ('logo', 'checksum') or [] if OK."""
+    if len(rom_data) < 0x150:
+        return ['size']
+    issues = []
+    if rom_data[0x104:0x134] != _NINTENDO_LOGO:
+        issues.append('logo')
+    chk = 0
+    for b in rom_data[0x134:0x14D]:
+        chk = (chk - b - 1) & 0xFF
+    if chk != rom_data[0x14D]:
+        issues.append('checksum')
+    return issues
+
 def _parse_rom_header(rom_path):
     """Parse ROM header bytes and return a short info string, or None on error."""
     try:
@@ -642,6 +663,7 @@ class CPU:
         self.trace_enabled = False
         self.branch_trace = deque(maxlen=8192)
         self.invalid_opcode_count = 0
+        self._logged_opcodes = set()
         self.trace_branch = _noop_trace
         self.current_opcode_pc = 0
 
@@ -1343,7 +1365,10 @@ class CPU:
             self.invalid_opcode_count += 1
             return 4
         self.invalid_opcode_count += 1
-        logging.error(f"Unimplemented Opcode: {opcode:02X} at PC: {self.current_opcode_pc:04X}")
+        if opcode not in self._logged_opcodes:
+            self._logged_opcodes.add(opcode)
+            logging.warning(
+                f"Unimplemented opcode: {opcode:02X} at PC: {self.current_opcode_pc:04X}")
         return 4
 
     def execute_cb(self, cb_opcode):
@@ -1515,6 +1540,10 @@ class LinkCable:
             except OSError:
                 pass
             self.server_sock = None
+
+    @property
+    def is_connected(self):
+        return self.sock is not None
 
 
 class MMU:
@@ -4711,6 +4740,7 @@ class EmulatorMenu:
             for i, key in enumerate(JOYPAD_BUTTON_KEYS)
         ]
         items.append(f"WASD as D-Pad: {'On' if self.wasd_enabled else 'Off'}")
+        items.append("Turbo A/B: Q/E (not remappable)")
         items.append("Reset to Default")
         return items
 
@@ -5160,8 +5190,14 @@ class GameBoy:
                     self.cpu.reg.l = 0x4D
                 self._apply_post_boot_io()
             self._load_sav()
+            boot_warnings = []
+            header_issues = _validate_rom_header(rom_data)
+            if header_issues:
+                boot_warnings.append("invalid ROM header")
             if self.mmu.mbc_type not in _SUPPORTED_CART_TYPES:
-                self._status_msg = "Mapper not emulated — game may not work"
+                boot_warnings.append("mapper not emulated")
+            if boot_warnings:
+                self._status_msg = " — ".join(w.capitalize() for w in boot_warnings)
                 self._status_ttl = 240
         else:
             logging.info("No ROM provided. Running dummy infinite loop.")
@@ -5377,13 +5413,21 @@ class GameBoy:
 
     # ── Save state support ─────────────────────────────────────────
     SAVE_STATE_MAGIC = b'GBST'
-    SAVE_STATE_VERSION = 3
+    SAVE_STATE_VERSION = 4
     SAVE_STATE_VERSION_MIN = 1
+    _STATE_ROM_ID_BYTES = 32
     _STATE_CPU_FMT = '<BBBB BB BB HHHH'
 
     @classmethod
-    def _state_min_bytes(cls):
-        return 4 + 4 + struct.calcsize(cls._STATE_CPU_FMT) + 4 + 0x10000
+    def _state_header_bytes(cls, version):
+        extra = cls._STATE_ROM_ID_BYTES if version >= 4 else 0
+        return 8 + extra
+
+    @classmethod
+    def _state_min_bytes(cls, version=None):
+        ver = cls.SAVE_STATE_VERSION if version is None else version
+        return (cls._state_header_bytes(ver)
+                + struct.calcsize(cls._STATE_CPU_FMT) + 4 + 0x10000)
 
     def _state_backup(self):
         """Capture live CPU + memory before a load attempt (rollback on failure)."""
@@ -5432,6 +5476,8 @@ class GameBoy:
             return f"Unsupported save version in slot {slot}"
         if error_code == 'corrupt':
             return f"Save file in slot {slot} is corrupted"
+        if error_code == 'wrong_rom':
+            return f"Save state in slot {slot} is for a different ROM"
         if error_code == 'io':
             base = f"Could not {action} slot {slot}"
             return f"{base}: {detail}" if detail else base
@@ -5464,7 +5510,10 @@ class GameBoy:
             apu.drain()
             parts = []
             parts.append(self.SAVE_STATE_MAGIC)
-            parts.append(struct.pack('<BBBB', self.SAVE_STATE_VERSION, slot, 0, 0))
+            rom_name = os.path.basename(mmu.rom_path or '').encode('utf-8', 'replace')[:31]
+            parts.append(struct.pack(
+                '<BBBB', self.SAVE_STATE_VERSION, slot, len(rom_name), 0))
+            parts.append(rom_name + b'\x00' * (self._STATE_ROM_ID_BYTES - len(rom_name)))
             # CPU
             reg = cpu.reg
             parts.append(struct.pack('<BBBB BB BB HHHH',
@@ -5621,12 +5670,10 @@ class GameBoy:
         if not path or not os.path.isfile(path):
             self._last_state_error = 'missing'
             return False
-        snap = self._state_backup()
+        snap = None
         try:
             with open(path, 'rb') as f:
                 data = f.read()
-            if len(data) < self._state_min_bytes():
-                raise ValueError("truncated save state (header)")
             pos = 0
             if data[pos:pos+4] != self.SAVE_STATE_MAGIC:
                 logging.warning("Save state: bad magic")
@@ -5638,8 +5685,20 @@ class GameBoy:
                 logging.warning(f"Save state: unsupported version {ver}")
                 self._last_state_error = 'version'
                 return False
+            if len(data) < self._state_min_bytes(ver):
+                raise ValueError("truncated save state (header)")
             pos += 4
+            if ver >= 4:
+                name_len = data[6]
+                saved_name = bytes(data[8:8 + name_len])
+                current_name = os.path.basename(self.mmu.rom_path or '').encode(
+                    'utf-8', 'replace')[:31]
+                if name_len and saved_name != current_name[:name_len]:
+                    self._last_state_error = 'wrong_rom'
+                    return False
+                pos = self._state_header_bytes(ver)
             mmu = self.mmu
+            snap = self._state_backup()
             cpu = self.cpu
             ppu = self.ppu
             apu = self.apu
@@ -5946,13 +6005,15 @@ class GameBoy:
             return True
         except OSError as e:
             logging.warning(f"Could not load state: {e}")
-            self._state_restore(snap)
+            if snap is not None:
+                self._state_restore(snap)
             self._last_state_error = 'io'
             self._last_state_detail = str(e)[:60]
             return False
         except (struct.error, ValueError, IndexError) as e:
             logging.warning(f"Could not load state: {e}")
-            self._state_restore(snap)
+            if snap is not None:
+                self._state_restore(snap)
             self._last_state_error = 'corrupt'
             self._last_state_detail = str(e)[:60]
             return False
@@ -6379,6 +6440,9 @@ class GameBoy:
                 self.screen.blit(surf, (x + 6, y + 3))
                 y += bg.get_height() + 4
 
+            lc = self.mmu.link_cable
+            if lc is not None and lc.is_connected:
+                _badge(f.render("LINK", True, MENU_HI))
             if getattr(self, '_fast_forward', False):
                 _badge(f.render("FF", True, MENU_HI))
             if getattr(self, '_show_fps', False):
@@ -6698,6 +6762,7 @@ class GameBoy:
             idx = JOYPAD_BUTTON_KEYS.index(self.controls_capture)
             items[idx] = f"{JOYPAD_BUTTON_LABELS[idx]}: Press a key..."
         items.append(f"WASD as D-Pad: {'On' if self.wasd_enabled else 'Off'}")
+        items.append("Turbo A/B: Q/E (not remappable)")
         items.append("Reset to Default")
         return items
 

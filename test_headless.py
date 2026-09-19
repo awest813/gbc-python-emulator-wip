@@ -661,6 +661,23 @@ def test_apu_power_and_div(ns):
     check("DIV reset clears the APU DIV shadow", gb.apu.fs_div == 0)
 
 
+def test_rom_header_validation(ns):
+    validate = ns["_validate_rom_header"]
+    logo = ns["_NINTENDO_LOGO"]
+    rom = bytearray(0x8000)
+    rom[0x104:0x134] = logo
+    chk = 0
+    for b in rom[0x134:0x14D]:
+        chk = (chk - b - 1) & 0xFF
+    rom[0x14D] = chk
+    check("valid synthetic header passes", validate(bytes(rom)) == [])
+    rom[0x104] = 0x00
+    check("bad logo flagged", 'logo' in validate(bytes(rom)))
+    rom[0x104:0x134] = logo
+    rom[0x14D] ^= 0xFF
+    check("bad checksum flagged", 'checksum' in validate(bytes(rom)))
+
+
 def main():
     ns = load_module()
     print("opcode checks:");           test_opcodes(ns)
@@ -676,6 +693,7 @@ def main():
     print("apu power and DIV:");       test_apu_power_and_div(ns)
     print("double-speed timing:");     test_double_speed(ns)
     print("mbc1 mode-1 low bank:");    test_mbc1_mode1_low_bank(ns)
+    print("rom header validation:");   test_rom_header_validation(ns)
     print("\nALL CHECKS PASSED")
 
 

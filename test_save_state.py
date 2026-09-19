@@ -9,6 +9,7 @@ load, which guards the packed-24-bit framebuffer path.
 Exits non-zero on any failure.
 """
 import os
+import shutil
 import sys
 import tempfile
 
@@ -180,13 +181,31 @@ def main():
         # A truncated / corrupt file must fail without shrinking live memory.
         corrupt = gb._state_path(0)
         with open(corrupt, "wb") as f:
-            f.write(b"GBST" + bytes([gb.SAVE_STATE_VERSION, 0, 0, 0]) + b"\x00" * 200)
+            f.write(b"GBST" + bytes([3, 0, 0, 0]) + b"\x00" * 200)
         mem_len = len(gb.mmu.memory)
         pc_before = gb.cpu.reg.pc
         check("truncated load returns False", gb.load_state(0) is False)
         check("truncated load leaves 64KB memory", len(gb.mmu.memory) == mem_len == 0x10000)
         check("truncated load rolls back CPU state", gb.cpu.reg.pc == pc_before)
         check("truncated load reports corrupt file", gb._last_state_error == 'corrupt')
+
+        # v4 saves record the ROM basename; loading a mismatched snapshot fails.
+        check("save_state v4 succeeds", gb.save_state(0) is True)
+        other_path = os.path.join(tmp, "other.gbc")
+        shutil.copy(rom_path, other_path)
+        shutil.copy(gb._state_path(0), os.path.splitext(other_path)[0] + ".ss0")
+        gb.mmu.rom_path = other_path
+        check("wrong ROM load returns False", gb.load_state(0) is False)
+        check("wrong ROM reports mismatch", gb._last_state_error == 'wrong_rom')
+        gb.mmu.rom_path = rom_path
+        check("matching ROM load succeeds", gb.load_state(0) is True)
+
+        # v3 saves without a ROM id block still load on v4 builds.
+        legacy = gb._state_path(1)
+        raw = open(gb._state_path(0), "rb").read()
+        with open(legacy, "wb") as f:
+            f.write(raw[:4] + bytes([3, 1, 0, 0]) + raw[40:])
+        check("legacy v3 save loads", gb.load_state(1) is True)
 
     if _failures:
         print(f"\n{_failures} CHECK(S) FAILED")
