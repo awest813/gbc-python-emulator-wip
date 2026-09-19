@@ -128,18 +128,33 @@ PALETTE_LIST = [
 def _shader_none(fb):
     return fb
 
-def _shader_lcd_ghost(fb, prev=None):
+def _shader_lcd_ghost(fb, prev=None, out=None, scratch=None, scratch_b=None):
     if prev is None:
         return fb
+    if scratch is not None and scratch_b is not None and out is not None:
+        np.multiply(fb, 0.80, out=scratch)
+        np.multiply(prev, 0.20, out=scratch_b)
+        np.add(scratch, scratch_b, out=scratch)
+        np.clip(scratch, 0, 255, out=out)
+        return out
     return np.clip(fb * 0.80 + prev * 0.20, 0, 255).astype(np.uint8)
 
-def _shader_crt_scanlines(fb):
-    out = fb.copy()
+def _shader_crt_scanlines(fb, out=None):
+    if out is None:
+        out = fb.copy()
+    else:
+        np.copyto(out, fb)
     out[1::2] = (out[1::2].astype(np.uint16) * 65 // 100).astype(np.uint8)
     return out
 
-def _shader_gamma_warm(fb):
-    return np.clip(np.power(fb.astype(np.float32) / 255.0, 1.2) * 255.0, 0, 255).astype(np.uint8)
+def _shader_gamma_warm(fb, out=None, scratch=None):
+    if scratch is None or out is None:
+        return np.clip(np.power(fb.astype(np.float32) / 255.0, 1.2) * 255.0, 0, 255).astype(np.uint8)
+    np.divide(fb, 255.0, out=scratch)
+    np.power(scratch, 1.2, out=scratch)
+    np.multiply(scratch, 255.0, out=scratch)
+    np.clip(scratch, 0, 255, out=out)
+    return out
 
 def _shader_pixel_bloom(fb):
     blurred = (np.roll(fb, 1, 0) + np.roll(fb, -1, 0) +
@@ -5323,9 +5338,18 @@ class GameBoy:
         if np is not None:
             self._frame_np = np.empty((SCREEN_HEIGHT, SCREEN_WIDTH, 3), dtype=np.uint8)
             self._blit_np = np.empty((SCREEN_WIDTH, SCREEN_HEIGHT, 3), dtype=np.uint8)
+            self._shader_out = np.empty((SCREEN_HEIGHT, SCREEN_WIDTH, 3), dtype=np.uint8)
+            self._shader_f32 = np.empty((SCREEN_HEIGHT, SCREEN_WIDTH, 3), dtype=np.float32)
+            self._shader_f32_b = np.empty((SCREEN_HEIGHT, SCREEN_WIDTH, 3), dtype=np.float32)
+            self._ghost_store = np.empty((SCREEN_HEIGHT, SCREEN_WIDTH, 3), dtype=np.uint8)
         else:
             self._frame_np = None
             self._blit_np = None
+            self._shader_out = None
+            self._shader_f32 = None
+            self._shader_f32_b = None
+            self._ghost_store = None
+        self._numpy_slow_warned = False
 
         if pygame:
             self.window_scale = _clamp_choice(window_scale, _WINDOW_SCALES, 4)
@@ -7453,8 +7477,9 @@ class GameBoy:
                 hint = self._pause_hint("Press a new key   Esc: Cancel",
                                         "Press a key   Esc: Cancel")
             else:
-                hint = self._pause_hint("Enter: Remap / Toggle   Esc: Back",
-                                        "Enter: Remap   Esc: Back")
+                hint = self._pause_hint(
+                    "Enter: Remap / Toggle   Esc: Back   Tab/F3/F4/Ctrl+R in-game",
+                    "Enter: Remap   Esc: Back")
             self.pause_controls_scroll = self._draw_overlay_menu(
                 backdrop, "Controls", self._pause_controls_items(),
                 self.pause_controls_cursor, hint,
@@ -7482,6 +7507,29 @@ class GameBoy:
                     "Enter: Select   Esc: Resume   F6-F9"),
                 status=status, status_hi=True)
 
+    def _apply_display_shader(self, fnp):
+        """Run the active post-process shader using pre-allocated scratch buffers."""
+        shader = self.shader
+        if shader is _shader_none:
+            return fnp
+        out = self._shader_out
+        if shader is _shader_lcd_ghost:
+            prev = self._prev_shader_frame
+            if prev is None:
+                np.copyto(self._ghost_store, fnp)
+                self._prev_shader_frame = self._ghost_store
+                return fnp
+            arr = _shader_lcd_ghost(
+                fnp, prev, out=out,
+                scratch=self._shader_f32, scratch_b=self._shader_f32_b)
+            np.copyto(prev, fnp)
+            return arr
+        if shader is _shader_crt_scanlines:
+            return _shader_crt_scanlines(fnp, out)
+        if shader is _shader_gamma_warm:
+            return _shader_gamma_warm(fnp, out, self._shader_f32)
+        return shader(fnp)
+
     def render(self, overlays=True):
         """Draws the PPU framebuffer to the Pygame screen."""
         if np is not None:
@@ -7493,15 +7541,14 @@ class GameBoy:
             fnp[:, :, 0] = (packed >> 16) & 0xFF
             fnp[:, :, 1] = (packed >> 8) & 0xFF
             fnp[:, :, 2] = packed & 0xFF
-            arr = fnp
-            if self.shader is _shader_lcd_ghost:
-                arr = self.shader(arr, prev=self._prev_shader_frame)
-                self._prev_shader_frame = arr.copy()
-            else:
-                arr = self.shader(arr)
+            arr = self._apply_display_shader(fnp)
             np.copyto(self._blit_np, arr.transpose(1, 0, 2))
             surf = pygame.surfarray.make_surface(self._blit_np)
         else:
+            if pygame and not self._numpy_slow_warned:
+                self._numpy_slow_warned = True
+                self._status_msg = "Install numpy for faster rendering (pip install numpy)"
+                self._status_ttl = 180
             surf = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT))
             pxa = pygame.PixelArray(surf)
             fb = self.ppu.framebuffer

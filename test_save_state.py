@@ -40,6 +40,14 @@ def check(name, ok):
         _failures += 1
 
 
+class _MockLinkCable:
+    """Minimal stand-in for a connected link partner."""
+
+    @property
+    def is_connected(self):
+        return True
+
+
 def build_machine(rom_path, cart=0x00):
     """Wire a headless GameBoy around a freshly loaded synthetic CGB ROM."""
     rom = bytearray(0x8000)
@@ -240,13 +248,27 @@ def main():
         check("mid-serial shift cleared on load", gb.mmu.serial_bits_left == 0)
         check("serial SC cleared on load", (gb.mmu.serial_control & 0x80) == 0)
 
+        # Mid-transfer serial is preserved when a link partner is connected.
+        gb.mmu.link_cable = _MockLinkCable()
+        gb.mmu.serial_data = 0xCD
+        gb.mmu.serial_control = 0x81
+        gb.mmu.serial_bits_left = 5
+        check("connected serial save succeeds", gb.save_state(0) is True)
+        gb.mmu.serial_bits_left = 0
+        check("connected serial load succeeds", gb.load_state(0) is True)
+        check("connected serial bits preserved", gb.mmu.serial_bits_left == 5)
+        check("connected serial data preserved", gb.mmu.serial_data == 0xCD)
+        gb.mmu.link_cable = None
+
         # v6 saves record the ROM basename; loading a mismatched snapshot fails.
         other_path = os.path.join(tmp, "other.gbc")
         shutil.copy(rom_path, other_path)
         shutil.copy(gb._state_path(0), os.path.splitext(other_path)[0] + ".ss0")
         gb.mmu.rom_path = other_path
+        gb.mmu.rom_bank = 77
         check("wrong ROM load returns False", gb.load_state(0) is False)
         check("wrong ROM reports mismatch", gb._last_state_error == 'wrong_rom')
+        check("wrong ROM leaves live state untouched", gb.mmu.rom_bank == 77)
         gb.mmu.rom_path = rom_path
         check("matching ROM load succeeds", gb.load_state(0) is True)
 
