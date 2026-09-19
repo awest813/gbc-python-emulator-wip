@@ -182,8 +182,11 @@ def main():
         with open(corrupt, "wb") as f:
             f.write(b"GBST" + bytes([gb.SAVE_STATE_VERSION, 0, 0, 0]) + b"\x00" * 200)
         mem_len = len(gb.mmu.memory)
+        pc_before = gb.cpu.reg.pc
         check("truncated load returns False", gb.load_state(0) is False)
         check("truncated load leaves 64KB memory", len(gb.mmu.memory) == mem_len == 0x10000)
+        check("truncated load rolls back CPU state", gb.cpu.reg.pc == pc_before)
+        check("truncated load reports corrupt file", gb._last_state_error == 'corrupt')
 
     if _failures:
         print(f"\n{_failures} CHECK(S) FAILED")

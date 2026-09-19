@@ -540,14 +540,15 @@ def _load_config():
         return {}
 
 def _save_config(cfg):
-    """Merge `cfg` into the existing JSON config and write it back."""
+    """Merge ``cfg`` into the existing JSON config and write it back."""
     current = _load_config()
     current.update(cfg)
     try:
         with open(_CONFIG_PATH, 'w') as f:
             json.dump(current, f, indent=2)
+        return True
     except OSError:
-        pass
+        return False
 
 
 # Apply persisted (or default) key bindings as soon as pygame is importable.
@@ -1451,8 +1452,9 @@ class CPU:
 class LinkCable:
     """TCP serial link between two emulator instances (local multiplayer).
 
-    Transfers complete in one shot (no bit-clock). Sockets use a short timeout
-    so a stalled partner cannot freeze the emulator indefinitely.
+    The partner byte is fetched when the transfer starts; local SB is then
+    bit-clocked via ``MMU._serial_step`` like hardware. Sockets use a short
+    timeout so a stalled partner cannot freeze the emulator indefinitely.
     """
     TRANSFER_TIMEOUT = 0.25
 
@@ -4619,6 +4621,8 @@ class EmulatorMenu:
         self._scan_roms()
 
     def _scan_roms(self):
+        self._rom_info_cache = {}
+        seen = set()
         self.roms = []
         if not os.path.isdir("roms") and not os.path.isdir("rom"):
             try:
@@ -4631,7 +4635,10 @@ class EmulatorMenu:
             for f in sorted(os.listdir(base)):
                 fp = os.path.join(base, f)
                 if os.path.isfile(fp) and f.lower().endswith(('.gb', '.gbc')):
-                    self.roms.append(fp)
+                    rp = os.path.realpath(fp)
+                    if rp not in seen:
+                        seen.add(rp)
+                        self.roms.append(fp)
             for sub in sorted(os.listdir(base)):
                 d1 = os.path.join(base, sub)
                 if not os.path.isdir(d1):
@@ -4640,7 +4647,10 @@ class EmulatorMenu:
                     for f in sorted(os.listdir(d1)):
                         fp = os.path.join(d1, f)
                         if os.path.isfile(fp) and f.lower().endswith(('.gb', '.gbc')):
-                            self.roms.append(fp)
+                            rp = os.path.realpath(fp)
+                            if rp not in seen:
+                                seen.add(rp)
+                                self.roms.append(fp)
                 except OSError:
                     pass
                 try:
@@ -4652,7 +4662,10 @@ class EmulatorMenu:
                             for f in sorted(os.listdir(d2)):
                                 fp = os.path.join(d2, f)
                                 if os.path.isfile(fp) and f.lower().endswith(('.gb', '.gbc')):
-                                    self.roms.append(fp)
+                                    rp = os.path.realpath(fp)
+                                    if rp not in seen:
+                                        seen.add(rp)
+                                        self.roms.append(fp)
                         except OSError:
                             pass
                 except OSError:
@@ -4669,7 +4682,9 @@ class EmulatorMenu:
             f"Shader: {SHADER_LIST[self.shader_idx][0]}",
             "Controls...",
         ]
-        _save_config(dict(
+
+    def _persist_menu_settings(self):
+        if not _save_config(dict(
             window_scale=self.window_scale,
             fps_limit=FPS_LIMIT_OPTIONS[self.fps_limit_idx][1],
             audio_enabled=AUDIO_OPTIONS[self.audio_idx][1],
@@ -4679,14 +4694,16 @@ class EmulatorMenu:
             shader=self.shader_idx,
             wasd_enabled=self.wasd_enabled,
             key_bindings=self.key_bindings,
-        ))
+        )):
+            self._status("Could not save settings")
 
     def _persist_controls(self):
         self.key_bindings = _rebuild_key_map(self.key_bindings, self.wasd_enabled)
-        _save_config({
+        if not _save_config({
             'wasd_enabled': self.wasd_enabled,
             'key_bindings': self.key_bindings,
-        })
+        }):
+            self._status("Could not save settings")
 
     def _controls_items(self):
         items = [
@@ -4743,7 +4760,7 @@ class EmulatorMenu:
     def _cycle_menu_setting(self, cursor, direction=1):
         """Cycle a main-menu setting forward (1) or backward (-1)."""
         if cursor == 0:
-            scales = [2, 3, 4, 5]
+            scales = list(_WINDOW_SCALES)
             try:
                 idx = scales.index(self.window_scale)
             except ValueError:
@@ -4764,6 +4781,7 @@ class EmulatorMenu:
         else:
             return
         self._sync_settings_items()
+        self._persist_menu_settings()
 
     def run(self):
         clock = pygame.time.Clock()
@@ -5067,7 +5085,7 @@ class EmulatorMenu:
         self._draw_chrome(
             hint,
             secondary=None if self.controls_capture else
-            "Tab: Fast-forward   F3: FPS   F4: Input   Ctrl+R: Reset")
+            "In-game: Tab fast-forward, F3 FPS, F4 input, Ctrl+R reset")
 
     def _render_confirm_exit(self):
         self._centre_text("Exit Emulator?", 120, MENU_HI, 36, shadow=True)
@@ -5142,6 +5160,9 @@ class GameBoy:
                     self.cpu.reg.l = 0x4D
                 self._apply_post_boot_io()
             self._load_sav()
+            if self.mmu.mbc_type not in _SUPPORTED_CART_TYPES:
+                self._status_msg = "Mapper not emulated — game may not work"
+                self._status_ttl = 240
         else:
             logging.info("No ROM provided. Running dummy infinite loop.")
             self.mmu.memory[0x0100] = 0x00
@@ -5358,6 +5379,65 @@ class GameBoy:
     SAVE_STATE_MAGIC = b'GBST'
     SAVE_STATE_VERSION = 3
     SAVE_STATE_VERSION_MIN = 1
+    _STATE_CPU_FMT = '<BBBB BB BB HHHH'
+
+    @classmethod
+    def _state_min_bytes(cls):
+        return 4 + 4 + struct.calcsize(cls._STATE_CPU_FMT) + 4 + 0x10000
+
+    def _state_backup(self):
+        """Capture live CPU + memory before a load attempt (rollback on failure)."""
+        cpu = self.cpu
+        reg = cpu.reg
+        return {
+            'memory': bytes(self.mmu.memory),
+            'cpu': (
+                reg.a, reg.f, reg.b, reg.c, reg.d, reg.e, reg.h, reg.l, reg.sp, reg.pc,
+                cpu.halted, cpu.interrupts_master_enabled, cpu.ime_pending, cpu.halt_bug_pending,
+            ),
+            'div_counter': self.timers.div_counter,
+            'tima_accum': self.timers.tima_accum,
+        }
+
+    def _state_restore(self, snap):
+        if not snap:
+            return
+        mmu = self.mmu
+        if len(mmu.memory) != 0x10000:
+            mmu.memory = bytearray(0x10000)
+        mmu.memory[:] = snap['memory']
+        (a, f_, b, c, d, e, h, l, sp, pc,
+         halted, ime, ime_pending, halt_bug) = snap['cpu']
+        reg = self.cpu.reg
+        reg.a, reg.f, reg.b, reg.c = a, f_ & 0xF0, b, c
+        reg.d, reg.e, reg.h, reg.l = d, e, h, l
+        reg.sp, reg.pc = sp, pc
+        self.cpu.halted = halted
+        self.cpu.interrupts_master_enabled = ime
+        self.cpu.ime_pending = ime_pending
+        self.cpu.halt_bug_pending = halt_bug
+        self.timers.div_counter = snap['div_counter']
+        self.timers.tima_accum = snap['tima_accum']
+        mmu.memory[0xFF04] = (snap['div_counter'] >> 8) & 0xFF
+
+    @staticmethod
+    def _format_state_message(action, slot, error_code, detail=None):
+        if action == 'save' and error_code is None:
+            return f"State saved to slot {slot}"
+        if action == 'load' and error_code is None:
+            return f"State loaded from slot {slot}"
+        if error_code == 'missing':
+            return f"No save state in slot {slot}"
+        if error_code == 'version':
+            return f"Unsupported save version in slot {slot}"
+        if error_code == 'corrupt':
+            return f"Save file in slot {slot} is corrupted"
+        if error_code == 'io':
+            base = f"Could not {action} slot {slot}"
+            return f"{base}: {detail}" if detail else base
+        if action == 'save':
+            return "Failed to save state" + (f": {detail}" if detail else "")
+        return f"Could not load slot {slot}" + (f": {detail}" if detail else "")
 
     def _state_path(self, slot):
         if not self.mmu.rom_path:
@@ -5366,8 +5446,10 @@ class GameBoy:
         return f"{base}.ss{slot}"
 
     def save_state(self, slot=0):
+        self._last_state_error = None
         path = self._state_path(slot)
         if not path:
+            self._last_state_error = 'io'
             return False
         try:
             apu = self.apu
@@ -5528,23 +5610,33 @@ class GameBoy:
             return True
         except (OSError, struct.error, ValueError) as e:
             logging.warning(f"Could not save state: {e}")
+            self._last_state_error = 'io'
+            self._last_state_detail = str(e)[:60]
             return False
 
     def load_state(self, slot=0):
+        self._last_state_error = None
+        self._last_state_detail = None
         path = self._state_path(slot)
         if not path or not os.path.isfile(path):
+            self._last_state_error = 'missing'
             return False
+        snap = self._state_backup()
         try:
             with open(path, 'rb') as f:
                 data = f.read()
+            if len(data) < self._state_min_bytes():
+                raise ValueError("truncated save state (header)")
             pos = 0
             if data[pos:pos+4] != self.SAVE_STATE_MAGIC:
                 logging.warning("Save state: bad magic")
+                self._last_state_error = 'corrupt'
                 return False
             pos += 4
             ver = data[pos]
             if ver < self.SAVE_STATE_VERSION_MIN or ver > self.SAVE_STATE_VERSION:
                 logging.warning(f"Save state: unsupported version {ver}")
+                self._last_state_error = 'version'
                 return False
             pos += 4
             mmu = self.mmu
@@ -5558,7 +5650,7 @@ class GameBoy:
                     raise ValueError(f"truncated save state ({label})")
 
             # CPU
-            cpu_fmt = '<BBBB BB BB HHHH'
+            cpu_fmt = self._STATE_CPU_FMT
             _need(struct.calcsize(cpu_fmt) + 4, "cpu")
             (a, f_, b, c, d, e, h, l, sp, pc, _, _) = struct.unpack_from(cpu_fmt, data, pos)
             pos += struct.calcsize(cpu_fmt)
@@ -5852,10 +5944,17 @@ class GameBoy:
             self._sync_frames = 0
             logging.info(f"Loaded state from slot {slot}: {os.path.basename(path)}")
             return True
-        except (OSError, struct.error, ValueError, IndexError) as e:
+        except OSError as e:
             logging.warning(f"Could not load state: {e}")
-            if len(self.mmu.memory) != 0x10000:
-                self.mmu.memory = bytearray(0x10000)
+            self._state_restore(snap)
+            self._last_state_error = 'io'
+            self._last_state_detail = str(e)[:60]
+            return False
+        except (struct.error, ValueError, IndexError) as e:
+            logging.warning(f"Could not load state: {e}")
+            self._state_restore(snap)
+            self._last_state_error = 'corrupt'
+            self._last_state_detail = str(e)[:60]
             return False
 
     def _pump_audio(self):
@@ -6060,28 +6159,28 @@ class GameBoy:
                     self._open_pause_menu()
                     return
                 elif event.key == pygame.K_F6:
-                    if self.save_state(0):
-                        self._status_msg = "State saved to slot 0"
-                    else:
-                        self._status_msg = "Failed to save state"
+                    ok = self.save_state(0)
+                    detail = getattr(self, '_last_state_detail', None)
+                    self._status_msg = self._format_state_message(
+                        'save', 0, None if ok else getattr(self, '_last_state_error', 'io'), detail)
                     self._status_ttl = 90
                 elif event.key == pygame.K_F7:
-                    if self.load_state(0):
-                        self._status_msg = "State loaded from slot 0"
-                    else:
-                        self._status_msg = "No save state in slot 0"
+                    ok = self.load_state(0)
+                    detail = getattr(self, '_last_state_detail', None)
+                    self._status_msg = self._format_state_message(
+                        'load', 0, None if ok else getattr(self, '_last_state_error', 'corrupt'), detail)
                     self._status_ttl = 90
                 elif event.key == pygame.K_F8:
-                    if self.save_state(1):
-                        self._status_msg = "State saved to slot 1"
-                    else:
-                        self._status_msg = "Failed to save state"
+                    ok = self.save_state(1)
+                    detail = getattr(self, '_last_state_detail', None)
+                    self._status_msg = self._format_state_message(
+                        'save', 1, None if ok else getattr(self, '_last_state_error', 'io'), detail)
                     self._status_ttl = 90
                 elif event.key == pygame.K_F9:
-                    if self.load_state(1):
-                        self._status_msg = "State loaded from slot 1"
-                    else:
-                        self._status_msg = "No save state in slot 1"
+                    ok = self.load_state(1)
+                    detail = getattr(self, '_last_state_detail', None)
+                    self._status_msg = self._format_state_message(
+                        'load', 1, None if ok else getattr(self, '_last_state_error', 'corrupt'), detail)
                     self._status_ttl = 90
                 elif event.key == pygame.K_F3:
                     self._show_fps = not self._show_fps
@@ -6306,7 +6405,12 @@ class GameBoy:
             pass
 
     # ── In-game pause menu ────────────────────────────────────────────
-    PAUSE_ITEMS = ["Resume", "Save State", "Load State", "Settings", "Exit to Menu"]
+    PAUSE_ITEMS = [
+        "Resume",
+        "Save to Slot 0", "Load from Slot 0",
+        "Save to Slot 1", "Load from Slot 1",
+        "Settings", "Exit to Menu",
+    ]
 
     def _open_pause_menu(self):
         """Enter the paused state; the main loop hands control to _pause_menu_loop."""
@@ -6389,7 +6493,7 @@ class GameBoy:
         elif cursor == 7:
             return False
         # Persist settings so they survive restart
-        _save_config(dict(
+        if not _save_config(dict(
             window_scale=WINDOW_SCALE_OPTIONS[si['scale']][1],
             fps_limit=FPS_LIMIT_OPTIONS[si['fps']][1],
             audio_enabled=AUDIO_OPTIONS[si['audio']][1],
@@ -6399,7 +6503,8 @@ class GameBoy:
             shader=si['shader'],
             wasd_enabled=self.wasd_enabled,
             key_bindings=self.key_bindings,
-        ))
+        )):
+            self._pause_status("Could not save settings")
         return resized
 
     def _capture_pause_backdrop(self):
@@ -6436,7 +6541,7 @@ class GameBoy:
             if self._pause_msg_ttl > 0:
                 self._pause_msg_ttl -= 1
             self._render_pause_page(page, backdrop)
-            clock.tick(30)
+            clock.tick(60)
 
         # Resume cleanly: re-sync held keys to the joypad and reset the A/V clock
         # so frame pacing doesn't try to "catch up" on the paused wall-clock time.
@@ -6524,19 +6629,22 @@ class GameBoy:
                         self.wasd_enabled = not self.wasd_enabled
                         self.key_bindings = _sanitize_key_bindings(self.key_bindings, self.wasd_enabled)
                         self.key_bindings = _rebuild_key_map(self.key_bindings, self.wasd_enabled)
-                        _save_config({
+                        if not _save_config({
                             'key_bindings': self.key_bindings,
                             'wasd_enabled': self.wasd_enabled,
-                        })
+                        }):
+                            self._pause_status("Could not save settings")
                     else:
                         self.wasd_enabled = True
                         self.key_bindings = _default_key_bindings(True)
                         self.key_bindings = _rebuild_key_map(self.key_bindings, True)
-                        _save_config({
+                        if not _save_config({
                             'key_bindings': self.key_bindings,
                             'wasd_enabled': True,
-                        })
-                        self._pause_status("Controls reset to default")
+                        }):
+                            self._pause_status("Could not save settings")
+                        else:
+                            self._pause_status("Controls reset to default")
                 elif action == pygame.K_ESCAPE or action == 'back':
                     self.controls_capture = None
                     page = "settings"
@@ -6558,15 +6666,21 @@ class GameBoy:
         choice = self.PAUSE_ITEMS[self.pause_cursor]
         if choice == "Resume":
             self.paused = False
-        elif choice == "Save State":
-            ok = self.save_state(0)
-            self._pause_status("State saved to slot 0" if ok else "Failed to save state")
-        elif choice == "Load State":
-            if self.load_state(0):
-                self._pause_status("State loaded from slot 0")
+        elif choice.startswith("Save to Slot "):
+            slot = int(choice.rsplit(' ', 1)[-1])
+            ok = self.save_state(slot)
+            detail = getattr(self, '_last_state_detail', None)
+            self._pause_status(self._format_state_message(
+                'save', slot, None if ok else getattr(self, '_last_state_error', 'io'), detail))
+        elif choice.startswith("Load from Slot "):
+            slot = int(choice.rsplit(' ', 1)[-1])
+            if self.load_state(slot):
+                self._pause_status(self._format_state_message('load', slot, None))
                 backdrop = self._capture_pause_backdrop()
             else:
-                self._pause_status("No save state in slot 0")
+                detail = getattr(self, '_last_state_detail', None)
+                self._pause_status(self._format_state_message(
+                    'load', slot, getattr(self, '_last_state_error', 'corrupt'), detail))
         elif choice == "Settings":
             self.pause_settings_cursor = 0
             page = "settings"
@@ -6659,11 +6773,12 @@ class GameBoy:
             self._draw_overlay_menu(
                 backdrop, "Exit to Menu?",
                 ["Keep Playing", "Exit to Menu"], self.pause_exit_cursor,
-                self._pause_hint("Tip: F6 saves progress first", "F6 saves first"))
+                self._pause_hint("Battery save writes on exit. F6/F8 = quick-save slots.",
+                                 "Battery save on exit"))
         else:
             status = self._pause_msg_ttl > 0 and self._pause_msg
             hint = status or self._pause_hint(
-                "Up/Down: Move   Enter: Select   Esc: Resume",
+                "Up/Down: Move   Enter: Select   Esc: Resume   F6-F9: Save/Load",
                 "Enter: Select   Esc: Resume")
             self._draw_overlay_menu(
                 backdrop, "Paused", self.PAUSE_ITEMS,

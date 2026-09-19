@@ -87,10 +87,12 @@ python gbc_emulator.py
 
 ```bash
 python gbc_emulator.py path/to/rom.gb
+python gbc_emulator.py path/to/rom.gbc --bootrom path/to/boot.bin
 ```
 
 `--nomenu` is still accepted and means the same thing. A missing ROM path
-prints an error instead of dropping into the menu.
+prints an error instead of dropping into the menu. `--bootrom` loads an
+optional DMG (256 B) or CGB (~2304 B) boot ROM before the cartridge starts.
 
 ### Chromebook (Crostini Linux)
 
@@ -289,10 +291,9 @@ python test_controls.py
 ```
 
 All four portable tests are self-contained (no display, no local ROMs) and exit
-non-zero on failure, so they work as CI checks.
-
-A fourth portable test covers Super Game Boy packets, MBC6/MBC7 mappers,
-cycle-accurate serial bit-clocking, and CGB double-speed cartridge wait-states:
+non-zero on failure, so they work as CI checks. The fourth test covers Super
+Game Boy packets, MBC6/MBC7 mappers, cycle-accurate serial bit-clocking, and
+CGB double-speed cartridge wait-states:
 
 ```bash
 python test_hw_features.py
