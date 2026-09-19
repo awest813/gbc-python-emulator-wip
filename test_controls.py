@@ -281,6 +281,10 @@ def test_turbo_and_reset(ns):
         check("soft reset clears HALT", gb.cpu.halted is False)
         check("soft reset clears IF", gb.mmu.memory[0xFF0F] == 0)
         check("soft reset clears IME", gb.cpu.interrupts_master_enabled is False)
+        gb.mmu.load_bootrom(bytes([0xBE] * 256))
+        check("boot ROM is mapped before reset", gb.mmu.bootrom_enabled is True)
+        gb.soft_reset()
+        check("soft reset unmaps boot ROM", gb.mmu.bootrom_enabled is False)
     finally:
         os.unlink(path)
 

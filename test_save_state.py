@@ -27,6 +27,8 @@ MMU, CPU, PPU, APU, Timers = (_ns["MMU"], _ns["CPU"], _ns["PPU"], _ns["APU"], _n
 GameBoy = _ns["GameBoy"]
 PALETTE_DMG = _ns["PALETTE_DMG"]
 _shader_none = _ns["_shader_none"]
+_JOY_SRC_KB = _ns["_JOY_SRC_KB"]
+_JOY_SRC_AXIS = _ns["_JOY_SRC_AXIS"]
 
 _failures = 0
 
@@ -195,25 +197,50 @@ def main():
         check("truncated load rolls back PPU mode", gb.ppu.mode == ppu_mode_before)
         check("truncated load reports corrupt file", gb._last_state_error == 'corrupt')
 
-        # v5 saves record APU timing, gdma stall, and ROM basename identity.
+        # v6 saves record APU timing, gdma stall, joypad sources, and ROM identity.
         apu_snap = (gb.apu.fs_div, gb.apu._fs_remain, gb.apu.frame_seq_step)
         gb.mmu.gdma_stall = 500
         gb.speed_remainder = 1
-        check("save_state v5 succeeds", gb.save_state(0) is True)
+        gb.mmu.set_joypad_button(1, True, _JOY_SRC_KB)   # Left
+        gb.mmu.set_joypad_button(2, True, _JOY_SRC_AXIS)  # Up
+        joy_src_snap = list(gb.mmu._joy_src)
+        check("save_state v6 succeeds", gb.save_state(0) is True)
         gb.apu.fs_div = 0
         gb.apu._fs_remain = 0
         gb.apu.frame_seq_step = 0
         gb.mmu.gdma_stall = 0
         gb.speed_remainder = 0
+        gb.mmu.release_all_joypad()
         check("load_state restores APU timing", gb.load_state(0) is True)
         check("APU fs_div restored", gb.apu.fs_div == apu_snap[0])
         check("APU fs_remain restored", gb.apu._fs_remain == apu_snap[1])
         check("APU frame_seq restored", gb.apu.frame_seq_step == apu_snap[2])
         check("GDMA stall restored", gb.mmu.gdma_stall == 500)
         check("speed remainder restored", gb.speed_remainder == 1)
+        check("joypad sources restored", gb.mmu._joy_src == joy_src_snap)
+        check("Left still held after load", (gb.mmu.joypad_buttons & 0x02) == 0)
+        check("Up still held after load", (gb.mmu.joypad_buttons & 0x04) == 0)
         check("scanline sprite cache cleared", gb.ppu._scanline_sprites is None)
 
-        # v5 saves record the ROM basename; loading a mismatched snapshot fails.
+        # bootrom_enabled round-trips separately from the 64KB memory blob.
+        gb.mmu.bootrom = bytearray([0xBE] * 256)
+        gb.mmu.bootrom_enabled = False
+        check("bootrom flag save succeeds", gb.save_state(0) is True)
+        gb.mmu.bootrom_enabled = True
+        check("bootrom flag load succeeds", gb.load_state(0) is True)
+        check("bootrom disabled after load", gb.mmu.bootrom_enabled is False)
+
+        # Mid-transfer serial is cleared when no link partner is connected.
+        gb.mmu.serial_data = 0xAB
+        gb.mmu.serial_control = 0x81
+        gb.mmu.serial_bits_left = 7
+        check("mid-serial save succeeds", gb.save_state(0) is True)
+        gb.mmu.serial_bits_left = 0
+        check("mid-serial load succeeds", gb.load_state(0) is True)
+        check("mid-serial shift cleared on load", gb.mmu.serial_bits_left == 0)
+        check("serial SC cleared on load", (gb.mmu.serial_control & 0x80) == 0)
+
+        # v6 saves record the ROM basename; loading a mismatched snapshot fails.
         other_path = os.path.join(tmp, "other.gbc")
         shutil.copy(rom_path, other_path)
         shutil.copy(gb._state_path(0), os.path.splitext(other_path)[0] + ".ss0")
@@ -233,7 +260,7 @@ def main():
         check("prefix length mismatch reports wrong_rom", gb._last_state_error == 'wrong_rom')
         gb.mmu.rom_path = rom_path
 
-        # v3 saves without a ROM id block still load on v5 builds.
+        # v3 saves without a ROM id block still load on v6 builds.
         legacy = gb._state_path(1)
         raw = open(gb._state_path(0), "rb").read()
         with open(legacy, "wb") as f:

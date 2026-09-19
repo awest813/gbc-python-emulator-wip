@@ -5503,11 +5503,12 @@ class GameBoy:
 
     # ── Save state support ─────────────────────────────────────────
     SAVE_STATE_MAGIC = b'GBST'
-    SAVE_STATE_VERSION = 5
+    SAVE_STATE_VERSION = 6
     SAVE_STATE_VERSION_MIN = 1
     _STATE_ROM_ID_BYTES = 32
     _STATE_TIMING_MAGIC = 0xA5
-    _STATE_TIMING_TAIL = 3  # gdma_stall u16 + speed_remainder u8
+    _STATE_TIMING_TAIL_V5 = 3   # gdma_stall u16 + speed_remainder u8
+    _STATE_EXTRA_TAIL_V6 = 16   # v5 timing + bootrom + joypad + MBC7 EEPROM shift
     _STATE_CPU_FMT = '<BBBB BB BB HHHH'
 
     @classmethod
@@ -5570,6 +5571,12 @@ class GameBoy:
                 'eeprom_state': mmu.eeprom_state, 'eeprom_do': mmu.eeprom_do,
                 'eeprom_write_en': mmu.eeprom_write_en, 'eeprom_addr': mmu.eeprom_addr,
                 'gdma_stall': mmu.gdma_stall,
+                'bootrom_enabled': mmu.bootrom_enabled,
+                '_dpad_last': list(mmu._dpad_last),
+                'eeprom_cs': mmu.eeprom_cs,
+                'eeprom_clk': mmu.eeprom_clk,
+                'eeprom_bits': mmu.eeprom_bits,
+                'eeprom_shift': mmu.eeprom_shift,
             },
             'ppu': {
                 '_scanline_sprites': ppu._scanline_sprites,
@@ -5705,6 +5712,12 @@ class GameBoy:
         mmu.eeprom_write_en = m['eeprom_write_en']
         mmu.eeprom_addr = m['eeprom_addr']
         mmu.gdma_stall = m.get('gdma_stall', 0)
+        mmu.bootrom_enabled = m.get('bootrom_enabled', False)
+        mmu._dpad_last = list(m.get('_dpad_last', [0, 2]))
+        mmu.eeprom_cs = m.get('eeprom_cs', False)
+        mmu.eeprom_clk = m.get('eeprom_clk', False)
+        mmu.eeprom_bits = m.get('eeprom_bits', 0)
+        mmu.eeprom_shift = m.get('eeprom_shift', 0)
         p = sub['ppu']
         ppu.mode = p['mode']
         ppu.scanline_dot = p['scanline_dot']
@@ -5793,11 +5806,25 @@ class GameBoy:
         self._has_rtc = sub['has_rtc']
         self.speed_remainder = sub.get('speed_remainder', 0)
 
+    def _sanitize_serial_after_load(self):
+        """Drop in-flight serial shifts that cannot resume without a live link partner."""
+        mmu = self.mmu
+        if mmu.serial_bits_left <= 0 or (mmu.serial_control & 0x81) != 0x81:
+            return
+        lc = getattr(mmu, 'link_cable', None)
+        if lc is not None and lc.is_connected:
+            return
+        mmu.serial_bits_left = 0
+        mmu.serial_cycle_accum = 0
+        mmu.serial_control &= ~0x80
+        mmu.serial_incoming = 0xFF
+
     def _restore_post_load(self):
         """Clear stale caches and re-sync live input sources after load_state."""
         self.ppu._scanline_sprites = None
-        self.mmu.release_all_joypad()
+        self._sanitize_serial_after_load()
         if pygame and getattr(self, 'screen', None) is not None:
+            self.mmu.release_all_joypad()
             self._sync_held_inputs()
 
     def _state_backup(self):
@@ -6040,7 +6067,17 @@ class GameBoy:
                                      mmu.eeprom_state & 0xFF, mmu.eeprom_do & 1,
                                      1 if mmu.eeprom_write_en else 0, mmu.eeprom_addr & 0x7F))
             parts.append(struct.pack(
-                '<HB', mmu.gdma_stall & 0xFFFF, getattr(self, 'speed_remainder', 0) & 0xFF))
+                '<HBBBBBBBBBBBBH',
+                mmu.gdma_stall & 0xFFFF,
+                getattr(self, 'speed_remainder', 0) & 0xFF,
+                1 if mmu.bootrom_enabled else 0,
+                mmu._joy_src[0], mmu._joy_src[1], mmu._joy_src[2],
+                mmu._joy_src[3], mmu._joy_src[4],
+                mmu._dpad_last[0], mmu._dpad_last[1],
+                1 if mmu.eeprom_cs else 0,
+                1 if mmu.eeprom_clk else 0,
+                mmu.eeprom_bits & 0xFF,
+                mmu.eeprom_shift & 0xFFFF))
             with open(path, 'wb') as f:
                 for p in parts:
                     f.write(p)
@@ -6146,8 +6183,7 @@ class GameBoy:
             mmu.has_rtc = bool(has_rtc)
             self._has_rtc = mmu.has_rtc
             mmu.is_cgb = bool(is_cgb)
-            mmu.joypad_buttons = joypad
-            mmu._joy_src = [joypad, 0xFF, 0xFF, 0xFF, 0xFF]
+            saved_joypad = joypad
             mmu.serial_data = serial_data
             mmu.serial_control = serial_control
             mmu.vram_bank_select = vram_bank_select & 1
@@ -6394,15 +6430,38 @@ class GameBoy:
                 mmu.eeprom_addr = eaddr
                 if mmu.mbc_type == 0x20:
                     mmu._remap_rom_bank()
-            if ver >= 5:
-                _need(self._STATE_TIMING_TAIL, "timing")
-                gdma_stall, speed_rem = struct.unpack_from('<HB', data, pos)
-                pos += self._STATE_TIMING_TAIL
+            if ver >= 6:
+                _need(self._STATE_EXTRA_TAIL_V6, "extra")
+                (gdma_stall, speed_rem, bootrom_on,
+                 js0, js1, js2, js3, js4, dp0, dp1,
+                 e_cs, e_clk, e_bits, e_shift) = struct.unpack_from(
+                    '<HBBBBBBBBBBBBH', data, pos)
+                pos += self._STATE_EXTRA_TAIL_V6
                 mmu.gdma_stall = gdma_stall
                 self.speed_remainder = speed_rem & 1
+                mmu.bootrom_enabled = bool(bootrom_on)
+                mmu._joy_src = [js0, js1, js2, js3, js4]
+                mmu._dpad_last = [dp0, dp1]
+                mmu.eeprom_cs = bool(e_cs)
+                mmu.eeprom_clk = bool(e_clk)
+                mmu.eeprom_bits = e_bits
+                mmu.eeprom_shift = e_shift
+                mmu._recompute_joypad()
+            elif ver >= 5:
+                _need(self._STATE_TIMING_TAIL_V5, "timing")
+                gdma_stall, speed_rem = struct.unpack_from('<HB', data, pos)
+                pos += self._STATE_TIMING_TAIL_V5
+                mmu.gdma_stall = gdma_stall
+                self.speed_remainder = speed_rem & 1
+                mmu._joy_src = [saved_joypad, 0xFF, 0xFF, 0xFF, 0xFF]
+                mmu._dpad_last = [0, 2]
+                mmu._recompute_joypad()
             else:
                 mmu.gdma_stall = 0
                 self.speed_remainder = 0
+                mmu._joy_src = [saved_joypad, 0xFF, 0xFF, 0xFF, 0xFF]
+                mmu._dpad_last = [0, 2]
+                mmu._recompute_joypad()
             self._restore_post_load()
             apu.drain()
             if hasattr(self, '_audio_pending'):
@@ -6793,6 +6852,7 @@ class GameBoy:
             cpu.reg.e = 0xD8
             cpu.reg.h = 0x01
             cpu.reg.l = 0x4D
+        self.mmu.bootrom_enabled = False
         self._apply_post_boot_io()
         ppu = self.ppu
         ppu.scanline_dot = 0

@@ -47,7 +47,7 @@ Super Game Boy palettes, and full CGB compatibility.
   write-protection rules (STAT read-only bits 0-2 / 6, unused bits
   forced to 1). Boot ROM support (DMG 256B / CGB ~2304B).
 - **Save states** — Snapshot full emulator state (including cartridge SRAM)
-  to `<rom>.ss<slot>` with F6 / F8 (save) and F7 / F9 (load). v5 saves
+  to `<rom>.ss<slot>` with F6 / F8 (save) and F7 / F9 (load). v6 saves
   record the ROM basename and refuse to load into a different game.
 - **Menu system** — ROM browser, window-scale selector, keyboard controls,
   project logo.
@@ -343,10 +343,13 @@ interpreter on modest hardware.
   partner times out instead of freezing the emulator. The HUD shows
   **LINK** while the socket is connected.
 - Save states (slots 0 and 1) include cartridge SRAM, MBC6 flash, SGB
-  palettes, and in-flight serial state. v5 saves store the ROM basename
-  (with length guard), APU frame-sequencer timing, GDMA stall, and
-  double-speed remainder; v4 saves still load; v1–v3 load without a ROM
-  identity check. Failed loads roll back live CPU/MMU/PPU/APU state.
+  palettes, and in-flight serial state. v6 saves store the ROM basename
+  (with length guard), APU frame-sequencer timing, GDMA stall,
+  double-speed remainder, boot-ROM map flag, per-source joypad state, and
+  MBC7 EEPROM shift progress; v4/v5 saves still load; v1–v3 load without
+  a ROM identity check. Failed loads roll back live CPU/MMU/PPU/APU state.
+  In-flight serial shifts are cleared on load unless a link partner is
+  connected.
   Battery-backed `.sav` files are
   written on exit. MBC3 RTC is stored after SRAM in VBA-M's 44-byte
   format so day/night continues while the emulator is closed. Older
