@@ -7828,7 +7828,6 @@ class GameBoy:
         self.controls_capture = None
         self._fast_forward = False
         self._ff_audio_muted = False
-        self._ff_audio_muted = False
 
     def _pause_status(self, msg):
         self._pause_msg = msg
