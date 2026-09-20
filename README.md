@@ -25,6 +25,10 @@ Super Game Boy palettes, and full CGB compatibility.
   frame sequencer for length / envelope / sweep, master volume and
   per-channel stereo panning, streamed to the host at 44.1 kHz.  Full
   CGB audio behaviour (wave RAM access rules, frame-sequencer reset).
+  Envelope period 0 holds volume, NRx4 extra-clocks length, DMG CH3
+  retrigger corrupts wave RAM, and subtract-then-add sweep disables
+  channel 1. Fast-forward mutes the host mixer; PCM is coalesced to
+  avoid frame-sized Sound gaps.
 - **Serial port** — FF01/FF02 with cycle-accurate bit-clocking (512 T-cycles
   per bit, or 16 in CGB fast mode), serial interrupt after 8 bits, and a
   TCP link cable for local two-player multiplayer.
@@ -257,7 +261,11 @@ Performance-critical helpers:
 - Direct WRAM (`C000–DFFF`) and HRAM/IE (`FF80–FFFF`) memory accessors skip
   the I/O decode chain on the hottest CPU read/write path.
 - Silent APU frames emit a single bulk zero-fill instead of mixing 700+
-  empty samples per video frame.
+  empty samples per video frame. Active channels interleave timer clocks
+  with 44.1 kHz emission so halt-skip steps do not freeze the waveform.
+- Host audio stages PCM, coalesces two video frames per mixer Sound, and
+  only drops backlog after eight frames. Tab fast-forward drains the APU
+  without flooding SDL.
 - Halted CPUs skip ahead to the next PPU mode or TIMA event instead of
   burning 4 T-cycles per `step_all` call (~17k times per frame).
 - APU frame-sequencer countdown and reused OAM scans (~10% higher synthetic

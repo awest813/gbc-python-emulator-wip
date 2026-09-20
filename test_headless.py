@@ -661,6 +661,125 @@ def test_apu_power_and_div(ns):
     check("DIV reset clears the APU DIV shadow", gb.apu.fs_div == 0)
 
 
+def test_apu_envelope_length_sweep(ns):
+    """Envelope period 0, NRx4 extra length clock, sweep negate, DMG CH3 corrupt."""
+    MMU, APU = ns["MMU"], ns["APU"]
+    CYCLES_PER_FRAME = ns["CYCLES_PER_FRAME"]
+    APU_BYTES_PER_STEREO_SAMPLE = ns["APU_BYTES_PER_STEREO_SAMPLE"]
+
+    m = MMU()
+    apu = APU(m, is_cgb=False)
+    apu.write_register(0xFF12, 0xF0)  # vol 15, decrease, period 0
+    apu.write_register(0xFF14, 0x80)
+    check("trigger loads period-0 envelope at max volume", apu.ch1_volume == 15)
+    for _ in range(16):
+        apu._clock_envelope()
+    check("envelope period 0 holds volume", apu.ch1_volume == 15)
+
+    apu.write_register(0xFF12, 0xF1)  # period 1
+    apu.write_register(0xFF14, 0x80)
+    apu.ch1_env_timer = 1
+    apu._clock_envelope()
+    check("envelope period 1 decays", apu.ch1_volume == 14)
+
+    apu.frame_seq_step = 7  # next tick clocks length
+    apu.ch1_length = 10
+    apu.ch1_length_enabled = False
+    apu.ch1_enabled = True
+    apu.ch1_dac = True
+    apu.write_register(0xFF14, 0x40)
+    check("extra length clock when enabling before a length step", apu.ch1_length == 9)
+
+    apu.frame_seq_step = 0  # next tick does not clock length
+    apu.ch1_length = 10
+    apu.ch1_length_enabled = False
+    apu.write_register(0xFF14, 0x40)
+    check("no extra length clock on a non-length step", apu.ch1_length == 10)
+
+    apu.frame_seq_step = 7
+    apu.ch1_length = 1
+    apu.ch1_length_enabled = False
+    apu.ch1_enabled = True
+    apu.write_register(0xFF14, 0x40)
+    check("extra clock to zero disables the channel", apu.ch1_enabled is False)
+    check("length is exhausted after extra clock", apu.ch1_length == 0)
+
+    apu.write_register(0xFF12, 0xF0)
+    apu.write_register(0xFF10, 0x1B)  # period 1, negate, shift 3
+    apu.write_register(0xFF13, 0xFF)
+    apu.write_register(0xFF14, 0x87)  # trigger, freq = 0x7FF
+    check("trigger with negate sweep marks negate used", apu.ch1_sweep_negate_used)
+    check("channel stays on after negate overflow check", apu.ch1_enabled)
+    apu.write_register(0xFF10, 0x11)  # switch to add mode
+    check("clearing sweep negate after use disables CH1", apu.ch1_enabled is False)
+
+    for i in range(16):
+        apu.wave_ram[i] = 0x10 + i
+    apu.ch3_dac = True
+    apu.ch3_enabled = True
+    apu.ch3_wave_pos = 4  # byte 2
+    apu._trigger_ch3()
+    check("DMG CH3 retrigger copies current byte to wave[0]", apu.wave_ram[0] == 0x12)
+
+    for i in range(16):
+        apu.wave_ram[i] = i
+    apu.ch3_enabled = True
+    apu.ch3_wave_pos = 20  # byte 10, 4-byte block starts at 8
+    apu._trigger_ch3()
+    check("DMG CH3 second-half retrigger copies 4-byte block",
+          list(apu.wave_ram[0:4]) == [8, 9, 10, 11])
+
+    m2 = MMU()
+    apu2 = APU(m2, is_cgb=True)
+    for i in range(16):
+        apu2.wave_ram[i] = 0x10 + i
+    apu2.ch3_dac = True
+    apu2.ch3_enabled = True
+    apu2.ch3_wave_pos = 4
+    apu2._trigger_ch3()
+    check("CGB CH3 retrigger leaves wave RAM intact", apu2.wave_ram[0] == 0x10)
+
+    apu.write_register(0xFF12, 0xF0)
+    apu.write_register(0xFF11, 0x80)  # 50% duty
+    apu.write_register(0xFF13, 0x00)
+    apu.write_register(0xFF14, 0x80)  # freq 0 → 8192-cycle duty step
+    apu.buffer.clear()
+    apu.sample_accum = 0
+    apu.step(CYCLES_PER_FRAME)
+    levels = set()
+    buf = apu.buffer
+    for i in range(0, len(buf), APU_BYTES_PER_STEREO_SAMPLE):
+        levels.add(int.from_bytes(buf[i:i + 2], "little", signed=True))
+    check("bulk step interleaves duty changes across samples", len(levels) > 1)
+
+
+def test_host_audio_queue(ns):
+    """Host mixer stages PCM, reports sample counts when silent, and trims backlog."""
+    _trim_pcm_bytes = ns["_trim_pcm_bytes"]
+    GameBoy = ns["GameBoy"]
+    frame = b"\x01\x00\x02\x00"
+    buf = bytearray(frame * 10)
+    dropped = _trim_pcm_bytes(buf, 12)
+    check("trim drops oldest complete stereo frames", dropped == 28)
+    check("trim keeps the newest bytes", bytes(buf) == frame * 3)
+    check("trim is a no-op when already within cap", _trim_pcm_bytes(buf, 12) == 0)
+
+    gb = GameBoy(rom_path=None, audio_enabled=False)
+    gb.apu.buffer.extend(b"\x00\x01\x00\x00" * 5)
+    n = gb._flush_audio()
+    check("flush reports drained samples when mixer is off", n == 5)
+    check("disabled mixer does not stage host PCM", len(gb._audio_pcm) == 0)
+
+    gb._audio_pcm.extend(frame * 4)
+    gb._fast_forward = True
+    gb._ff_audio_muted = False
+    gb._drop_host_audio()
+    gb.apu.buffer.extend(b"\x7F\x00\x7F\x00" * 3)
+    leftover = gb.apu.drain()
+    check("fast-forward drop clears staged PCM", len(gb._audio_pcm) == 0)
+    check("fast-forward still drains the APU buffer", leftover == b"\x7F\x00\x7F\x00" * 3)
+
+
 def test_double_speed_apu_sync(ns):
     """CGB STOP must resync the APU frame-sequencer countdown."""
     MMU, CPU, APU = ns["MMU"], ns["CPU"], ns["APU"]
@@ -746,6 +865,8 @@ def main():
     print("gameboy frame audio:");     test_gameboy_frame_audio(ns)
     print("oam dma sprite load:");     test_oam_dma(ns)
     print("apu power and DIV:");       test_apu_power_and_div(ns)
+    print("apu envelope/length/sweep:"); test_apu_envelope_length_sweep(ns)
+    print("host audio queue:");        test_host_audio_queue(ns)
     print("double-speed timing:");     test_double_speed(ns)
     print("double-speed apu sync:");   test_double_speed_apu_sync(ns)
     print("cached oam sprite height:"); test_cached_oam_sprite_height(ns)
