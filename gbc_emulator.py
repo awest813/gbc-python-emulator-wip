@@ -103,6 +103,9 @@ WAVE_RAM_SIZE       = 16
 INT16_MAX = 32767
 INT16_MIN = -32768
 AUDIO_SCALE_FACTOR = 70
+AUDIO_MIXER_SAMPLES = 1024          # SDL fragment size (~23 ms at 44.1 kHz)
+AUDIO_HOST_MAX_FRAMES = 8           # drop PCM only after this many video frames
+AUDIO_HOST_SUBMIT_FRAMES = 2        # coalesce two frames per Sound when queued
 
 def _sign_extend_byte(b):
     """Sign-extend an 8-bit value to a signed Python int (range -128..127)."""
@@ -3889,6 +3892,7 @@ class APU:
         self.ch1_sweep_timer = 0
         self.ch1_sweep_enabled = False
         self.ch1_sweep_shadow = 0
+        self.ch1_sweep_negate_used = False
 
         # Channel 2: square (no sweep)
         self.ch2_enabled = False
@@ -3991,8 +3995,15 @@ class APU:
 
         # Channel 1
         if addr == 0xFF10:  # NR10: sweep
+            new_dir = (value >> 3) & 0x01
+            # After a subtract-sweep calculation, switching back to add mode
+            # disables the channel until the next trigger.
+            if self.ch1_sweep_negate_used and not new_dir:
+                self.ch1_enabled = False
+                self.ch1_sweep_enabled = False
+                self._refresh_nr52()
             self.ch1_sweep_period = (value >> 4) & 0x07
-            self.ch1_sweep_direction = (value >> 3) & 0x01
+            self.ch1_sweep_direction = new_dir
             self.ch1_sweep_shift = value & 0x07
             mem[addr] = value | _APU_READ_OR[addr]
         elif addr == 0xFF11:  # NR11: duty / length
@@ -4013,8 +4024,12 @@ class APU:
             mem[addr] = value | _APU_READ_OR[addr]
         elif addr == 0xFF14:  # NR14: trigger / length-en / freq hi
             self.ch1_freq = (self.ch1_freq & 0xFF) | ((value & 0x07) << 8)
+            was_len = self.ch1_length_enabled
             self.ch1_length_enabled = bool(value & 0x40)
-            if value & 0x80:
+            trig = bool(value & 0x80)
+            self.ch1_length = self._clock_length_on_enable(
+                was_len, self.ch1_length_enabled, self.ch1_length, 'ch1_enabled', trig)
+            if trig:
                 self._trigger_ch1()
             mem[addr] = value | _APU_READ_OR[addr]
 
@@ -4037,8 +4052,12 @@ class APU:
             mem[addr] = value | _APU_READ_OR[addr]
         elif addr == 0xFF19:  # NR24
             self.ch2_freq = (self.ch2_freq & 0xFF) | ((value & 0x07) << 8)
+            was_len = self.ch2_length_enabled
             self.ch2_length_enabled = bool(value & 0x40)
-            if value & 0x80:
+            trig = bool(value & 0x80)
+            self.ch2_length = self._clock_length_on_enable(
+                was_len, self.ch2_length_enabled, self.ch2_length, 'ch2_enabled', trig)
+            if trig:
                 self._trigger_ch2()
             mem[addr] = value | _APU_READ_OR[addr]
 
@@ -4060,8 +4079,12 @@ class APU:
             mem[addr] = value | _APU_READ_OR[addr]
         elif addr == 0xFF1E:  # NR34
             self.ch3_freq = (self.ch3_freq & 0xFF) | ((value & 0x07) << 8)
+            was_len = self.ch3_length_enabled
             self.ch3_length_enabled = bool(value & 0x40)
-            if value & 0x80:
+            trig = bool(value & 0x80)
+            self.ch3_length = self._clock_length_on_enable(
+                was_len, self.ch3_length_enabled, self.ch3_length, 'ch3_enabled', trig)
+            if trig:
                 self._trigger_ch3()
             mem[addr] = value | _APU_READ_OR[addr]
 
@@ -4084,8 +4107,12 @@ class APU:
             self.ch4_divisor_code = value & 0x07
             mem[addr] = value
         elif addr == 0xFF23:  # NR44
+            was_len = self.ch4_length_enabled
             self.ch4_length_enabled = bool(value & 0x40)
-            if value & 0x80:
+            trig = bool(value & 0x80)
+            self.ch4_length = self._clock_length_on_enable(
+                was_len, self.ch4_length_enabled, self.ch4_length, 'ch4_enabled', trig)
+            if trig:
                 self._trigger_ch4()
             mem[addr] = value | _APU_READ_OR[addr]
 
@@ -4163,6 +4190,7 @@ class APU:
         self.ch1_sweep_enabled = False
         self.ch1_sweep_shadow = 0
         self.ch1_sweep_timer = 0
+        self.ch1_sweep_negate_used = False
         self.ch3_vol_shift = 4
         self.ch3_wave_pos = 0
         self.ch4_lfsr = 0x7FFF
@@ -4199,6 +4227,15 @@ class APU:
         """Return True if the next frame-sequencer tick will clock length counters."""
         return (self.frame_seq_step + 1) & 7 in (0, 2, 4, 6)
 
+    def _clock_length_on_enable(self, was_enabled, now_enabled, length, enabled_attr, triggering):
+        """Extra length clock when enabling length just before a length-tick step."""
+        if now_enabled and not was_enabled and length > 0 and self._next_fs_clocks_length():
+            length -= 1
+            if length == 0 and not triggering:
+                setattr(self, enabled_attr, False)
+                self._refresh_nr52()
+        return length
+
     def _trigger_ch1(self):
         if self.ch1_dac:
             self.ch1_enabled = True
@@ -4212,6 +4249,7 @@ class APU:
         self.ch1_sweep_shadow = self.ch1_freq
         self.ch1_sweep_timer = self.ch1_sweep_period if self.ch1_sweep_period else 8
         self.ch1_sweep_enabled = (self.ch1_sweep_period != 0) or (self.ch1_sweep_shift != 0)
+        self.ch1_sweep_negate_used = False
         if self.ch1_sweep_shift != 0:
             self._ch1_sweep_calc(apply_result=False)
         self._refresh_nr52()
@@ -4228,7 +4266,21 @@ class APU:
         self.ch2_env_timer = self.ch2_env_period if self.ch2_env_period else 8
         self._refresh_nr52()
 
+    def _corrupt_wave_ram_dmg(self):
+        """Retriggering CH3 on DMG overwrites the start of wave RAM."""
+        byte_pos = self.ch3_wave_pos >> 1
+        if byte_pos < 8:
+            self.wave_ram[0] = self.wave_ram[byte_pos]
+        else:
+            start = byte_pos & ~0x03
+            self.wave_ram[0:4] = self.wave_ram[start:start + 4]
+        mem = self.mmu.memory
+        for i, b in enumerate(self.wave_ram):
+            mem[0xFF30 + i] = b
+
     def _trigger_ch3(self):
+        if not self.is_cgb and self.ch3_enabled:
+            self._corrupt_wave_ram_dmg()
         if self.ch3_dac:
             self.ch3_enabled = True
         if self.ch3_length == 0:
@@ -4253,7 +4305,11 @@ class APU:
     def _ch1_sweep_calc(self, apply_result):
         shift = self.ch1_sweep_shift
         delta = self.ch1_sweep_shadow >> shift
-        new_freq = self.ch1_sweep_shadow - delta if self.ch1_sweep_direction else self.ch1_sweep_shadow + delta
+        if self.ch1_sweep_direction:
+            self.ch1_sweep_negate_used = True
+            new_freq = self.ch1_sweep_shadow - delta
+        else:
+            new_freq = self.ch1_sweep_shadow + delta
         if new_freq > MAX_FREQUENCY - 1:
             self.ch1_enabled = False
             self.ch1_sweep_enabled = False
@@ -4317,34 +4373,27 @@ class APU:
         if self.ch1_sweep_period != 0:
             self._ch1_sweep_calc(apply_result=True)
 
+    @staticmethod
+    def _envelope_tick(volume, direction, period, timer):
+        """Advance one channel envelope. Period 0 disables volume updates."""
+        if period == 0:
+            return volume, timer
+        timer -= 1
+        if timer <= 0:
+            timer = period
+            if direction and volume < 15:
+                volume += 1
+            elif not direction and volume > 0:
+                volume -= 1
+        return volume, timer
+
     def _clock_envelope(self):
-        period = self.ch1_env_period or 8
-        self.ch1_env_timer -= 1
-        if self.ch1_env_timer <= 0:
-            self.ch1_env_timer = period
-            v = self.ch1_volume
-            if self.ch1_env_direction and v < 15:
-                self.ch1_volume = v + 1
-            elif not self.ch1_env_direction and v > 0:
-                self.ch1_volume = v - 1
-        period = self.ch2_env_period or 8
-        self.ch2_env_timer -= 1
-        if self.ch2_env_timer <= 0:
-            self.ch2_env_timer = period
-            v = self.ch2_volume
-            if self.ch2_env_direction and v < 15:
-                self.ch2_volume = v + 1
-            elif not self.ch2_env_direction and v > 0:
-                self.ch2_volume = v - 1
-        period = self.ch4_env_period or 8
-        self.ch4_env_timer -= 1
-        if self.ch4_env_timer <= 0:
-            self.ch4_env_timer = period
-            v = self.ch4_volume
-            if self.ch4_env_direction and v < 15:
-                self.ch4_volume = v + 1
-            elif not self.ch4_env_direction and v > 0:
-                self.ch4_volume = v - 1
+        self.ch1_volume, self.ch1_env_timer = self._envelope_tick(
+            self.ch1_volume, self.ch1_env_direction, self.ch1_env_period, self.ch1_env_timer)
+        self.ch2_volume, self.ch2_env_timer = self._envelope_tick(
+            self.ch2_volume, self.ch2_env_direction, self.ch2_env_period, self.ch2_env_timer)
+        self.ch4_volume, self.ch4_env_timer = self._envelope_tick(
+            self.ch4_volume, self.ch4_env_direction, self.ch4_env_period, self.ch4_env_timer)
 
     # ── Per-step channel timers ─────────────────────────────────────
 
@@ -4445,11 +4494,7 @@ class APU:
         elif right < INT16_MIN: right = INT16_MIN
         lv = left & 0xFFFF
         rv = right & 0xFFFF
-        buf = self.buffer
-        buf.append(lv & 0xFF)
-        buf.append(lv >> 8)
-        buf.append(rv & 0xFF)
-        buf.append(rv >> 8)
+        self.buffer.extend((lv & 0xFF, lv >> 8, rv & 0xFF, rv >> 8))
 
     # ── Main step ───────────────────────────────────────────────────
 
@@ -4477,20 +4522,37 @@ class APU:
             return
 
         active = self.ch1_enabled or self.ch2_enabled or self.ch3_enabled or self.ch4_enabled
-        if active:
-            self._step_channels(cycles)
-
-        # Sample emission
-        self.sample_accum += cycles * sd
-        if active:
-            while self.sample_accum >= sn:
-                self.sample_accum -= sn
-                self._mix_sample()
-        else:
+        if not active:
+            self.sample_accum += cycles * sd
             n = self.sample_accum // sn
             if n:
                 self.sample_accum -= n * sn
                 self.buffer.extend(b'\x00\x00\x00\x00' * n)
+            return
+
+        # Interleave channel clocks with sample emission so halt-skip / bulk
+        # steps do not freeze the waveform across many 44.1 kHz samples.
+        remaining = cycles
+        need = sn - self.sample_accum
+        until = (need + sd - 1) // sd
+        if until < 1:
+            until = 1
+        if remaining < until:
+            self._step_channels(remaining)
+            self.sample_accum += remaining * sd
+            return
+        while remaining > 0:
+            need = sn - self.sample_accum
+            until = (need + sd - 1) // sd
+            if until < 1:
+                until = 1
+            chunk = remaining if remaining < until else until
+            self._step_channels(chunk)
+            self.sample_accum += chunk * sd
+            remaining -= chunk
+            if self.sample_accum >= sn:
+                self.sample_accum -= sn
+                self._mix_sample()
 
     def drain(self):
         """Returns and clears the accumulated PCM bytes (signed-16 stereo LE)."""
@@ -4519,6 +4581,26 @@ APU_MIN_SAMPLES_PER_FRAME = (CYCLES_PER_FRAME * APU.SAMPLE_RATE) // APU.CPU_CLOC
 APU_MAX_SAMPLES_PER_FRAME = APU_MIN_SAMPLES_PER_FRAME + (
     1 if (CYCLES_PER_FRAME * APU.SAMPLE_RATE) % APU.CPU_CLOCK else 0
 )
+AUDIO_HOST_MAX_BYTES = APU_MAX_SAMPLES_PER_FRAME * APU_BYTES_PER_STEREO_SAMPLE * AUDIO_HOST_MAX_FRAMES
+AUDIO_HOST_SUBMIT_BYTES = APU_MAX_SAMPLES_PER_FRAME * APU_BYTES_PER_STEREO_SAMPLE * AUDIO_HOST_SUBMIT_FRAMES
+
+
+def _trim_pcm_bytes(buf, max_bytes):
+    """Drop the oldest complete stereo frames so ``buf`` stays within max_bytes.
+
+    Returns the number of bytes removed.
+    """
+    n = len(buf)
+    if max_bytes < APU_BYTES_PER_STEREO_SAMPLE:
+        del buf[:]
+        return n
+    max_bytes &= ~3
+    extra = n - max_bytes
+    if extra < APU_BYTES_PER_STEREO_SAMPLE:
+        return 0
+    extra &= ~3
+    del buf[:extra]
+    return extra
 
 
 # ── Menu system ──────────────────────────────────────────────────────
@@ -4718,12 +4800,12 @@ class EmulatorMenu:
             print("  Install it with:  pip install pygame numpy")
             print("=" * 55)
             sys.exit(1)
-        pygame.mixer.pre_init(44100, -16, 2, 1024)
+        pygame.mixer.pre_init(44100, -16, 2, AUDIO_MIXER_SAMPLES)
         try:
             pygame.init()
         except pygame.error:
             os.environ["SDL_AUDIODRIVER"] = "dummy"
-            pygame.mixer.pre_init(44100, -16, 2, 1024)
+            pygame.mixer.pre_init(44100, -16, 2, AUDIO_MIXER_SAMPLES)
             pygame.init()
             logging.warning("Audio init failed — running silent (dummy audio driver).")
         _init_joysticks()
@@ -5475,22 +5557,25 @@ class GameBoy:
         self.audio_channel = None
         self._audio_refs = []
         self._audio_pending = deque(maxlen=16)
+        self._audio_pcm = bytearray()
+        self._ff_audio_muted = False
         if not pygame or not self._audio_on:
             return
         desired = (self.apu.SAMPLE_RATE, -16, 2)
         init_state = pygame.mixer.get_init()
         try:
             if init_state is None:
-                pygame.mixer.init(desired[0], desired[1], desired[2], 1024)
+                pygame.mixer.init(desired[0], desired[1], desired[2], AUDIO_MIXER_SAMPLES)
             elif init_state[:3] != desired:
                 pygame.mixer.quit()
-                pygame.mixer.init(desired[0], desired[1], desired[2], 1024)
+                pygame.mixer.init(desired[0], desired[1], desired[2], AUDIO_MIXER_SAMPLES)
         except pygame.error as e:
             logging.warning(f"Audio init failed, running silent: {e}")
             return
         try:
             self.audio_channel = pygame.mixer.Channel(0)
             self.audio_enabled = True
+            self._set_volume(getattr(self, '_volume', 1.0))
         except pygame.error as e:
             logging.warning(f"Audio channel unavailable, running silent: {e}")
 
@@ -5673,6 +5758,7 @@ class GameBoy:
                 'ch1_sweep_shift': apu.ch1_sweep_shift, 'ch1_sweep_timer': apu.ch1_sweep_timer,
                 'ch1_sweep_shadow': apu.ch1_sweep_shadow,
                 'ch1_sweep_enabled': apu.ch1_sweep_enabled,
+                'ch1_sweep_negate_used': getattr(apu, 'ch1_sweep_negate_used', False),
                 'ch2_enabled': apu.ch2_enabled, 'ch2_dac': apu.ch2_dac,
                 'ch2_freq': apu.ch2_freq, 'ch2_freq_timer': apu.ch2_freq_timer,
                 'ch2_duty': apu.ch2_duty, 'ch2_duty_step': apu.ch2_duty_step,
@@ -5839,6 +5925,7 @@ class GameBoy:
         apu.ch1_sweep_timer = a['ch1_sweep_timer']
         apu.ch1_sweep_shadow = a['ch1_sweep_shadow']
         apu.ch1_sweep_enabled = a['ch1_sweep_enabled']
+        apu.ch1_sweep_negate_used = a.get('ch1_sweep_negate_used', False)
         apu.ch2_enabled = a['ch2_enabled']
         apu.ch2_dac = a['ch2_dac']
         apu.ch2_freq = a['ch2_freq']
@@ -6110,7 +6197,7 @@ class GameBoy:
                 apu.ch1_freq & 0xFF, (apu.ch1_freq >> 8) & 0x0F,
                 apu.ch1_freq_timer & 0xFF, (apu.ch1_freq_timer >> 8) & 0xFF,
                 apu.ch1_duty & 0x03, apu.ch1_duty_step & 0x07,
-                1 if apu.ch1_length_enabled else 0, apu.ch1_length & 0x3F,
+                1 if apu.ch1_length_enabled else 0, apu.ch1_length & 0x7F,
                 apu.ch1_volume & 0x0F, apu.ch1_env_initial & 0x0F,
                 apu.ch1_env_direction & 0x01, apu.ch1_env_period & 0x07,
                 apu.ch1_env_timer & 0x07, apu.ch1_sweep_period & 0x07,
@@ -6119,18 +6206,19 @@ class GameBoy:
                 apu.ch2_freq & 0xFF, (apu.ch2_freq >> 8) & 0x0F,
                 apu.ch2_freq_timer & 0xFF, (apu.ch2_freq_timer >> 8) & 0xFF,
                 apu.ch2_duty & 0x03, apu.ch2_duty_step & 0x07,
-                1 if apu.ch2_length_enabled else 0, apu.ch2_length & 0x3F,
+                1 if apu.ch2_length_enabled else 0, apu.ch2_length & 0x7F,
                 apu.ch2_volume & 0x0F, apu.ch2_env_period & 0x07,
                 # Channel 3 (10 bytes)
                 1 if apu.ch3_enabled else 0, 1 if apu.ch3_dac else 0,
-                apu.ch3_freq & 0xFF, (apu.ch3_freq >> 8) & 0x0F,
+                apu.ch3_freq & 0xFF,
+                (apu.ch3_freq >> 8) & 0x07 | ((apu.ch3_length >> 8) & 1) << 3,
                 apu.ch3_freq_timer & 0xFF, (apu.ch3_freq_timer >> 8) & 0xFF,
                 1 if apu.ch3_length_enabled else 0, apu.ch3_length & 0xFF,
-                apu.ch3_vol_shift & 0x03, apu.ch3_wave_pos & 0x1F,
+                apu.ch3_vol_shift & 0x07, apu.ch3_wave_pos & 0x1F,
                 # Channel 4 (12 bytes)
                 1 if apu.ch4_enabled else 0, 1 if apu.ch4_dac else 0,
                 apu.ch4_freq_timer & 0xFF, (apu.ch4_freq_timer >> 8) & 0xFF,
-                1 if apu.ch4_length_enabled else 0, apu.ch4_length & 0x3F,
+                1 if apu.ch4_length_enabled else 0, apu.ch4_length & 0x7F,
                 apu.ch4_volume & 0x0F, apu.ch4_env_period & 0x07,
                 apu.ch4_lfsr & 0xFF, (apu.ch4_lfsr >> 8) & 0x7F,
                 apu.ch4_shift & 0x0F, apu.ch4_width_mode & 0x01,
@@ -6139,7 +6227,7 @@ class GameBoy:
                 apu.ch1_sweep_timer & 0x07, apu.ch1_sweep_shadow & 0xFF,
                 (apu.ch1_sweep_shadow >> 8) & 0x0F,
                 1 if apu.ch1_sweep_enabled else 0,
-                apu.ch1_env_timer & 0x07,
+                (apu.ch1_env_timer & 0x07) | (0x80 if apu.ch1_sweep_negate_used else 0),
                 apu.ch2_env_initial & 0x0F, apu.ch2_env_direction & 0x01,
                 apu.ch2_env_timer & 0x07,
                 apu.ch4_env_initial & 0x0F, apu.ch4_env_direction & 0x01,
@@ -6432,7 +6520,7 @@ class GameBoy:
             apu.ch1_freq = ap[ai] | ((ap[ai+1] & 0x07) << 8); ai += 2
             apu.ch1_freq_timer = ap[ai] | (ap[ai+1] << 8); ai += 2
             apu.ch1_duty = ap[ai] & 0x03; apu.ch1_duty_step = ap[ai+1] & 0x07; ai += 2
-            apu.ch1_length_enabled = bool(ap[ai]); apu.ch1_length = ap[ai+1] & 0x3F; ai += 2
+            apu.ch1_length_enabled = bool(ap[ai]); apu.ch1_length = ap[ai+1] & 0x7F; ai += 2
             apu.ch1_volume = ap[ai] & 0x0F; apu.ch1_env_initial = ap[ai+1] & 0x0F; ai += 2
             apu.ch1_env_direction = ap[ai] & 0x01
             apu.ch1_env_period = ap[ai+1] & 0x07
@@ -6443,19 +6531,20 @@ class GameBoy:
             apu.ch2_freq = ap[ai] | ((ap[ai+1] & 0x07) << 8); ai += 2
             apu.ch2_freq_timer = ap[ai] | (ap[ai+1] << 8); ai += 2
             apu.ch2_duty = ap[ai] & 0x03; apu.ch2_duty_step = ap[ai+1] & 0x07; ai += 2
-            apu.ch2_length_enabled = bool(ap[ai]); apu.ch2_length = ap[ai+1] & 0x3F; ai += 2
+            apu.ch2_length_enabled = bool(ap[ai]); apu.ch2_length = ap[ai+1] & 0x7F; ai += 2
             apu.ch2_volume = ap[ai] & 0x0F
             apu.ch2_env_period = ap[ai+1] & 0x07; ai += 2
             # Channel 3
             apu.ch3_enabled = bool(ap[ai]); apu.ch3_dac = bool(ap[ai+1]); ai += 2
-            apu.ch3_freq = ap[ai] | ((ap[ai+1] & 0x07) << 8); ai += 2
+            apu.ch3_freq = ap[ai] | ((ap[ai+1] & 0x07) << 8)
+            ch3_len_hi = (ap[ai+1] >> 3) & 1; ai += 2
             apu.ch3_freq_timer = ap[ai] | (ap[ai+1] << 8); ai += 2
-            apu.ch3_length_enabled = bool(ap[ai]); apu.ch3_length = ap[ai+1] & 0xFF; ai += 2
-            apu.ch3_vol_shift = ap[ai] & 0x03; apu.ch3_wave_pos = ap[ai+1] & 0x1F; ai += 2
+            apu.ch3_length_enabled = bool(ap[ai]); apu.ch3_length = (ap[ai+1] & 0xFF) | (ch3_len_hi << 8); ai += 2
+            apu.ch3_vol_shift = ap[ai] & 0x07; apu.ch3_wave_pos = ap[ai+1] & 0x1F; ai += 2
             # Channel 4
             apu.ch4_enabled = bool(ap[ai]); apu.ch4_dac = bool(ap[ai+1]); ai += 2
             apu.ch4_freq_timer = ap[ai] | (ap[ai+1] << 8); ai += 2
-            apu.ch4_length_enabled = bool(ap[ai]); apu.ch4_length = ap[ai+1] & 0x3F; ai += 2
+            apu.ch4_length_enabled = bool(ap[ai]); apu.ch4_length = ap[ai+1] & 0x7F; ai += 2
             apu.ch4_volume = ap[ai] & 0x0F
             apu.ch4_env_period = ap[ai+1] & 0x07; ai += 2
             apu.ch4_lfsr = ap[ai] | ((ap[ai+1] & 0x7F) << 8); ai += 2
@@ -6467,7 +6556,8 @@ class GameBoy:
             apu.ch1_sweep_timer = ap[ai+2] & 0x07
             apu.ch1_sweep_shadow = ap[ai+3] | ((ap[ai+4] & 0x0F) << 8)
             apu.ch1_sweep_enabled = bool(ap[ai+5])
-            apu.ch1_env_timer = ap[ai+6] & 0x07; ai += 7
+            apu.ch1_env_timer = ap[ai+6] & 0x07
+            apu.ch1_sweep_negate_used = bool(ap[ai+6] & 0x80); ai += 7
             apu.ch2_env_initial = ap[ai] & 0x0F
             apu.ch2_env_direction = ap[ai+1] & 0x01
             apu.ch2_env_timer = ap[ai+2] & 0x07; ai += 3
@@ -6606,11 +6696,8 @@ class GameBoy:
                 mmu._recompute_joypad()
             self._restore_post_load(ver)
             apu.drain()
-            if hasattr(self, '_audio_pending'):
-                self._audio_pending.clear()
-            self._av_start = time.perf_counter()
-            self._sync_samples = 0
-            self._sync_frames = 0
+            self._drop_host_audio()
+            self._reset_av_clock()
             logging.info(f"Loaded state from slot {slot}: {os.path.basename(path)}")
             return True
         except OSError as e:
@@ -6628,22 +6715,77 @@ class GameBoy:
             self._last_state_detail = str(e)[:60]
             return False
 
+    def _reset_av_clock(self):
+        """Restart frame pacing so a pause / load / fast-forward exit does not lurch."""
+        self._av_start = time.perf_counter()
+        self._sync_samples = 0
+        self._sync_frames = 0
+
+    def _drop_host_audio(self):
+        """Stop the mixer and discard queued host PCM without touching the APU."""
+        if getattr(self, 'audio_channel', None) is not None:
+            try:
+                self.audio_channel.stop()
+            except pygame.error:
+                pass
+        pending = getattr(self, '_audio_pending', None)
+        if pending is not None:
+            pending.clear()
+        pcm = getattr(self, '_audio_pcm', None)
+        if pcm is not None:
+            del pcm[:]
+        refs = getattr(self, '_audio_refs', None)
+        if refs is not None:
+            refs.clear()
+
+    def _take_host_pcm_chunk(self, max_bytes):
+        """Pop up to ``max_bytes`` of complete stereo frames from the staging buffer."""
+        pcm = self._audio_pcm
+        n = len(pcm)
+        if n < APU_BYTES_PER_STEREO_SAMPLE:
+            return None
+        if max_bytes < APU_BYTES_PER_STEREO_SAMPLE:
+            max_bytes = APU_BYTES_PER_STEREO_SAMPLE
+        n = min(n, max_bytes)
+        n &= ~3
+        chunk = bytes(pcm[:n])
+        del pcm[:n]
+        return chunk
+
     def _pump_audio(self):
-        """Feed the mixer from the pending-audio deque (channel + one queue slot).
-        Drops stale queued buffers when the queue backs up to avoid drift."""
+        """Feed the mixer from staged PCM (channel + one queue slot).
+
+        Coalesces two video frames into each Sound when the mixer is already
+        busy, and only drops PCM after AUDIO_HOST_MAX_FRAMES of backlog.
+        """
         if not self.audio_enabled:
             return
         ch = self.audio_channel
-        # If the queue is backing up, drop the oldest buffers to stay in sync.
-        while len(self._audio_pending) > 4:
-            self._audio_pending.popleft()
-        while self._audio_pending:
+        pcm = self._audio_pcm
+        _trim_pcm_bytes(pcm, AUDIO_HOST_MAX_BYTES)
+        while len(pcm) >= APU_BYTES_PER_STEREO_SAMPLE:
             if not ch.get_busy():
-                ch.play(self._audio_pending.popleft())
+                chunk = self._take_host_pcm_chunk(AUDIO_HOST_SUBMIT_BYTES)
             elif ch.get_queue() is None:
-                ch.queue(self._audio_pending.popleft())
-                break
+                chunk = self._take_host_pcm_chunk(AUDIO_HOST_SUBMIT_BYTES)
             else:
+                break
+            if not chunk:
+                break
+            try:
+                sound = pygame.mixer.Sound(buffer=chunk)
+            except (pygame.error, TypeError):
+                break
+            self._audio_refs.append(sound)
+            if len(self._audio_refs) > 8:
+                self._audio_refs = self._audio_refs[-4:]
+            try:
+                if not ch.get_busy():
+                    ch.play(sound)
+                else:
+                    ch.queue(sound)
+                    break
+            except pygame.error:
                 break
 
     def _flush_audio(self):
@@ -6652,20 +6794,12 @@ class GameBoy:
         n_samples = len(data) // APU_BYTES_PER_STEREO_SAMPLE
         if not self.audio_enabled:
             return n_samples
-        if len(data) < APU_BYTES_PER_STEREO_SAMPLE or len(data) & 3:
+        if n_samples == 0:
+            self._pump_audio()
             return 0
-        try:
-            sound = pygame.mixer.Sound(buffer=data)
-        except (pygame.error, TypeError):
-            return 0
-        self._audio_pending.append(sound)
-        self._audio_refs.append(sound)
-        if len(self._audio_refs) > 8:
-            self._audio_refs = self._audio_refs[-4:]
-        # Warn if the audio queue is backing up (emulator running faster than mixer)
-        if len(self._audio_pending) >= 12:
-            logging.debug("Audio queue nearly full (%d entries); mixer may be behind",
-                          len(self._audio_pending))
+        # Keep leftover bytes (should be none) out of the mixer.
+        aligned = n_samples * APU_BYTES_PER_STEREO_SAMPLE
+        self._audio_pcm.extend(data[:aligned])
         self._pump_audio()
         return n_samples
 
@@ -6804,7 +6938,17 @@ class GameBoy:
                 skip_blit = self._fast_forward and (self._frame_index & 3)
                 if not skip_blit:
                     self.render()
-                samples_this_frame = self._flush_audio()
+                if self._fast_forward:
+                    if not self._ff_audio_muted:
+                        self._drop_host_audio()
+                        self._ff_audio_muted = True
+                    self.apu.drain()
+                    samples_this_frame = 0
+                else:
+                    if self._ff_audio_muted:
+                        self._ff_audio_muted = False
+                        self._reset_av_clock()
+                    samples_this_frame = self._flush_audio()
 
             if self.paused and pygame:
                 self._pause_menu_loop()
@@ -7006,12 +7150,10 @@ class GameBoy:
         self.timers.div_counter = 0
         self.timers.tima_accum = 0
         if hasattr(self, '_audio_pending'):
-            self._audio_pending.clear()
+            self._drop_host_audio()
         self.speed_remainder = 0
         self._cycle_carry = 0
-        self._av_start = time.perf_counter()
-        self._sync_samples = 0
-        self._sync_frames = 0
+        self._reset_av_clock()
         self._status_msg = "Reset"
         self._status_ttl = 90
 
@@ -7089,6 +7231,8 @@ class GameBoy:
         self.pause_controls_scroll = 0
         self.controls_capture = None
         self._fast_forward = False
+        self._ff_audio_muted = False
+        self._ff_audio_muted = False
 
     def _pause_status(self, msg):
         self._pause_msg = msg
@@ -7135,11 +7279,7 @@ class GameBoy:
                 self._init_audio()
                 self._set_volume(VOLUME_OPTIONS[si['volume']][1])
             else:
-                if self.audio_channel is not None:
-                    try:
-                        self.audio_channel.stop()
-                    except pygame.error:
-                        pass
+                self._drop_host_audio()
                 self.audio_enabled = False
         elif cursor == 3:
             n = len(VOLUME_OPTIONS)
@@ -7190,12 +7330,7 @@ class GameBoy:
         audio, shows the overlay menu, and returns once the player resumes or exits."""
         # Release every joypad button so the game doesn't see a stuck input.
         self.mmu.release_all_joypad()
-        if self.audio_channel is not None:
-            try:
-                self.audio_channel.stop()
-            except pygame.error:
-                pass
-        self._audio_pending.clear()
+        self._drop_host_audio()
         self.apu.drain()
         pygame.event.clear()
 
@@ -7216,9 +7351,7 @@ class GameBoy:
         if self.running:
             self._sync_held_inputs()
         pygame.event.clear()
-        self._av_start = time.perf_counter()
-        self._sync_samples = 0
-        self._sync_frames = 0
+        self._reset_av_clock()
 
     def _pause_quick_state(self, action, slot, backdrop):
         if action == 'save':

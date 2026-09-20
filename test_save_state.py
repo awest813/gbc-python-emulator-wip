@@ -268,6 +268,21 @@ def main():
         check("Up still held after load", (gb.mmu.joypad_buttons & 0x04) == 0)
         check("scanline sprite cache cleared", gb.ppu._scanline_sprites is None)
 
+        gb.apu.ch1_length = 64
+        gb.apu.ch3_length = 256
+        gb.apu.ch3_vol_shift = 4
+        gb.apu.ch1_sweep_negate_used = True
+        check("APU length/vol save succeeds", gb.save_state(0) is True)
+        gb.apu.ch1_length = 1
+        gb.apu.ch3_length = 1
+        gb.apu.ch3_vol_shift = 0
+        gb.apu.ch1_sweep_negate_used = False
+        check("APU length/vol load succeeds", gb.load_state(0) is True)
+        check("CH1 length 64 round-trips", gb.apu.ch1_length == 64)
+        check("CH3 length 256 round-trips", gb.apu.ch3_length == 256)
+        check("CH3 mute shift round-trips", gb.apu.ch3_vol_shift == 4)
+        check("sweep negate-used flag round-trips", gb.apu.ch1_sweep_negate_used is True)
+
         # bootrom_enabled round-trips separately from the 64KB memory blob.
         gb.mmu.bootrom = bytearray([0xBE] * 256)
         gb.mmu.bootrom_enabled = False
