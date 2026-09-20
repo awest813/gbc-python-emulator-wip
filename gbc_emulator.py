@@ -311,16 +311,28 @@ FLAG_C = 4  # Carry flag
 # Joypad bit order matches P1 (FF00): Right, Left, Up, Down, A, B, Select, Start
 JOYPAD_BUTTON_KEYS = ('right', 'left', 'up', 'down', 'a', 'b', 'select', 'start')
 CONTROLS_WASD_ROW = len(JOYPAD_BUTTON_KEYS)
-CONTROLS_TURBO_ROW = CONTROLS_WASD_ROW + 1
-CONTROLS_RESET_ROW = CONTROLS_WASD_ROW + 2
+CONTROLS_TURBO_A_ROW = CONTROLS_WASD_ROW + 1
+CONTROLS_TURBO_B_ROW = CONTROLS_WASD_ROW + 2
+CONTROLS_RESET_ROW = CONTROLS_WASD_ROW + 3
+CONTROLS_GAMEPAD_ROW = CONTROLS_WASD_ROW + 4
+CONTROLS_SKIP_ROWS = frozenset({CONTROLS_GAMEPAD_ROW})
+# Back-compat alias used by older tests / comments: first turbo row.
+CONTROLS_TURBO_ROW = CONTROLS_TURBO_A_ROW
+SETTINGS_ROW_IDS = (
+    'scale', 'display', 'fps', 'audio', 'volume', 'palette', 'filter', 'shader', 'controls',
+)
+DISPLAY_OPTIONS = [("Window", False), ("Fullscreen", True)]
 
 
 def _advance_controls_cursor(cursor, delta, n_items):
-    """Move the controls-menu cursor, skipping the informational turbo row."""
-    nxt = (cursor + delta) % n_items
-    if nxt == CONTROLS_TURBO_ROW:
-        nxt = (nxt + delta) % n_items
-    return nxt
+    """Move the controls-menu cursor, skipping informational rows."""
+    n = max(int(n_items), 1)
+    nxt = int(cursor)
+    for _ in range(n):
+        nxt = (nxt + delta) % n
+        if nxt not in CONTROLS_SKIP_ROWS:
+            return nxt
+    return int(cursor) % n
 JOYPAD_BUTTON_LABELS = ('Right', 'Left', 'Up', 'Down', 'A', 'B', 'Select', 'Start')
 DEFAULT_KEY_BINDINGS = {
     'right':  ['right', 'd'],
@@ -332,6 +344,12 @@ DEFAULT_KEY_BINDINGS = {
     'select': ['right shift'],
     'start':  ['return'],
 }
+DEFAULT_TURBO_BINDINGS = {
+    'turbo_a': ['q', ','],
+    'turbo_b': ['e', '.'],
+}
+TURBO_BUTTON_KEYS = ('turbo_a', 'turbo_b')
+TURBO_BUTTON_LABELS = ('Turbo A', 'Turbo B')
 WASD_ALIASES = (('d', 'right'), ('a', 'left'), ('w', 'up'), ('s', 'down'))
 
 # pygame key -> joypad bit; rebuilt from config / the Controls page.
@@ -356,9 +374,10 @@ _JOY_SRC_AXIS = 2
 _JOY_SRC_BTN = 3
 _JOY_SRC_TURBO = 4
 _RESERVED_REMAP_KEY_NAMES = frozenset({
-    'escape', 'tab', 'f2', 'f3', 'f4', 'f5', 'f6', 'f7', 'f8', 'f9',
+    'escape', 'tab', 'f2', 'f3', 'f4', 'f5', 'f6', 'f7', 'f8', 'f9', 'f11',
 })
-_RESERVED_KEY_MSG = "That key is reserved (Esc, Tab, F2-F9)"
+_RESERVED_KEY_MSG = "That key is reserved (Esc, Tab, F2-F9, F11)"
+KEY_TO_TURBO_BIT = {}
 
 def _init_joysticks():
     """Initialise all connected joysticks. Safe to call multiple times."""
@@ -400,7 +419,11 @@ def _joystick_dpad_from_axis(event):
     return []
 
 def _gamepad_menu_action(event):
-    """Map a joystick event to a menu keystroke string: 'up','down','left','right','select','back', or None."""
+    """Map a joystick event to a menu keystroke string.
+
+    Analog stick motion is handled separately by `_StickNav` so a held stick
+    cannot flood the menu with one event per SDL axis sample.
+    """
     if event.type == pygame.JOYBUTTONDOWN:
         if event.button == 0:  return 'select'
         if event.button == 1:  return 'back'
@@ -412,14 +435,214 @@ def _gamepad_menu_action(event):
         if y == -1: return 'down'
         if x == -1: return 'left'
         if x == 1:  return 'right'
-    if event.type == pygame.JOYAXISMOTION:
-        T = _GAMEPAD_AXIS_THRESHOLD
-        if event.axis in (1, 7):
-            if event.value < -T: return 'up'
-            if event.value > T:  return 'down'
-        if event.axis in (0, 6):
-            if event.value < -T: return 'left'
-            if event.value > T:  return 'right'
+    return None
+
+
+class _StickNav:
+    """Edge-detect + repeat analog-stick menu navigation (one action per tick)."""
+    __slots__ = ('x', 'y', 'x_due', 'y_due', 'delay', 'repeat')
+
+    def __init__(self, delay=280, repeat=70):
+        self.x = 0
+        self.y = 0
+        self.x_due = 0
+        self.y_due = 0
+        self.delay = delay
+        self.repeat = repeat
+
+    def reset(self):
+        self.x = self.y = 0
+        self.x_due = self.y_due = 0
+
+    def update(self, x_dir, y_dir, now):
+        """Return one of 'up'/'down'/'left'/'right', or None.
+
+        ``x_dir`` / ``y_dir`` are -1, 0, or 1. Newly pressed directions fire
+        immediately; held directions repeat after ``delay`` then ``repeat``.
+        """
+        edges = []
+        repeats = []
+        if y_dir != self.y:
+            self.y = y_dir
+            self.y_due = now + self.delay
+            if y_dir:
+                edges.append('up' if y_dir < 0 else 'down')
+        elif y_dir and now >= self.y_due:
+            self.y_due = now + self.repeat
+            repeats.append('up' if y_dir < 0 else 'down')
+        if x_dir != self.x:
+            self.x = x_dir
+            self.x_due = now + self.delay
+            if x_dir:
+                edges.append('left' if x_dir < 0 else 'right')
+        elif x_dir and now >= self.x_due:
+            self.x_due = now + self.repeat
+            repeats.append('left' if x_dir < 0 else 'right')
+        if edges:
+            return edges[0]
+        if repeats:
+            return repeats[0]
+        return None
+
+
+def _read_analog_menu_dirs():
+    """Return (x_dir, y_dir) from left stick / analog D-pad axes, or (0, 0)."""
+    x_dir = y_dir = 0
+    if not pygame:
+        return 0, 0
+    try:
+        count = pygame.joystick.get_count()
+    except pygame.error:
+        return 0, 0
+    T = _GAMEPAD_AXIS_THRESHOLD
+    for i in range(count):
+        try:
+            js = pygame.joystick.Joystick(i)
+            naxes = js.get_numaxes()
+            for ax in (0, 6):
+                if ax < naxes:
+                    v = js.get_axis(ax)
+                    if v > T:
+                        x_dir = 1
+                    elif v < -T:
+                        x_dir = -1
+            for ax in (1, 7):
+                if ax < naxes:
+                    v = js.get_axis(ax)
+                    if v > T:
+                        y_dir = 1
+                    elif v < -T:
+                        y_dir = -1
+        except pygame.error:
+            continue
+    return x_dir, y_dir
+
+
+def _open_display(size, fullscreen=False):
+    """Open a windowed or desktop-fullscreen display surface."""
+    flags = pygame.FULLSCREEN if fullscreen else 0
+    if fullscreen:
+        try:
+            return pygame.display.set_mode((0, 0), flags)
+        except pygame.error:
+            return pygame.display.set_mode(size)
+    return pygame.display.set_mode(size)
+
+
+def _present_integer_scale(display, canvas, fill=(0, 0, 0)):
+    """Blit ``canvas`` onto ``display`` with integer scale, letterboxed.
+
+    Returns ``(scale, ox, oy, dest_w, dest_h)``.
+    """
+    dw, dh = display.get_size()
+    cw, ch = canvas.get_size()
+    if cw <= 0 or ch <= 0 or dw <= 0 or dh <= 0:
+        return 1, 0, 0, max(cw, 1), max(ch, 1)
+    scale = max(1, min(dw // cw, dh // ch))
+    w, h = cw * scale, ch * scale
+    ox, oy = (dw - w) // 2, (dh - h) // 2
+    if (dw, dh) != (w, h) or (ox, oy) != (0, 0):
+        display.fill(fill)
+    if scale == 1:
+        display.blit(canvas, (ox, oy))
+    else:
+        display.blit(pygame.transform.scale(canvas, (w, h)), (ox, oy))
+    return scale, ox, oy, w, h
+
+
+def _map_mouse_to_canvas(pos, scale, ox, oy, cw, ch):
+    """Map a display-space mouse position onto a letterboxed canvas, or None."""
+    if not pos or scale < 1:
+        return None
+    x = (pos[0] - ox) // scale
+    y = (pos[1] - oy) // scale
+    if x < 0 or y < 0 or x >= cw or y >= ch:
+        return None
+    return int(x), int(y)
+
+
+def _hit_list_index(hits, pos):
+    """Return the item index for a point in ``hits`` ``(x, y, w, h, index)`` rows."""
+    if pos is None:
+        return None
+    x, y = pos
+    for hx, hy, hw, hh, idx in hits:
+        if hx <= x < hx + hw and hy <= y < hy + hh:
+            return idx
+    return None
+
+
+def _move_list_cursor(cursor, n, action, page_size=10):
+    """Move a non-wrapping list cursor (ROM browser, etc.)."""
+    if n <= 0:
+        return 0
+    page = max(1, int(page_size))
+    if action == 'home':
+        return 0
+    if action == 'end':
+        return n - 1
+    if action == 'pageup':
+        return max(0, int(cursor) - page)
+    if action == 'pagedown':
+        return min(n - 1, int(cursor) + page)
+    if action == 'up':
+        return max(0, int(cursor) - 1)
+    if action == 'down':
+        return min(n - 1, int(cursor) + 1)
+    return max(0, min(int(cursor), n - 1))
+
+
+def _slot_status_suffix(path):
+    """Return ``empty`` or a local ``YYYY-MM-DD HH:MM`` timestamp for a save file."""
+    if not path or not os.path.isfile(path):
+        return "empty"
+    try:
+        ts = os.path.getmtime(path)
+    except OSError:
+        return "empty"
+    return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
+
+
+def _decorate_submenu_row(text, selected):
+    return f"> {text}" if selected else text
+
+
+def _connected_gamepad_label():
+    if not pygame:
+        return "Gamepad: none"
+    try:
+        n = pygame.joystick.get_count()
+    except pygame.error:
+        return "Gamepad: none"
+    names = []
+    for i in range(n):
+        try:
+            names.append(pygame.joystick.Joystick(i).get_name())
+        except pygame.error:
+            continue
+    if not names:
+        return "Gamepad: none"
+    label = names[0] if len(names) == 1 else f"{names[0]} +{len(names) - 1}"
+    return f"Gamepad: {label}"
+
+
+def _gamepad_hotplug_message(event):
+    """Human-readable toast for JOYDEVICEADDED / JOYDEVICEREMOVED, or None."""
+    if not pygame:
+        return None
+    added = getattr(pygame, 'JOYDEVICEADDED', None)
+    removed = getattr(pygame, 'JOYDEVICEREMOVED', None)
+    if added is not None and event.type == added:
+        name = None
+        idx = getattr(event, 'device_index', None)
+        if idx is not None:
+            try:
+                name = pygame.joystick.Joystick(idx).get_name()
+            except pygame.error:
+                name = None
+        return f"Gamepad connected{': ' + name if name else ''}"
+    if removed is not None and event.type == removed:
+        return "Gamepad disconnected"
     return None
 
 
@@ -438,6 +661,11 @@ _KEY_NAME_ALIASES = {
     'left': 'K_LEFT',
     'up': 'K_UP',
     'down': 'K_DOWN',
+    ',': 'K_COMMA',
+    'comma': 'K_COMMA',
+    '.': 'K_PERIOD',
+    'period': 'K_PERIOD',
+    'full stop': 'K_PERIOD',
 }
 
 
@@ -475,6 +703,11 @@ def _key_display_name(name):
         'left': 'Left',
         'up': 'Up',
         'down': 'Down',
+        ',': 'Comma',
+        'comma': 'Comma',
+        '.': 'Period',
+        'period': 'Period',
+        'full stop': 'Period',
     }
     if name in aliases:
         return aliases[name]
@@ -541,11 +774,37 @@ def _rebuild_key_map(bindings=None, wasd_enabled=True):
 
 
 def _binding_label(bindings, button):
-    names = bindings.get(button) or DEFAULT_KEY_BINDINGS[button]
+    names = bindings.get(button) or _default_fallbacks_for(button)
     return ', '.join(_key_display_name(n) for n in names)
 
 
-def _assign_binding_key(bindings, button, key_name):
+def _default_fallbacks_for(button):
+    if button in DEFAULT_TURBO_BINDINGS:
+        return DEFAULT_TURBO_BINDINGS[button]
+    return DEFAULT_KEY_BINDINGS.get(button, ['space'])
+
+
+def _steal_key_from_map(amap, key_name, except_button, old_primary=None):
+    """Remove ``key_name`` from another button in ``amap``, swapping primaries."""
+    owner = None
+    for other, names in amap.items():
+        if other == except_button:
+            continue
+        if key_name in names:
+            owner = other
+            break
+    if owner is None:
+        return
+    amap[owner] = [n for n in amap[owner] if n != key_name]
+    if old_primary and old_primary != key_name and old_primary not in amap[owner]:
+        amap[owner] = [old_primary] + amap[owner]
+    if not amap[owner]:
+        fallback = _default_fallbacks_for(owner)[0]
+        if fallback != key_name:
+            amap[owner] = [fallback]
+
+
+def _assign_binding_key(bindings, button, key_name, other_maps=None):
     """Set `button`'s primary key. If another button owns it, swap primaries."""
     key_name = _normalize_key_name(key_name)
     if not key_name or key_name in _RESERVED_REMAP_KEY_NAMES:
@@ -553,27 +812,57 @@ def _assign_binding_key(bindings, button, key_name):
     if pygame and _key_constant(key_name) is None:
         return False
     old_primary = (bindings.get(button) or [None])[0]
-    owner = None
-    for other, names in bindings.items():
-        if key_name in names:
-            owner = other
-            break
-    if owner is not None and owner != button:
-        bindings[owner] = [n for n in bindings[owner] if n != key_name]
-        if old_primary and old_primary != key_name:
-            bindings[owner] = [old_primary] + [n for n in bindings[owner] if n != old_primary]
-        if not bindings[owner]:
-            fallback = DEFAULT_KEY_BINDINGS[owner][0]
-            if fallback != key_name:
-                bindings[owner] = [fallback]
+    _steal_key_from_map(bindings, key_name, button, old_primary)
+    if other_maps:
+        for extra in other_maps:
+            _steal_key_from_map(extra, key_name, None, old_primary)
     rest = [n for n in bindings.get(button, []) if n != key_name]
     bindings[button] = [key_name] + rest
     return True
 
 
+def _sanitize_turbo_bindings(raw):
+    """Return a validated turbo_a/turbo_b -> [key-name] map."""
+    bindings = {k: list(v) for k, v in DEFAULT_TURBO_BINDINGS.items()}
+    if not isinstance(raw, dict):
+        return bindings
+    for button in TURBO_BUTTON_KEYS:
+        value = raw.get(button)
+        if not isinstance(value, (list, tuple)):
+            continue
+        names = []
+        for item in value:
+            name = _normalize_key_name(item)
+            if not name or name in _RESERVED_REMAP_KEY_NAMES or name in names:
+                continue
+            if pygame and _key_constant(name) is None:
+                continue
+            names.append(name)
+        if names:
+            bindings[button] = names
+    return bindings
+
+
+def _rebuild_turbo_map(bindings=None):
+    """Rebuild KEY_TO_TURBO_BIT (pygame key -> joypad A/B bit). Returns the map."""
+    global KEY_TO_TURBO_BIT
+    bindings = _sanitize_turbo_bindings(bindings)
+    mapping = {}
+    bit_for = {'turbo_a': 4, 'turbo_b': 5}
+    if pygame:
+        for button, bit in bit_for.items():
+            for name in bindings.get(button, ()):
+                key = _key_constant(name)
+                if key is not None and key not in mapping and key not in KEY_TO_JOYPAD_BIT:
+                    mapping[key] = bit
+    KEY_TO_TURBO_BIT = mapping
+    return bindings
+
+
 def _menu_nav_action(action):
     """Map WASD / gamepad strings onto the arrow-key constants used by menus."""
-    if action in ('up', 'down', 'left', 'right', 'select', 'back'):
+    if action in ('up', 'down', 'left', 'right', 'select', 'back',
+                  'home', 'end', 'pageup', 'pagedown', 'toggle_fullscreen'):
         return action
     if not pygame:
         return action
@@ -585,6 +874,16 @@ def _menu_nav_action(action):
         return pygame.K_LEFT
     if action in (pygame.K_RIGHT, pygame.K_d):
         return pygame.K_RIGHT
+    if action == pygame.K_HOME:
+        return 'home'
+    if action == pygame.K_END:
+        return 'end'
+    if action == pygame.K_PAGEUP:
+        return 'pageup'
+    if action == pygame.K_PAGEDOWN:
+        return 'pagedown'
+    if action == pygame.K_F11:
+        return 'toggle_fullscreen'
     return action
 
 
@@ -616,9 +915,17 @@ def _save_config(cfg):
         return False
 
 
+def _rebuild_input_maps(key_bindings=None, wasd_enabled=True, turbo_bindings=None):
+    """Rebuild joypad and turbo key maps together so they cannot overlap."""
+    keys = _rebuild_key_map(key_bindings, wasd_enabled)
+    turbo = _rebuild_turbo_map(turbo_bindings)
+    return keys, turbo
+
+
 # Apply persisted (or default) key bindings as soon as pygame is importable.
 _cfg0 = _load_config()
-_rebuild_key_map(_cfg0.get('key_bindings'), bool(_cfg0.get('wasd_enabled', True)))
+_rebuild_input_maps(_cfg0.get('key_bindings'), bool(_cfg0.get('wasd_enabled', True)),
+                    _cfg0.get('turbo_bindings'))
 del _cfg0
 
 
@@ -4678,7 +4985,6 @@ def _set_window_icon():
 class EmulatorMenu:
     def __init__(self, bootrom_path=None):
         self.selected = 0
-        self.main_items = ["Load ROM", "Settings", "Exit to OS"]
         self.roms = []
         self.rom_cursor = 0
         self.rom_scroll = 0
@@ -4696,10 +5002,16 @@ class EmulatorMenu:
         self.shader_idx = 0
         self.status_line = ""
         self.status_ttl = 0
+        self._menu_hits = []
+        self._stick_nav = _StickNav()
+        self._blit_scale = 1
+        self._blit_ox = 0
+        self._blit_oy = 0
         # Load persisted settings from config file
         cfg = _load_config()
         self.window_scale = _clamp_choice(cfg.get("window_scale", self.window_scale),
                                           _WINDOW_SCALES, 4)
+        self.fullscreen = bool(cfg.get("fullscreen", False))
         self.fps_limit_idx = _opt_index(FPS_LIMIT_OPTIONS, cfg.get("fps_limit", 59.73), 0)
         self.audio_idx = _opt_index(AUDIO_OPTIONS, cfg.get("audio_enabled", True), 0)
         self.volume_idx = _opt_index(VOLUME_OPTIONS, cfg.get("volume", 1.0), 4)
@@ -4707,7 +5019,10 @@ class EmulatorMenu:
         self.filter_idx = _opt_index(FILTER_OPTIONS, cfg.get("smooth_scale", False), 0)
         self.shader_idx = _clamp_index(cfg.get("shader", 0), len(SHADER_LIST), 0)
         self.wasd_enabled = bool(cfg.get("wasd_enabled", True))
-        self.key_bindings = _rebuild_key_map(cfg.get("key_bindings"), self.wasd_enabled)
+        last = cfg.get("last_rom")
+        self.last_rom = last if isinstance(last, str) and os.path.isfile(last) else None
+        self.key_bindings, self.turbo_bindings = _rebuild_input_maps(
+            cfg.get("key_bindings"), self.wasd_enabled, cfg.get("turbo_bindings"))
         self.controls_cursor = 0
         self.controls_scroll = 0
         self.controls_capture = None  # button key being remapped, or None
@@ -4727,12 +5042,64 @@ class EmulatorMenu:
             pygame.init()
             logging.warning("Audio init failed — running silent (dummy audio driver).")
         _init_joysticks()
-        self.key_bindings = _rebuild_key_map(self.key_bindings, self.wasd_enabled)
-        self.screen = pygame.display.set_mode((MENU_W, MENU_H))
+        self.key_bindings, self.turbo_bindings = _rebuild_input_maps(
+            self.key_bindings, self.wasd_enabled, self.turbo_bindings)
+        self.screen = pygame.Surface((MENU_W, MENU_H))
+        self._apply_display_mode()
         pygame.display.set_caption("Python GBC Emulator")
         self.logo = None
         self._load_logo()
         self._scan_roms()
+        self._select_last_rom()
+
+    def _main_items(self):
+        items = []
+        if self.last_rom and os.path.isfile(self.last_rom):
+            items.append("Continue")
+        items.extend(["Load ROM", "Settings", "Exit to OS"])
+        return items
+
+    def _apply_display_mode(self):
+        self._display = _open_display((MENU_W, MENU_H), self.fullscreen)
+        _set_window_icon()
+        self._stick_nav.reset()
+
+    def _toggle_fullscreen(self):
+        self.fullscreen = not self.fullscreen
+        self._apply_display_mode()
+        if not _save_config({'fullscreen': self.fullscreen}):
+            self._status("Could not save settings")
+        else:
+            self._status("Fullscreen" if self.fullscreen else "Windowed")
+
+    def _present(self):
+        self._blit_scale, self._blit_ox, self._blit_oy, _, _ = _present_integer_scale(
+            self._display, self.screen, MENU_BG)
+        pygame.display.flip()
+
+    def _canvas_mouse(self, pos=None):
+        if pos is None:
+            pos = pygame.mouse.get_pos()
+        return _map_mouse_to_canvas(
+            pos, self._blit_scale, self._blit_ox, self._blit_oy, MENU_W, MENU_H)
+
+    def _select_last_rom(self):
+        if not self.last_rom or not self.roms:
+            return
+        target = os.path.realpath(self.last_rom)
+        for i, path in enumerate(self.roms):
+            if os.path.realpath(path) == target:
+                self.rom_cursor = i
+                self.rom_scroll, _ = _sync_list_scroll(
+                    i, self.rom_scroll, self.max_visible, len(self.roms))
+                return
+
+    def _remember_rom(self, path):
+        try:
+            self.last_rom = os.path.realpath(path)
+        except OSError:
+            self.last_rom = path
+        _save_config({'last_rom': self.last_rom})
 
     def _scan_roms(self):
         self._rom_info_cache = {}
@@ -4789,6 +5156,7 @@ class EmulatorMenu:
     def _sync_settings_items(self):
         self.settings_items = [
             f"Window Scale: {self.window_scale}x",
+            f"Display: {DISPLAY_OPTIONS[1][0] if self.fullscreen else DISPLAY_OPTIONS[0][0]}",
             f"Frame Rate: {FPS_LIMIT_OPTIONS[self.fps_limit_idx][0]}",
             f"Audio: {AUDIO_OPTIONS[self.audio_idx][0]}",
             f"Volume: {VOLUME_OPTIONS[self.volume_idx][0]}",
@@ -4801,6 +5169,7 @@ class EmulatorMenu:
     def _persist_menu_settings(self):
         if not _save_config(dict(
             window_scale=self.window_scale,
+            fullscreen=self.fullscreen,
             fps_limit=FPS_LIMIT_OPTIONS[self.fps_limit_idx][1],
             audio_enabled=AUDIO_OPTIONS[self.audio_idx][1],
             volume=VOLUME_OPTIONS[self.volume_idx][1],
@@ -4809,14 +5178,18 @@ class EmulatorMenu:
             shader=self.shader_idx,
             wasd_enabled=self.wasd_enabled,
             key_bindings=self.key_bindings,
+            turbo_bindings=self.turbo_bindings,
+            last_rom=self.last_rom,
         )):
             self._status("Could not save settings")
 
     def _persist_controls(self):
-        self.key_bindings = _rebuild_key_map(self.key_bindings, self.wasd_enabled)
+        self.key_bindings, self.turbo_bindings = _rebuild_input_maps(
+            self.key_bindings, self.wasd_enabled, self.turbo_bindings)
         if not _save_config({
             'wasd_enabled': self.wasd_enabled,
             'key_bindings': self.key_bindings,
+            'turbo_bindings': self.turbo_bindings,
         }):
             self._status("Could not save settings")
 
@@ -4826,8 +5199,10 @@ class EmulatorMenu:
             for i, key in enumerate(JOYPAD_BUTTON_KEYS)
         ]
         items.append(f"WASD as D-Pad: {'On' if self.wasd_enabled else 'Off'}")
-        items.append("Turbo A/B: Q/E (not remappable)")
+        items.append(f"Turbo A: {_binding_label(self.turbo_bindings, 'turbo_a')}")
+        items.append(f"Turbo B: {_binding_label(self.turbo_bindings, 'turbo_b')}")
         items.append("Reset to Default")
+        items.append(_connected_gamepad_label())
         return items
 
     def _status(self, msg):
@@ -4857,6 +5232,7 @@ class EmulatorMenu:
     def _draw_menu(self, items, cursor, start_y, gap, size=28, scroll=0, max_visible=None):
         f = get_font(size)
         n = len(items)
+        self._menu_hits = []
         if max_visible is not None and n > max_visible:
             scroll, cap = _sync_list_scroll(cursor, scroll, max_visible, n)
             visible = items[scroll:scroll + cap]
@@ -4871,13 +5247,15 @@ class EmulatorMenu:
             max_w = max(max_w, f.size(item)[0])
         bar_w = min(MENU_W - 80, max(220, max_w + 72))
         bar_h = size + 10
+        bar_x = (MENU_W - bar_w) // 2
         if scroll > 0:
             self._centre_text("^ more", start_y - 16, MENU_DIM, 14)
         for i, item in enumerate(visible):
             y = start_y + i * gap
+            idx = scroll + i
+            self._menu_hits.append((bar_x, y - 4, bar_w, bar_h, idx))
             if i == display_cursor:
-                _blit_selection_bar(
-                    self.screen, (MENU_W - bar_w) // 2, y - 4, bar_w, bar_h)
+                _blit_selection_bar(self.screen, bar_x, y - 4, bar_w, bar_h)
             colour = MENU_HI if i == display_cursor else MENU_FG
             w = self._centre_text(item, y, colour, size, shadow=(i == display_cursor))
             if i == display_cursor:
@@ -4888,26 +5266,37 @@ class EmulatorMenu:
             self._centre_text("v more", start_y + cap * gap - 6, MENU_DIM, 14)
         return scroll
 
+    def _settings_id(self, cursor=None):
+        if cursor is None:
+            cursor = self.settings_cursor
+        if 0 <= cursor < len(SETTINGS_ROW_IDS):
+            return SETTINGS_ROW_IDS[cursor]
+        return None
+
     def _cycle_menu_setting(self, cursor, direction=1):
         """Cycle a main-menu setting forward (1) or backward (-1)."""
-        if cursor == 0:
+        sid = self._settings_id(cursor)
+        if sid == 'scale':
             scales = list(_WINDOW_SCALES)
             try:
                 idx = scales.index(self.window_scale)
             except ValueError:
                 idx = 2
             self.window_scale = scales[(idx + direction) % len(scales)]
-        elif cursor == 1:
+        elif sid == 'display':
+            self.fullscreen = not self.fullscreen
+            self._apply_display_mode()
+        elif sid == 'fps':
             self.fps_limit_idx = (self.fps_limit_idx + direction) % len(FPS_LIMIT_OPTIONS)
-        elif cursor == 2:
+        elif sid == 'audio':
             self.audio_idx = (self.audio_idx + direction) % len(AUDIO_OPTIONS)
-        elif cursor == 3:
+        elif sid == 'volume':
             self.volume_idx = (self.volume_idx + direction) % len(VOLUME_OPTIONS)
-        elif cursor == 4:
+        elif sid == 'palette':
             self.palette_idx = (self.palette_idx + direction) % len(PALETTE_LIST)
-        elif cursor == 5:
+        elif sid == 'filter':
             self.filter_idx = (self.filter_idx + direction) % len(FILTER_OPTIONS)
-        elif cursor == 6:
+        elif sid == 'shader':
             self.shader_idx = (self.shader_idx + direction) % len(SHADER_LIST)
         else:
             return
@@ -4933,7 +5322,7 @@ class EmulatorMenu:
                 self._render_controls()
             elif page == "confirm_exit":
                 self._render_confirm_exit()
-            pygame.display.flip()
+            self._present()
             clock.tick(60)
 
     def _load_logo(self):
@@ -4966,183 +5355,299 @@ class EmulatorMenu:
                 return
         self.logo = None
 
+    def _restore_after_game(self, gb=None):
+        if gb is not None:
+            si = gb._set_idx
+            self.window_scale = WINDOW_SCALE_OPTIONS[si['scale']][1]
+            self.fps_limit_idx = si['fps']
+            self.audio_idx = si['audio']
+            self.volume_idx = si['volume']
+            self.palette_idx = si['palette']
+            self.filter_idx = si['filter']
+            self.shader_idx = si['shader']
+            self.wasd_enabled = gb.wasd_enabled
+            self.fullscreen = getattr(gb, 'fullscreen', self.fullscreen)
+            self.key_bindings = gb.key_bindings
+            self.turbo_bindings = getattr(gb, 'turbo_bindings', self.turbo_bindings)
+            self.key_bindings, self.turbo_bindings = _rebuild_input_maps(
+                self.key_bindings, self.wasd_enabled, self.turbo_bindings)
+            self._sync_settings_items()
+        self.screen = pygame.Surface((MENU_W, MENU_H))
+        self._apply_display_mode()
+        pygame.display.set_caption("Python GBC Emulator")
+        pygame.event.clear()
+        pygame.key.set_repeat(200, 50)
+        _init_joysticks()
+        self._stick_nav.reset()
+
+    def _launch_rom(self, path):
+        if not path or not os.path.isfile(path):
+            self._status(f"ROM not found: {os.path.basename(path or '')}")
+            return "main"
+        self._remember_rom(path)
+        self._status(f"Loading: {os.path.basename(path)}")
+        self._present()
+        gb = None
+        try:
+            gb = GameBoy(
+                path,
+                window_scale=self.window_scale,
+                fps_limit=FPS_LIMIT_OPTIONS[self.fps_limit_idx][1],
+                audio_enabled=AUDIO_OPTIONS[self.audio_idx][1],
+                volume=VOLUME_OPTIONS[self.volume_idx][1],
+                palette=PALETTE_LIST[self.palette_idx][1],
+                smooth_scale=FILTER_OPTIONS[self.filter_idx][1],
+                shader=SHADER_LIST[self.shader_idx][1],
+                bootrom_path=self.bootrom_path,
+                fullscreen=self.fullscreen,
+            )
+            gb.run()
+        except FileNotFoundError:
+            self._status(f"ROM not found: {os.path.basename(path)}")
+        except (OSError, ValueError, pygame.error, RuntimeError, MemoryError) as e:
+            self._status(f"Error loading ROM: {e}")
+        self._restore_after_game(gb)
+        return "main"
+
+    def _capture_binding(self, name):
+        target = self.controls_capture
+        if target in TURBO_BUTTON_KEYS:
+            ok = _assign_binding_key(
+                self.turbo_bindings, target, name, other_maps=[self.key_bindings])
+        else:
+            ok = _assign_binding_key(
+                self.key_bindings, target, name, other_maps=[self.turbo_bindings])
+        if ok:
+            self._persist_controls()
+            label = target.replace('_', ' ').title()
+            self._status(f"{label} -> {_key_display_name(name)}")
+        else:
+            self._status(_RESERVED_KEY_MSG)
+        self.controls_capture = None
+        pygame.key.set_repeat(200, 50)
+
     def _handle(self, page):
+        actions = []
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 pygame.quit()
                 sys.exit()
+            plug = _gamepad_hotplug_message(event)
+            if event.type in (getattr(pygame, 'JOYDEVICEADDED', -1),
+                              getattr(pygame, 'JOYDEVICEREMOVED', -2)):
+                _init_joysticks()
+                if plug:
+                    self._status(plug)
+                continue
             if page == "controls" and self.controls_capture is not None:
                 if event.type == pygame.KEYDOWN:
                     if event.key == pygame.K_ESCAPE:
                         self.controls_capture = None
                         pygame.key.set_repeat(200, 50)
-                        continue
-                    name = _normalize_key_name(pygame.key.name(event.key))
-                    if _assign_binding_key(self.key_bindings, self.controls_capture, name):
-                        self._persist_controls()
-                        self._status(f"{self.controls_capture.title()} -> {_key_display_name(name)}")
+                    elif event.key != pygame.K_F11:
+                        self._capture_binding(_normalize_key_name(pygame.key.name(event.key)))
                     else:
-                        self._status(_RESERVED_KEY_MSG)
-                    self.controls_capture = None
-                    pygame.key.set_repeat(200, 50)
+                        actions.append('toggle_fullscreen')
                 continue
             if event.type == pygame.KEYDOWN:
-                action = event.key
-            elif event.type in (pygame.JOYBUTTONDOWN, pygame.JOYHATMOTION, pygame.JOYAXISMOTION):
-                action = _gamepad_menu_action(event)
-            elif event.type in (getattr(pygame, 'JOYDEVICEADDED', -1),
-                                getattr(pygame, 'JOYDEVICEREMOVED', -2)):
-                _init_joysticks()
-                continue
-            else:
-                continue
-            if action is None:
-                continue
-            action = _menu_nav_action(action)
-            if page == "main":
-                if action == pygame.K_UP or action == 'up':
-                    self.selected = (self.selected - 1) % len(self.main_items)
-                elif action == pygame.K_DOWN or action == 'down':
-                    self.selected = (self.selected + 1) % len(self.main_items)
-                elif action == pygame.K_RETURN or action == 'select':
-                    if self.selected == 0:
-                        self._scan_roms()
+                actions.append(event.key)
+            elif event.type in (pygame.JOYBUTTONDOWN, pygame.JOYHATMOTION):
+                ga = _gamepad_menu_action(event)
+                if ga:
+                    actions.append(ga)
+            elif event.type == pygame.MOUSEMOTION:
+                idx = _hit_list_index(self._menu_hits, self._canvas_mouse(event.pos))
+                if idx is not None:
+                    self._hover_select(page, idx)
+            elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                idx = _hit_list_index(self._menu_hits, self._canvas_mouse(event.pos))
+                if idx is not None:
+                    if self._hover_select(page, idx) is False:
+                        actions.append('select')
+                    else:
+                        actions.append('select')
+            elif event.type == getattr(pygame, 'MOUSEWHEEL', -3):
+                if getattr(event, 'y', 0) > 0:
+                    actions.append('up')
+                elif getattr(event, 'y', 0) < 0:
+                    actions.append('down')
+        if self.controls_capture is None:
+            stick = self._stick_nav.update(*_read_analog_menu_dirs(), pygame.time.get_ticks())
+            if stick:
+                actions.append(stick)
+        for raw in actions:
+            page = self._dispatch(page, _menu_nav_action(raw))
+        return page
+
+    def _hover_select(self, page, idx):
+        """Move the page cursor to ``idx``. Returns True if it changed."""
+        if page == "main":
+            items = self._main_items()
+            if 0 <= idx < len(items) and idx != self.selected:
+                self.selected = idx
+                return True
+        elif page == "load_rom" and self.roms:
+            if 0 <= idx < len(self.roms) and idx != self.rom_cursor:
+                self.rom_cursor = idx
+                self.rom_scroll, _ = _sync_list_scroll(
+                    idx, self.rom_scroll, self.max_visible, len(self.roms))
+                return True
+        elif page == "settings":
+            if 0 <= idx < len(self.settings_items) and idx != self.settings_cursor:
+                self.settings_cursor = idx
+                return True
+        elif page == "controls":
+            items = self._controls_items()
+            if 0 <= idx < len(items) and idx != self.controls_cursor:
+                self.controls_cursor = idx
+                self.controls_scroll, _ = _sync_list_scroll(
+                    idx, self.controls_scroll, 8, len(items))
+                return True
+        elif page == "confirm_exit":
+            if idx in (0, 1) and idx != self.exit_cursor:
+                self.exit_cursor = idx
+                return True
+        return False
+
+    def _dispatch(self, page, action):
+        if action == 'toggle_fullscreen' or action == pygame.K_F11:
+            self._toggle_fullscreen()
+            return page
+        if page == "main":
+            items = self._main_items()
+            n = len(items)
+            if self.selected >= n:
+                self.selected = 0
+            if action == pygame.K_UP or action == 'up':
+                self.selected = (self.selected - 1) % n
+            elif action == pygame.K_DOWN or action == 'down':
+                self.selected = (self.selected + 1) % n
+            elif action == pygame.K_RETURN or action == 'select':
+                choice = items[self.selected]
+                if choice == "Continue":
+                    return self._launch_rom(self.last_rom)
+                if choice == "Load ROM":
+                    self._scan_roms()
+                    self._select_last_rom()
+                    if not self.roms:
                         self.rom_cursor = 0
                         self.rom_scroll = 0
-                        return "load_rom"
-                    elif self.selected == 1:
-                        self._sync_settings_items()
-                        self.settings_cursor = 0
-                        return "settings"
-                    elif self.selected == 2:
-                        self.exit_cursor = 0
-                        return "confirm_exit"
-                elif action == pygame.K_ESCAPE or action == 'back':
+                    return "load_rom"
+                if choice == "Settings":
+                    self._sync_settings_items()
+                    self.settings_cursor = 0
+                    return "settings"
+                if choice == "Exit to OS":
                     self.exit_cursor = 0
                     return "confirm_exit"
-            elif page == "load_rom":
-                if action == pygame.K_UP or action == 'up':
-                    if self.rom_cursor > 0:
-                        self.rom_cursor -= 1
-                        if self.rom_cursor < self.rom_scroll:
-                            self.rom_scroll = self.rom_cursor
-                elif action == pygame.K_DOWN or action == 'down':
-                    if self.rom_cursor < len(self.roms) - 1:
-                        self.rom_cursor += 1
-                        if self.rom_cursor >= self.rom_scroll + self.max_visible:
-                            self.rom_scroll = self.rom_cursor - self.max_visible + 1
-                elif action == pygame.K_RETURN or action == 'select':
-                    if self.roms:
-                        path = self.roms[self.rom_cursor]
-                        self._status(f"Loading: {os.path.basename(path)}")
-                        self._render_load_rom()
-                        pygame.display.flip()
-                        try:
-                            gb = GameBoy(
-                                path,
-                                window_scale=self.window_scale,
-                                fps_limit=FPS_LIMIT_OPTIONS[self.fps_limit_idx][1],
-                                audio_enabled=AUDIO_OPTIONS[self.audio_idx][1],
-                                volume=VOLUME_OPTIONS[self.volume_idx][1],
-                                palette=PALETTE_LIST[self.palette_idx][1],
-                                smooth_scale=FILTER_OPTIONS[self.filter_idx][1],
-                                shader=SHADER_LIST[self.shader_idx][1],
-                                bootrom_path=self.bootrom_path,
-                            )
-                            gb.run()
-                            # Sync menu settings indices from pause-menu changes
-                            si = gb._set_idx
-                            self.window_scale = WINDOW_SCALE_OPTIONS[si['scale']][1]
-                            self.fps_limit_idx = si['fps']
-                            self.audio_idx = si['audio']
-                            self.volume_idx = si['volume']
-                            self.palette_idx = si['palette']
-                            self.filter_idx = si['filter']
-                            self.shader_idx = si['shader']
-                            self.wasd_enabled = gb.wasd_enabled
-                            self.key_bindings = _rebuild_key_map(gb.key_bindings, self.wasd_enabled)
-                            self._sync_settings_items()
-                        except FileNotFoundError:
-                            self._status(f"ROM not found: {os.path.basename(path)}")
-                        except (OSError, ValueError, pygame.error, RuntimeError, MemoryError) as e:
-                            self._status(f"Error loading ROM: {e}")
-                        self.screen = pygame.display.set_mode((MENU_W, MENU_H))
-                        pygame.event.clear()
-                        pygame.key.set_repeat(200, 50)
-                        _init_joysticks()
-                        return "main"
-                elif action == pygame.K_ESCAPE or action == 'back':
-                    self.selected = 0
-                    return "main"
-                elif action == pygame.K_F5:
-                    self._scan_roms()
-                    self.rom_cursor = 0
-                    self.rom_scroll = 0
-                    self._status("ROM list refreshed")
-            elif page == "settings":
-                if action == pygame.K_UP or action == 'up':
-                    self.settings_cursor = (self.settings_cursor - 1) % len(self.settings_items)
-                elif action == pygame.K_DOWN or action == 'down':
-                    self.settings_cursor = (self.settings_cursor + 1) % len(self.settings_items)
-                elif action == pygame.K_RETURN or action == 'select':
-                    if self.settings_cursor == 7:
-                        self.controls_cursor = 0
-                        self.controls_scroll = 0
-                        self.controls_capture = None
-                        return "controls"
-                    self._cycle_menu_setting(self.settings_cursor, 1)
-                elif action in (pygame.K_RIGHT, 'right'):
-                    if self.settings_cursor != 7:
-                        self._cycle_menu_setting(self.settings_cursor, 1)
-                elif action in (pygame.K_LEFT, 'left'):
-                    if self.settings_cursor != 7:
-                        self._cycle_menu_setting(self.settings_cursor, -1)
-                elif action == pygame.K_ESCAPE or action == 'back':
-                    self.selected = 1
-                    return "main"
-            elif page == "controls":
-                items = self._controls_items()
-                if action == pygame.K_UP or action == 'up':
-                    self.controls_cursor = _advance_controls_cursor(
-                        self.controls_cursor, -1, len(items))
-                    self.controls_scroll, _ = _sync_list_scroll(
-                        self.controls_cursor, self.controls_scroll, 8, len(items))
-                elif action == pygame.K_DOWN or action == 'down':
-                    self.controls_cursor = _advance_controls_cursor(
-                        self.controls_cursor, 1, len(items))
-                    self.controls_scroll, _ = _sync_list_scroll(
-                        self.controls_cursor, self.controls_scroll, 8, len(items))
-                elif action == pygame.K_RETURN or action == 'select':
-                    if self.controls_cursor < CONTROLS_WASD_ROW:
-                        self.controls_capture = JOYPAD_BUTTON_KEYS[self.controls_cursor]
-                        pygame.key.set_repeat()
-                    elif self.controls_cursor == CONTROLS_WASD_ROW:
-                        self.wasd_enabled = not self.wasd_enabled
-                        self.key_bindings = _sanitize_key_bindings(self.key_bindings, self.wasd_enabled)
-                        self._persist_controls()
-                    elif self.controls_cursor == CONTROLS_TURBO_ROW:
-                        self._status("Turbo A/B: Q/E (not remappable)")
-                    elif self.controls_cursor == CONTROLS_RESET_ROW:
-                        self.wasd_enabled = True
-                        self.key_bindings = _default_key_bindings(True)
-                        self._persist_controls()
-                        self._status("Controls reset to default")
-                elif action == pygame.K_ESCAPE or action == 'back':
+            elif action == pygame.K_ESCAPE or action == 'back':
+                self.exit_cursor = 0
+                return "confirm_exit"
+            return page
+        if page == "load_rom":
+            n = len(self.roms)
+            if action in (pygame.K_UP, 'up', pygame.K_DOWN, 'down',
+                          'home', 'end', 'pageup', 'pagedown'):
+                nav = {pygame.K_UP: 'up', pygame.K_DOWN: 'down'}.get(action, action)
+                self.rom_cursor = _move_list_cursor(
+                    self.rom_cursor, n, nav, self.max_visible)
+                self.rom_scroll, _ = _sync_list_scroll(
+                    self.rom_cursor, self.rom_scroll, self.max_visible, max(n, 1))
+            elif action == pygame.K_RETURN or action == 'select':
+                if self.roms:
+                    return self._launch_rom(self.roms[self.rom_cursor])
+            elif action == pygame.K_ESCAPE or action == 'back':
+                return "main"
+            elif action == pygame.K_F5:
+                prev = self.roms[self.rom_cursor] if self.roms else None
+                self._scan_roms()
+                if prev and prev in self.roms:
+                    self.rom_cursor = self.roms.index(prev)
+                else:
+                    self._select_last_rom()
+                    if not self.roms:
+                        self.rom_cursor = 0
+                self.rom_scroll, _ = _sync_list_scroll(
+                    self.rom_cursor, self.rom_scroll, self.max_visible, max(len(self.roms), 1))
+                self._status("ROM list refreshed")
+            return page
+        if page == "settings":
+            n = len(self.settings_items)
+            if action == pygame.K_UP or action == 'up':
+                self.settings_cursor = (self.settings_cursor - 1) % n
+            elif action == pygame.K_DOWN or action == 'down':
+                self.settings_cursor = (self.settings_cursor + 1) % n
+            elif action == pygame.K_RETURN or action == 'select':
+                if self._settings_id() == 'controls':
+                    self.controls_cursor = 0
+                    self.controls_scroll = 0
                     self.controls_capture = None
-                    return "settings"
-            elif page == "confirm_exit":
-                if action in (pygame.K_UP, pygame.K_DOWN, pygame.K_LEFT, pygame.K_RIGHT,
-                              'up', 'down', 'left', 'right'):
-                    self.exit_cursor ^= 1
-                elif action == pygame.K_RETURN or action == 'select':
-                    if self.exit_cursor == 1:
-                        pygame.quit()
-                        sys.exit()
-                    self.selected = 0
-                    return "main"
-                elif action == pygame.K_ESCAPE or action == 'back':
-                    self.selected = 0
-                    return "main"
+                    return "controls"
+                self._cycle_menu_setting(self.settings_cursor, 1)
+            elif action in (pygame.K_RIGHT, 'right'):
+                if self._settings_id() != 'controls':
+                    self._cycle_menu_setting(self.settings_cursor, 1)
+            elif action in (pygame.K_LEFT, 'left'):
+                if self._settings_id() != 'controls':
+                    self._cycle_menu_setting(self.settings_cursor, -1)
+            elif action == pygame.K_ESCAPE or action == 'back':
+                return "main"
+            return page
+        if page == "controls":
+            items = self._controls_items()
+            n = len(items)
+            if action == pygame.K_UP or action == 'up':
+                self.controls_cursor = _advance_controls_cursor(self.controls_cursor, -1, n)
+                self.controls_scroll, _ = _sync_list_scroll(
+                    self.controls_cursor, self.controls_scroll, 8, n)
+            elif action == pygame.K_DOWN or action == 'down':
+                self.controls_cursor = _advance_controls_cursor(self.controls_cursor, 1, n)
+                self.controls_scroll, _ = _sync_list_scroll(
+                    self.controls_cursor, self.controls_scroll, 8, n)
+            elif action in (pygame.K_LEFT, pygame.K_RIGHT, 'left', 'right'):
+                if self.controls_cursor == CONTROLS_WASD_ROW:
+                    self.wasd_enabled = not self.wasd_enabled
+                    self.key_bindings = _sanitize_key_bindings(
+                        self.key_bindings, self.wasd_enabled)
+                    self._persist_controls()
+            elif action == pygame.K_RETURN or action == 'select':
+                if self.controls_cursor < CONTROLS_WASD_ROW:
+                    self.controls_capture = JOYPAD_BUTTON_KEYS[self.controls_cursor]
+                    pygame.key.set_repeat()
+                elif self.controls_cursor == CONTROLS_WASD_ROW:
+                    self.wasd_enabled = not self.wasd_enabled
+                    self.key_bindings = _sanitize_key_bindings(
+                        self.key_bindings, self.wasd_enabled)
+                    self._persist_controls()
+                elif self.controls_cursor == CONTROLS_TURBO_A_ROW:
+                    self.controls_capture = 'turbo_a'
+                    pygame.key.set_repeat()
+                elif self.controls_cursor == CONTROLS_TURBO_B_ROW:
+                    self.controls_capture = 'turbo_b'
+                    pygame.key.set_repeat()
+                elif self.controls_cursor == CONTROLS_RESET_ROW:
+                    self.wasd_enabled = True
+                    self.key_bindings = _default_key_bindings(True)
+                    self.turbo_bindings = {k: list(v) for k, v in DEFAULT_TURBO_BINDINGS.items()}
+                    self._persist_controls()
+                    self._status("Controls reset to default")
+                elif self.controls_cursor == CONTROLS_GAMEPAD_ROW:
+                    self._status(_connected_gamepad_label())
+            elif action == pygame.K_ESCAPE or action == 'back':
+                self.controls_capture = None
+                return "settings"
+            return page
+        if page == "confirm_exit":
+            if action in (pygame.K_UP, pygame.K_DOWN, pygame.K_LEFT, pygame.K_RIGHT,
+                          'up', 'down', 'left', 'right'):
+                self.exit_cursor ^= 1
+            elif action == pygame.K_RETURN or action == 'select':
+                if self.exit_cursor == 1:
+                    pygame.quit()
+                    sys.exit()
+                return "main"
+            elif action == pygame.K_ESCAPE or action == 'back':
+                return "main"
         return page
 
     def _render_main(self):
@@ -5154,11 +5659,21 @@ class EmulatorMenu:
             title_y = 72
         self._centre_text("Python GBC Emulator", title_y, MENU_HI, 36, shadow=True)
         self._centre_text(f"v{__version__}", title_y + 42, MENU_DIM, 18)
-        self._draw_menu(self.main_items, self.selected, title_y + 88, 48, size=28)
-        self._draw_chrome("Up/Down or WASD: Move   Enter: Select   Esc: Quit")
+        items = self._main_items()
+        if self.selected >= len(items):
+            self.selected = 0
+        gap = 42 if len(items) > 3 else 48
+        self._draw_menu(items, self.selected, title_y + 80, gap, size=26)
+        secondary = None
+        if items and items[self.selected] == "Continue" and self.last_rom:
+            secondary = os.path.basename(self.last_rom)
+        self._draw_chrome(
+            "Up/Down or click: Move   Enter: Select   F11: Fullscreen   Esc: Quit",
+            secondary=secondary)
 
     def _render_load_rom(self):
         self._centre_text("Select ROM", 22, MENU_HI, 32, shadow=True)
+        self._menu_hits = []
         if not self.roms:
             self._centre_text("No .gb / .gbc files found", 160, MENU_DIM, 24)
             self._centre_text("Put ROM files in the roms folder", 210, MENU_DIM, 20)
@@ -5180,6 +5695,7 @@ class EmulatorMenu:
         for i, rom_path in enumerate(visible):
             y = list_y + i * row_h
             idx = self.rom_scroll + i
+            self._menu_hits.append((24, y - 3, MENU_W - 48, 28, idx))
             selected = idx == self.rom_cursor
             if selected:
                 _blit_selection_bar(self.screen, 24, y - 3, MENU_W - 48, 28)
@@ -5218,18 +5734,21 @@ class EmulatorMenu:
         fi = get_font(16)
         meta = _fit_text(fi, f"{folder}  |  {info}", MENU_W - 64)
         self._centre_text(meta, min(info_y, MENU_RULE_Y - 22), MENU_DIM, 16)
-        self._draw_chrome("Enter: Load   F5: Refresh   Esc: Back")
+        self._draw_chrome("Enter/click: Load   PgUp/PgDn: Jump   F5: Refresh   Esc: Back")
 
     def _render_settings(self):
         self._centre_text("Settings", 24, MENU_HI, 32, shadow=True)
-        items = [
-            _decorate_cyclic_setting(text, i == self.settings_cursor and i < 7)
-            for i, text in enumerate(self.settings_items)
-        ]
-        self._draw_menu(items, self.settings_cursor, 80, 36, size=24)
+        items = []
+        for i, text in enumerate(self.settings_items):
+            selected = i == self.settings_cursor
+            if self._settings_id(i) == 'controls':
+                items.append(_decorate_submenu_row(text, selected))
+            else:
+                items.append(_decorate_cyclic_setting(text, selected))
+        self._draw_menu(items, self.settings_cursor, 72, 34, size=22)
         footer = ("Enter: Open Controls   Esc: Back"
-                  if self.settings_cursor == 7
-                  else "Left/Right or Enter: Change   Esc: Back")
+                  if self._settings_id() == 'controls'
+                  else "Left/Right or Enter: Change   F11: Fullscreen   Esc: Back")
         self._draw_chrome(footer)
 
     def _render_controls(self):
@@ -5237,23 +5756,28 @@ class EmulatorMenu:
         items = self._controls_items()
         if self.controls_capture is not None:
             items = list(items)
-            idx = JOYPAD_BUTTON_KEYS.index(self.controls_capture)
-            items[idx] = f"{JOYPAD_BUTTON_LABELS[idx]}: press a key..."
+            if self.controls_capture in JOYPAD_BUTTON_KEYS:
+                idx = JOYPAD_BUTTON_KEYS.index(self.controls_capture)
+                items[idx] = f"{JOYPAD_BUTTON_LABELS[idx]}: press a key..."
+            elif self.controls_capture == 'turbo_a':
+                items[CONTROLS_TURBO_A_ROW] = "Turbo A: press a key..."
+            elif self.controls_capture == 'turbo_b':
+                items[CONTROLS_TURBO_B_ROW] = "Turbo B: press a key..."
         self.controls_scroll = self._draw_menu(
-            items, self.controls_cursor, 60, 32, size=22,
+            items, self.controls_cursor, 58, 30, size=20,
             scroll=self.controls_scroll, max_visible=8)
         hint = "Press a new key   Esc: Cancel" if self.controls_capture else \
-            "Enter: Remap / Toggle   Esc: Back"
+            "Enter: Remap / Toggle   Left/Right: WASD   Esc: Back"
         self._draw_chrome(
             hint,
             secondary=None if self.controls_capture else
-            "In-game: Tab fast-forward, F3 FPS, F4 input, Ctrl+R reset")
+            "In-game: Tab fast-forward, F3 FPS, F4 input, F11 fullscreen, Ctrl+R reset")
 
     def _render_confirm_exit(self):
         self._centre_text("Exit Emulator?", 120, MENU_HI, 36, shadow=True)
         self._centre_text("Quit to the operating system?", 178, MENU_DIM, 22)
         self._draw_menu(["Keep Playing", "Exit to OS"], self.exit_cursor, 250, 50, size=28)
-        self._draw_chrome("Left/Right: Choose   Enter: Confirm   Esc: Cancel")
+        self._draw_chrome("Left/Right or click: Choose   Enter: Confirm   Esc: Cancel")
 
 
 class GameBoy:
@@ -5261,7 +5785,7 @@ class GameBoy:
     def __init__(self, rom_path=None, window_scale=4, fps_limit=59.73,
                  audio_enabled=True, volume=1.0, palette=PALETTE_DMG,
                  smooth_scale=False, shader=None, bootrom_path=None,
-                 link_cable=None):
+                 link_cable=None, fullscreen=None):
         self.mmu = MMU()
         self.mmu.link_cable = link_cable
         self.cpu = CPU(self.mmu)
@@ -5368,12 +5892,25 @@ class GameBoy:
             self._ghost_store = None
         self._numpy_slow_warned = False
 
+        self.fullscreen = False
+        self._caption = f"Python GBC Emulator - {os.path.basename(rom_path) if rom_path else 'No ROM'}"
+        self._present_rect = (0, 0, SCREEN_WIDTH, SCREEN_HEIGHT)
+        self._overlay_hits = []
+        self._stick_nav = _StickNav()
         if pygame:
             self.window_scale = _clamp_choice(window_scale, _WINDOW_SCALES, 4)
-            self.screen = pygame.display.set_mode((SCREEN_WIDTH * self.window_scale, SCREEN_HEIGHT * self.window_scale))
-            pygame.display.set_caption(f"Python GBC Emulator - {os.path.basename(rom_path) if rom_path else 'No ROM'}")
-            _set_window_icon()
+            pre_cfg = _load_config()
+            if fullscreen is None:
+                self.fullscreen = bool(pre_cfg.get('fullscreen', False))
+            else:
+                self.fullscreen = bool(fullscreen)
+            self._apply_game_display()
             _init_joysticks()
+            if rom_path:
+                try:
+                    _save_config({'last_rom': os.path.realpath(rom_path)})
+                except OSError:
+                    _save_config({'last_rom': rom_path})
         elif not rom_path:
             logging.warning("pygame not available — running headless is not useful without a ROM.")
 
@@ -5391,7 +5928,8 @@ class GameBoy:
         self._pause_msg_ttl = 0
         cfg = _load_config()
         self.wasd_enabled = bool(cfg.get('wasd_enabled', True))
-        self.key_bindings = _rebuild_key_map(cfg.get('key_bindings'), self.wasd_enabled)
+        self.key_bindings, self.turbo_bindings = _rebuild_input_maps(
+            cfg.get('key_bindings'), self.wasd_enabled, cfg.get('turbo_bindings'))
         self.controls_capture = None
         self.pause_controls_cursor = 0
         self.pause_controls_scroll = 0
@@ -5501,6 +6039,29 @@ class GameBoy:
                 self.audio_channel.set_volume(volume)
             except pygame.error:
                 pass
+
+    def _apply_game_display(self):
+        """Open the game window at the current scale, or desktop fullscreen."""
+        w = SCREEN_WIDTH * getattr(self, 'window_scale', 4)
+        h = SCREEN_HEIGHT * getattr(self, 'window_scale', 4)
+        self.screen = _open_display((w, h), getattr(self, 'fullscreen', False))
+        pygame.display.set_caption(getattr(self, '_caption', 'Python GBC Emulator'))
+        _set_window_icon()
+        sw, sh = self.screen.get_size()
+        self._present_rect = (0, 0, sw, sh)
+        if hasattr(self, '_stick_nav'):
+            self._stick_nav.reset()
+
+    def _toggle_fullscreen(self):
+        self.fullscreen = not bool(getattr(self, 'fullscreen', False))
+        self._apply_game_display()
+        if not _save_config({'fullscreen': self.fullscreen}):
+            self._status_msg = "Could not save settings"
+            self._status_ttl = 90
+        else:
+            self._status_msg = "Fullscreen" if self.fullscreen else "Windowed"
+            self._status_ttl = 90
+        return True
 
     def _sav_path(self):
         if not self.mmu.rom_path:
@@ -6832,11 +7393,19 @@ class GameBoy:
                 elif event.key == pygame.K_F6:
                     self._state_toast('save', 0, self.save_state(0))
                 elif event.key == pygame.K_F7:
-                    self._state_toast('load', 0, self.load_state(0))
+                    ok = self.load_state(0)
+                    self._state_toast('load', 0, ok)
+                    if ok:
+                        self.render()
                 elif event.key == pygame.K_F8:
                     self._state_toast('save', 1, self.save_state(1))
                 elif event.key == pygame.K_F9:
-                    self._state_toast('load', 1, self.load_state(1))
+                    ok = self.load_state(1)
+                    self._state_toast('load', 1, ok)
+                    if ok:
+                        self.render()
+                elif event.key == pygame.K_F11:
+                    self._toggle_fullscreen()
                 elif event.key == pygame.K_F3:
                     self._show_fps = not self._show_fps
                     self._status_msg = "FPS overlay on" if self._show_fps else "FPS overlay off"
@@ -6885,6 +7454,10 @@ class GameBoy:
             elif event.type in (getattr(pygame, 'JOYDEVICEADDED', -1),
                                 getattr(pygame, 'JOYDEVICEREMOVED', -2)):
                 _init_joysticks()
+                msg = _gamepad_hotplug_message(event)
+                if msg:
+                    self._status_msg = msg
+                    self._status_ttl = 90
 
     def _sync_held_inputs(self):
         """Re-read currently held keyboard / gamepad state after the pause menu."""
@@ -6937,12 +7510,27 @@ class GameBoy:
         self.mmu._recompute_joypad()
 
     def _apply_turbo(self):
-        """Hold Q/E (or comma/period) to auto-fire A/B at 30 Hz."""
+        """Hold turbo A/B keys to auto-fire A/B at 30 Hz."""
         if not pygame:
             return
         pressed = pygame.key.get_pressed()
-        turbo_a = bool(pressed[pygame.K_q] or pressed[pygame.K_COMMA])
-        turbo_b = bool(pressed[pygame.K_e] or pressed[pygame.K_PERIOD])
+        turbo_a = turbo_b = False
+        turbo_map = KEY_TO_TURBO_BIT or {
+            pygame.K_q: 4, pygame.K_COMMA: 4,
+            pygame.K_e: 5, pygame.K_PERIOD: 5,
+        }
+        for key, bit in turbo_map.items():
+            if key in KEY_TO_JOYPAD_BIT:
+                continue
+            try:
+                held = pressed[key]
+            except IndexError:
+                continue
+            if held:
+                if bit == 4:
+                    turbo_a = True
+                elif bit == 5:
+                    turbo_b = True
         self._turbo_phase ^= 1
         fire = bool(self._turbo_phase)
         mask = 0xFF
@@ -7020,9 +7608,11 @@ class GameBoy:
         if not pygame or getattr(self, 'screen', None) is None:
             return
         try:
-            h = self.screen.get_height()
-            f = get_font(18 if h >= 400 else 14)
-            right = self.screen.get_width() - 8
+            ox, oy, pw, ph = getattr(
+                self, '_present_rect',
+                (0, 0, self.screen.get_width(), self.screen.get_height()))
+            f = get_font(18 if ph >= 400 else 14)
+            right = ox + pw - 8
             badges = []
             lc = self.mmu.link_cable
             if lc is not None and lc.is_connected:
@@ -7061,11 +7651,12 @@ class GameBoy:
             bar.fill(MENU_BG)
             bar.set_alpha(210)
             x = right - total_w
-            self.screen.blit(bar, (x, 8))
-            pygame.draw.rect(self.screen, MENU_DIM, (x, 8, total_w, bar_h), 1)
+            y = oy + 8
+            self.screen.blit(bar, (x, y))
+            pygame.draw.rect(self.screen, MENU_DIM, (x, y, total_w, bar_h), 1)
             bx = x + pad
             for badge in badges:
-                by = 8 + (bar_h - badge.get_height()) // 2
+                by = y + (bar_h - badge.get_height()) // 2
                 self.screen.blit(badge, (bx, by))
                 bx += badge.get_width() + gap
         except (pygame.error, AttributeError):
@@ -7073,10 +7664,15 @@ class GameBoy:
 
     # ── In-game pause menu ────────────────────────────────────────────
     PAUSE_ITEMS = ["Resume", "Save States...", "Settings", "Exit to Menu"]
-    SAVE_STATE_ITEMS = [
-        "Save to Slot 0", "Load from Slot 0",
-        "Save to Slot 1", "Load from Slot 1",
-    ]
+    SAVE_STATE_ACTIONS = (('save', 0), ('load', 0), ('save', 1), ('load', 1))
+
+    def _save_state_items(self):
+        items = []
+        for action, slot in self.SAVE_STATE_ACTIONS:
+            stamp = _slot_status_suffix(self._state_path(slot))
+            verb = "Save" if action == 'save' else "Load"
+            items.append(f"{verb} Slot {slot}  ·  {stamp}")
+        return items
 
     def _open_pause_menu(self):
         """Enter the paused state; the main loop hands control to _pause_menu_loop."""
@@ -7098,6 +7694,7 @@ class GameBoy:
         si = self._set_idx
         raw = [
             f"Window Scale: {WINDOW_SCALE_OPTIONS[si['scale']][0]}",
+            f"Display: {'Fullscreen' if self.fullscreen else 'Window'}",
             f"Frame Rate: {FPS_LIMIT_OPTIONS[si['fps']][0]}",
             f"Audio: {AUDIO_OPTIONS[si['audio']][0]}",
             f"Volume: {VOLUME_OPTIONS[si['volume']][0]}",
@@ -7106,28 +7703,40 @@ class GameBoy:
             f"Shader: {SHADER_LIST[si['shader']][0]}",
             "Controls...",
         ]
-        return [
-            _decorate_cyclic_setting(text, i == self.pause_settings_cursor and i < 7)
-            for i, text in enumerate(raw)
-        ]
+        items = []
+        for i, text in enumerate(raw):
+            selected = i == self.pause_settings_cursor
+            sid = SETTINGS_ROW_IDS[i] if i < len(SETTINGS_ROW_IDS) else None
+            if sid == 'controls':
+                items.append(_decorate_submenu_row(text, selected))
+            else:
+                items.append(_decorate_cyclic_setting(text, selected))
+        return items
 
     def _cycle_pause_setting(self, cursor, direction=1):
         """Cycle the setting under the cursor forward (1) or backward (-1).
         Returns True if the window was resized (so the backdrop must be recaptured)."""
         si = self._set_idx
         resized = False
-        if cursor == 0:
+        sid = SETTINGS_ROW_IDS[cursor] if 0 <= cursor < len(SETTINGS_ROW_IDS) else None
+        if sid == 'scale':
             n = len(WINDOW_SCALE_OPTIONS)
             si['scale'] = (si['scale'] + direction) % n
             self.window_scale = WINDOW_SCALE_OPTIONS[si['scale']][1]
-            self.screen = pygame.display.set_mode(
-                (SCREEN_WIDTH * self.window_scale, SCREEN_HEIGHT * self.window_scale))
+            if self.fullscreen:
+                self._pause_status("Scale applies in windowed mode")
+            else:
+                self._apply_game_display()
+                resized = True
+        elif sid == 'display':
+            self.fullscreen = not self.fullscreen
+            self._apply_game_display()
             resized = True
-        elif cursor == 1:
+        elif sid == 'fps':
             n = len(FPS_LIMIT_OPTIONS)
             si['fps'] = (si['fps'] + direction) % n
             self.fps_limit = FPS_LIMIT_OPTIONS[si['fps']][1]
-        elif cursor == 2:
+        elif sid == 'audio':
             n = len(AUDIO_OPTIONS)
             si['audio'] = (si['audio'] + direction) % n
             self._audio_on = AUDIO_OPTIONS[si['audio']][1]
@@ -7141,28 +7750,30 @@ class GameBoy:
                     except pygame.error:
                         pass
                 self.audio_enabled = False
-        elif cursor == 3:
+        elif sid == 'volume':
             n = len(VOLUME_OPTIONS)
             si['volume'] = (si['volume'] + direction) % n
             self._set_volume(VOLUME_OPTIONS[si['volume']][1])
-        elif cursor == 4:
+        elif sid == 'palette':
             n = len(PALETTE_LIST)
             si['palette'] = (si['palette'] + direction) % n
             self.ppu.set_palette(PALETTE_LIST[si['palette']][1])
-        elif cursor == 5:
+        elif sid == 'filter':
             n = len(FILTER_OPTIONS)
             si['filter'] = (si['filter'] + direction) % n
             self.smooth_scale = FILTER_OPTIONS[si['filter']][1]
-        elif cursor == 6:
+        elif sid == 'shader':
             n = len(SHADER_LIST)
             si['shader'] = (si['shader'] + direction) % n
             self.shader = SHADER_LIST[si['shader']][1]
             self._prev_shader_frame = None
-        elif cursor == 7:
+        elif sid == 'controls':
             return False
-        # Persist settings so they survive restart
+        else:
+            return False
         if not _save_config(dict(
             window_scale=WINDOW_SCALE_OPTIONS[si['scale']][1],
+            fullscreen=self.fullscreen,
             fps_limit=FPS_LIMIT_OPTIONS[si['fps']][1],
             audio_enabled=AUDIO_OPTIONS[si['audio']][1],
             volume=VOLUME_OPTIONS[si['volume']][1],
@@ -7171,6 +7782,7 @@ class GameBoy:
             shader=si['shader'],
             wasd_enabled=self.wasd_enabled,
             key_bindings=self.key_bindings,
+            turbo_bindings=self.turbo_bindings,
         )):
             self._pause_status("Could not save settings")
         return resized
@@ -7202,6 +7814,7 @@ class GameBoy:
         backdrop = self._capture_pause_backdrop()
         clock = pygame.time.Clock()
         page = "pause"
+        self._stick_nav.reset()
         while self.paused and self.running:
             page, backdrop = self._handle_pause_events(page, backdrop)
             if not self.paused or not self.running:
@@ -7235,13 +7848,45 @@ class GameBoy:
             'load', slot, getattr(self, '_last_state_error', 'corrupt'), detail))
         return backdrop
 
+    def _pause_persist_controls(self):
+        self.key_bindings, self.turbo_bindings = _rebuild_input_maps(
+            self.key_bindings, self.wasd_enabled, self.turbo_bindings)
+        if not _save_config({
+            'key_bindings': self.key_bindings,
+            'turbo_bindings': self.turbo_bindings,
+            'wasd_enabled': self.wasd_enabled,
+        }):
+            self._pause_status("Could not save settings")
+            return False
+        return True
+
+    def _overlay_host(self):
+        r = getattr(self, '_present_rect', None)
+        if r and r[2] >= 160 and r[3] >= 144:
+            return r
+        if getattr(self, 'screen', None) is None:
+            return (0, 0, SCREEN_WIDTH, SCREEN_HEIGHT)
+        return (0, 0, self.screen.get_width(), self.screen.get_height())
+
     def _handle_pause_events(self, page, backdrop):
+        actions = []
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 self.running = False
                 self.paused = False
                 return page, backdrop
+            plug = _gamepad_hotplug_message(event)
+            if event.type in (getattr(pygame, 'JOYDEVICEADDED', -1),
+                              getattr(pygame, 'JOYDEVICEREMOVED', -2)):
+                _init_joysticks()
+                if plug:
+                    self._pause_status(plug)
+                continue
             if event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_F11:
+                    self._toggle_fullscreen()
+                    backdrop = self._capture_pause_backdrop()
+                    continue
                 if event.key == pygame.K_r and (event.mod & pygame.KMOD_CTRL):
                     self.soft_reset()
                     backdrop = self._capture_pause_backdrop()
@@ -7261,122 +7906,170 @@ class GameBoy:
                         self.controls_capture = None
                     else:
                         name = _normalize_key_name(pygame.key.name(event.key))
-                        if _assign_binding_key(self.key_bindings, self.controls_capture, name):
-                            self.key_bindings = _rebuild_key_map(self.key_bindings, self.wasd_enabled)
-                            _save_config({
-                                'key_bindings': self.key_bindings,
-                                'wasd_enabled': self.wasd_enabled,
-                            })
-                            self._pause_status(f"{self.controls_capture.title()} -> {_key_display_name(name)}")
+                        target = self.controls_capture
+                        if target in TURBO_BUTTON_KEYS:
+                            ok = _assign_binding_key(
+                                self.turbo_bindings, target, name,
+                                other_maps=[self.key_bindings])
+                        else:
+                            ok = _assign_binding_key(
+                                self.key_bindings, target, name,
+                                other_maps=[self.turbo_bindings])
+                        if ok:
+                            self._pause_persist_controls()
+                            label = target.replace('_', ' ').title()
+                            self._pause_status(f"{label} -> {_key_display_name(name)}")
                         else:
                             self._pause_status(_RESERVED_KEY_MSG)
                         self.controls_capture = None
                 continue
             if event.type == pygame.KEYDOWN:
-                action = event.key
-            elif event.type in (pygame.JOYBUTTONDOWN, pygame.JOYHATMOTION, pygame.JOYAXISMOTION):
-                action = _gamepad_menu_action(event)
-            else:
-                continue
-            if action is None:
-                continue
-            action = _menu_nav_action(action)
-            if page == "pause":
-                if action in (pygame.K_UP, 'up'):
-                    self.pause_cursor = (self.pause_cursor - 1) % len(self.PAUSE_ITEMS)
-                elif action in (pygame.K_DOWN, 'down'):
-                    self.pause_cursor = (self.pause_cursor + 1) % len(self.PAUSE_ITEMS)
-                elif action == pygame.K_RETURN or action == 'select':
-                    page, backdrop = self._activate_pause_item(page, backdrop)
-                elif action == pygame.K_ESCAPE or action == 'back':
-                    self.paused = False
-            elif page == "settings":
-                items = self._pause_settings_items()
-                if action in (pygame.K_UP, 'up'):
-                    self.pause_settings_cursor = (self.pause_settings_cursor - 1) % len(items)
-                elif action in (pygame.K_DOWN, 'down'):
-                    self.pause_settings_cursor = (self.pause_settings_cursor + 1) % len(items)
-                elif action == pygame.K_RETURN or action == 'select':
-                    if self.pause_settings_cursor == 7:
-                        self.pause_controls_cursor = 0
-                        self.pause_controls_scroll = 0
-                        self.controls_capture = None
-                        page = "controls"
-                    elif self._cycle_pause_setting(self.pause_settings_cursor, 1):
-                        backdrop = self._capture_pause_backdrop()
-                elif action in (pygame.K_RIGHT, 'right'):
-                    if self.pause_settings_cursor != 7:
-                        if self._cycle_pause_setting(self.pause_settings_cursor, 1):
-                            backdrop = self._capture_pause_backdrop()
-                elif action in (pygame.K_LEFT, 'left'):
-                    if self.pause_settings_cursor != 7:
-                        if self._cycle_pause_setting(self.pause_settings_cursor, -1):
-                            backdrop = self._capture_pause_backdrop()
-                elif action == pygame.K_ESCAPE or action == 'back':
-                    page = "pause"
-            elif page == "save_states":
-                items = self.SAVE_STATE_ITEMS
-                if action in (pygame.K_UP, 'up'):
-                    self.pause_save_cursor = (self.pause_save_cursor - 1) % len(items)
-                elif action in (pygame.K_DOWN, 'down'):
-                    self.pause_save_cursor = (self.pause_save_cursor + 1) % len(items)
-                elif action == pygame.K_RETURN or action == 'select':
-                    page, backdrop = self._activate_save_state_item(backdrop)
-                elif action == pygame.K_ESCAPE or action == 'back':
-                    page = "pause"
-            elif page == "controls":
-                items = self._pause_controls_items()
-                cap = _overlay_scroll_capacity(*self.screen.get_size(), has_status=True)
-                if action in (pygame.K_UP, 'up'):
-                    self.pause_controls_cursor = _advance_controls_cursor(
-                        self.pause_controls_cursor, -1, len(items))
-                    self.pause_controls_scroll, _ = _sync_list_scroll(
-                        self.pause_controls_cursor, self.pause_controls_scroll, cap, len(items))
-                elif action in (pygame.K_DOWN, 'down'):
-                    self.pause_controls_cursor = _advance_controls_cursor(
-                        self.pause_controls_cursor, 1, len(items))
-                    self.pause_controls_scroll, _ = _sync_list_scroll(
-                        self.pause_controls_cursor, self.pause_controls_scroll, cap, len(items))
-                elif action == pygame.K_RETURN or action == 'select':
-                    if self.pause_controls_cursor < CONTROLS_WASD_ROW:
-                        self.controls_capture = JOYPAD_BUTTON_KEYS[self.pause_controls_cursor]
-                    elif self.pause_controls_cursor == CONTROLS_WASD_ROW:
-                        self.wasd_enabled = not self.wasd_enabled
-                        self.key_bindings = _sanitize_key_bindings(self.key_bindings, self.wasd_enabled)
-                        self.key_bindings = _rebuild_key_map(self.key_bindings, self.wasd_enabled)
-                        if not _save_config({
-                            'key_bindings': self.key_bindings,
-                            'wasd_enabled': self.wasd_enabled,
-                        }):
-                            self._pause_status("Could not save settings")
-                    elif self.pause_controls_cursor == CONTROLS_TURBO_ROW:
-                        self._pause_status("Turbo A/B: Q/E (not remappable)")
-                    elif self.pause_controls_cursor == CONTROLS_RESET_ROW:
-                        self.wasd_enabled = True
-                        self.key_bindings = _default_key_bindings(True)
-                        self.key_bindings = _rebuild_key_map(self.key_bindings, True)
-                        if not _save_config({
-                            'key_bindings': self.key_bindings,
-                            'wasd_enabled': True,
-                        }):
-                            self._pause_status("Could not save settings")
-                        else:
-                            self._pause_status("Controls reset to default")
-                elif action == pygame.K_ESCAPE or action == 'back':
+                actions.append(event.key)
+            elif event.type in (pygame.JOYBUTTONDOWN, pygame.JOYHATMOTION):
+                ga = _gamepad_menu_action(event)
+                if ga:
+                    actions.append(ga)
+            elif event.type == pygame.MOUSEMOTION:
+                idx = _hit_list_index(self._overlay_hits, event.pos)
+                if idx is not None:
+                    self._pause_hover(page, idx)
+            elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                idx = _hit_list_index(self._overlay_hits, event.pos)
+                if idx is not None:
+                    self._pause_hover(page, idx)
+                    actions.append('select')
+            elif event.type == getattr(pygame, 'MOUSEWHEEL', -3):
+                if getattr(event, 'y', 0) > 0:
+                    actions.append('up')
+                elif getattr(event, 'y', 0) < 0:
+                    actions.append('down')
+        if self.controls_capture is None:
+            stick = self._stick_nav.update(*_read_analog_menu_dirs(), pygame.time.get_ticks())
+            if stick:
+                actions.append(stick)
+        for raw in actions:
+            page, backdrop = self._dispatch_pause(page, _menu_nav_action(raw), backdrop)
+        return page, backdrop
+
+    def _pause_hover(self, page, idx):
+        if page == "pause" and 0 <= idx < len(self.PAUSE_ITEMS):
+            self.pause_cursor = idx
+        elif page == "settings":
+            items = self._pause_settings_items()
+            if 0 <= idx < len(items):
+                self.pause_settings_cursor = idx
+        elif page == "save_states":
+            items = self._save_state_items()
+            if 0 <= idx < len(items):
+                self.pause_save_cursor = idx
+        elif page == "controls":
+            items = self._pause_controls_items()
+            if 0 <= idx < len(items):
+                self.pause_controls_cursor = idx
+        elif page == "confirm_exit" and idx in (0, 1):
+            self.pause_exit_cursor = idx
+
+    def _dispatch_pause(self, page, action, backdrop):
+        if page == "pause":
+            if action in (pygame.K_UP, 'up'):
+                self.pause_cursor = (self.pause_cursor - 1) % len(self.PAUSE_ITEMS)
+            elif action in (pygame.K_DOWN, 'down'):
+                self.pause_cursor = (self.pause_cursor + 1) % len(self.PAUSE_ITEMS)
+            elif action == pygame.K_RETURN or action == 'select':
+                page, backdrop = self._activate_pause_item(page, backdrop)
+            elif action == pygame.K_ESCAPE or action == 'back':
+                self.paused = False
+        elif page == "settings":
+            items = self._pause_settings_items()
+            sid = SETTINGS_ROW_IDS[self.pause_settings_cursor] if (
+                0 <= self.pause_settings_cursor < len(SETTINGS_ROW_IDS)) else None
+            if action in (pygame.K_UP, 'up'):
+                self.pause_settings_cursor = (self.pause_settings_cursor - 1) % len(items)
+            elif action in (pygame.K_DOWN, 'down'):
+                self.pause_settings_cursor = (self.pause_settings_cursor + 1) % len(items)
+            elif action == pygame.K_RETURN or action == 'select':
+                if sid == 'controls':
+                    self.pause_controls_cursor = 0
+                    self.pause_controls_scroll = 0
                     self.controls_capture = None
-                    page = "settings"
-            elif page == "confirm_exit":
-                if action in (pygame.K_UP, pygame.K_DOWN, pygame.K_LEFT, pygame.K_RIGHT,
-                              'up', 'down', 'left', 'right'):
-                    self.pause_exit_cursor ^= 1
-                elif action == pygame.K_RETURN or action == 'select':
-                    if self.pause_exit_cursor == 1:
-                        self.running = False
-                        self.paused = False
-                    else:
-                        page = "pause"
-                elif action == pygame.K_ESCAPE or action == 'back':
+                    page = "controls"
+                elif self._cycle_pause_setting(self.pause_settings_cursor, 1):
+                    backdrop = self._capture_pause_backdrop()
+            elif action in (pygame.K_RIGHT, 'right'):
+                if sid != 'controls':
+                    if self._cycle_pause_setting(self.pause_settings_cursor, 1):
+                        backdrop = self._capture_pause_backdrop()
+            elif action in (pygame.K_LEFT, 'left'):
+                if sid != 'controls':
+                    if self._cycle_pause_setting(self.pause_settings_cursor, -1):
+                        backdrop = self._capture_pause_backdrop()
+            elif action == pygame.K_ESCAPE or action == 'back':
+                page = "pause"
+        elif page == "save_states":
+            items = self._save_state_items()
+            if action in (pygame.K_UP, 'up'):
+                self.pause_save_cursor = (self.pause_save_cursor - 1) % len(items)
+            elif action in (pygame.K_DOWN, 'down'):
+                self.pause_save_cursor = (self.pause_save_cursor + 1) % len(items)
+            elif action == pygame.K_RETURN or action == 'select':
+                page, backdrop = self._activate_save_state_item(backdrop)
+            elif action == pygame.K_ESCAPE or action == 'back':
+                page = "pause"
+        elif page == "controls":
+            items = self._pause_controls_items()
+            ox, oy, w, h = self._overlay_host()
+            cap = _overlay_scroll_capacity(w, h, has_status=True)
+            if action in (pygame.K_UP, 'up'):
+                self.pause_controls_cursor = _advance_controls_cursor(
+                    self.pause_controls_cursor, -1, len(items))
+                self.pause_controls_scroll, _ = _sync_list_scroll(
+                    self.pause_controls_cursor, self.pause_controls_scroll, cap, len(items))
+            elif action in (pygame.K_DOWN, 'down'):
+                self.pause_controls_cursor = _advance_controls_cursor(
+                    self.pause_controls_cursor, 1, len(items))
+                self.pause_controls_scroll, _ = _sync_list_scroll(
+                    self.pause_controls_cursor, self.pause_controls_scroll, cap, len(items))
+            elif action in (pygame.K_LEFT, pygame.K_RIGHT, 'left', 'right'):
+                if self.pause_controls_cursor == CONTROLS_WASD_ROW:
+                    self.wasd_enabled = not self.wasd_enabled
+                    self.key_bindings = _sanitize_key_bindings(
+                        self.key_bindings, self.wasd_enabled)
+                    self._pause_persist_controls()
+            elif action == pygame.K_RETURN or action == 'select':
+                if self.pause_controls_cursor < CONTROLS_WASD_ROW:
+                    self.controls_capture = JOYPAD_BUTTON_KEYS[self.pause_controls_cursor]
+                elif self.pause_controls_cursor == CONTROLS_WASD_ROW:
+                    self.wasd_enabled = not self.wasd_enabled
+                    self.key_bindings = _sanitize_key_bindings(
+                        self.key_bindings, self.wasd_enabled)
+                    self._pause_persist_controls()
+                elif self.pause_controls_cursor == CONTROLS_TURBO_A_ROW:
+                    self.controls_capture = 'turbo_a'
+                elif self.pause_controls_cursor == CONTROLS_TURBO_B_ROW:
+                    self.controls_capture = 'turbo_b'
+                elif self.pause_controls_cursor == CONTROLS_RESET_ROW:
+                    self.wasd_enabled = True
+                    self.key_bindings = _default_key_bindings(True)
+                    self.turbo_bindings = {k: list(v) for k, v in DEFAULT_TURBO_BINDINGS.items()}
+                    if self._pause_persist_controls():
+                        self._pause_status("Controls reset to default")
+                elif self.pause_controls_cursor == CONTROLS_GAMEPAD_ROW:
+                    self._pause_status(_connected_gamepad_label())
+            elif action == pygame.K_ESCAPE or action == 'back':
+                self.controls_capture = None
+                page = "settings"
+        elif page == "confirm_exit":
+            if action in (pygame.K_UP, pygame.K_DOWN, pygame.K_LEFT, pygame.K_RIGHT,
+                          'up', 'down', 'left', 'right'):
+                self.pause_exit_cursor ^= 1
+            elif action == pygame.K_RETURN or action == 'select':
+                if self.pause_exit_cursor == 1:
+                    self.running = False
+                    self.paused = False
+                else:
                     page = "pause"
+            elif action == pygame.K_ESCAPE or action == 'back':
+                page = "pause"
         return page, backdrop
 
     def _activate_pause_item(self, page, backdrop):
@@ -7395,15 +8088,17 @@ class GameBoy:
         return page, backdrop
 
     def _activate_save_state_item(self, backdrop):
-        choice = self.SAVE_STATE_ITEMS[self.pause_save_cursor]
-        if choice.startswith("Save to Slot "):
-            slot = int(choice.rsplit(' ', 1)[-1])
+        actions = self.SAVE_STATE_ACTIONS
+        if not actions:
+            return "save_states", backdrop
+        idx = self.pause_save_cursor % len(actions)
+        action, slot = actions[idx]
+        if action == 'save':
             ok = self.save_state(slot)
             detail = getattr(self, '_last_state_detail', None)
             self._pause_status(self._format_state_message(
                 'save', slot, None if ok else getattr(self, '_last_state_error', 'io'), detail))
-        elif choice.startswith("Load from Slot "):
-            slot = int(choice.rsplit(' ', 1)[-1])
+        else:
             if self.load_state(slot):
                 self._pause_status(self._format_state_message('load', slot, None))
                 backdrop = self._capture_pause_backdrop()
@@ -7418,18 +8113,24 @@ class GameBoy:
             f"{JOYPAD_BUTTON_LABELS[i]}: {_binding_label(self.key_bindings, key)}"
             for i, key in enumerate(JOYPAD_BUTTON_KEYS)
         ]
-        if self.controls_capture is not None:
+        if self.controls_capture in JOYPAD_BUTTON_KEYS:
             idx = JOYPAD_BUTTON_KEYS.index(self.controls_capture)
             items[idx] = f"{JOYPAD_BUTTON_LABELS[idx]}: Press a key..."
         items.append(f"WASD as D-Pad: {'On' if self.wasd_enabled else 'Off'}")
-        items.append("Turbo A/B: Q/E (not remappable)")
+        ta = "Press a key..." if self.controls_capture == 'turbo_a' else _binding_label(
+            self.turbo_bindings, 'turbo_a')
+        tb = "Press a key..." if self.controls_capture == 'turbo_b' else _binding_label(
+            self.turbo_bindings, 'turbo_b')
+        items.append(f"Turbo A: {ta}")
+        items.append(f"Turbo B: {tb}")
         items.append("Reset to Default")
+        items.append(_connected_gamepad_label())
         return items
 
     def _draw_overlay_menu(self, backdrop, title, items, cursor, hint, hint_hi=False,
                            scroll=0, status=None, status_hi=False):
         self.screen.blit(backdrop, (0, 0))
-        w, h = self.screen.get_size()
+        ox, oy, w, h = self._overlay_host()
         has_status = bool(status)
         cap = _overlay_scroll_capacity(w, h, has_hint=bool(hint), has_status=has_status)
         n_items = max(len(items), 1)
@@ -7437,7 +8138,7 @@ class GameBoy:
         visible = items[scroll:scroll + cap] if items else [""]
         display_cursor = cursor - scroll
         L = _overlay_layout(w, h, len(visible), has_hint=bool(hint), has_status=has_status)
-        px, py = L['px'], L['py']
+        px, py = ox + L['px'], oy + L['py']
         panel_w, panel_h = L['panel_w'], L['panel_h']
         panel = pygame.Surface((panel_w, panel_h))
         panel.fill(MENU_BG)
@@ -7453,14 +8154,16 @@ class GameBoy:
         scroll_font = get_font(max(11, L['item_size'] - 4))
         max_item_w = panel_w - 40
         list_y = py + L['title_band']
+        self._overlay_hits = []
         if scroll > 0:
             more = scroll_font.render("^ more", True, MENU_DIM)
             self.screen.blit(more, (px + (panel_w - more.get_width()) // 2, list_y - 2))
         for i, item in enumerate(visible):
             iy = list_y + i * L['item_h']
+            bar_h = max(12, L['item_h'] - 2)
+            self._overlay_hits.append((px + 6, iy - 1, panel_w - 12, bar_h, scroll + i))
             label = _fit_text(itf, item, max_item_w)
             if i == display_cursor:
-                bar_h = max(12, L['item_h'] - 2)
                 _blit_selection_bar(self.screen, px + 6, iy - 1, panel_w - 12, bar_h)
                 colour = MENU_HI
             else:
@@ -7497,7 +8200,14 @@ class GameBoy:
         return scroll
 
     def _pause_hint(self, wide, narrow):
-        return wide if self.screen.get_width() >= 400 else narrow
+        _ox, _oy, w, _h = self._overlay_host()
+        return wide if w >= 400 else narrow
+
+    def _pause_title(self, fallback="Paused"):
+        name = os.path.basename(self.mmu.rom_path or '')
+        if not name:
+            return fallback
+        return f"{fallback} — {name}"
 
     def _render_pause_page(self, page, backdrop):
         status = self._pause_msg if self._pause_msg_ttl > 0 else None
@@ -7514,7 +8224,7 @@ class GameBoy:
                                         "Press a key   Esc: Cancel")
             else:
                 hint = self._pause_hint(
-                    "Enter: Remap / Toggle   Esc: Back   Tab/F3/F4/Ctrl+R in-game",
+                    "Enter: Remap / Toggle   Esc: Back   F11 fullscreen",
                     "Enter: Remap   Esc: Back")
             self.pause_controls_scroll = self._draw_overlay_menu(
                 backdrop, "Controls", self._pause_controls_items(),
@@ -7522,9 +8232,9 @@ class GameBoy:
                 scroll=self.pause_controls_scroll, status=status, status_hi=True)
         elif page == "save_states":
             self._draw_overlay_menu(
-                backdrop, "Save States", self.SAVE_STATE_ITEMS,
+                backdrop, "Save States", self._save_state_items(),
                 self.pause_save_cursor,
-                self._pause_hint("Enter: Save/Load   Esc: Back   F6-F9: Quick keys",
+                self._pause_hint("Enter/click: Save/Load   Esc: Back   F6-F9: Quick keys",
                                  "Enter: Save/Load   Esc: Back   F6-F9"),
                 status=status, status_hi=True)
         elif page == "confirm_exit":
@@ -7535,11 +8245,12 @@ class GameBoy:
                                  "Battery save on exit"),
                 status=status, status_hi=True)
         else:
+            title = self._pause_title("Paused")
             self._draw_overlay_menu(
-                backdrop, "Paused", self.PAUSE_ITEMS,
+                backdrop, title, self.PAUSE_ITEMS,
                 self.pause_cursor,
                 self._pause_hint(
-                    "Up/Down: Move   Enter: Select   Esc: Resume   F6-F9: Save/Load",
+                    "Up/Down or click: Move   Enter: Select   Esc: Resume   F6-F9",
                     "Enter: Select   Esc: Resume   F6-F9"),
                 status=status, status_hi=True)
 
@@ -7594,24 +8305,30 @@ class GameBoy:
             for i in range(SCREEN_HEIGHT * SCREEN_WIDTH):
                 pxa[i % SCREEN_WIDTH, i // SCREEN_WIDTH] = fb[i]
             pxa.close()
-        target_size = self.screen.get_size()
-        if target_size == (SCREEN_WIDTH, SCREEN_HEIGHT):
+        dw, dh = self.screen.get_size()
+        scale = max(1, min(dw // SCREEN_WIDTH, dh // SCREEN_HEIGHT))
+        tw, th = SCREEN_WIDTH * scale, SCREEN_HEIGHT * scale
+        if (tw, th) == (SCREEN_WIDTH, SCREEN_HEIGHT):
             scaled = surf
         elif self.smooth_scale:
-            scaled = pygame.transform.smoothscale(surf, target_size)
+            scaled = pygame.transform.smoothscale(surf, (tw, th))
         else:
-            scaled = pygame.transform.scale(surf, target_size)
-        self.screen.blit(scaled, (0, 0))
+            scaled = pygame.transform.scale(surf, (tw, th))
+        ox, oy = (dw - tw) // 2, (dh - th) // 2
+        if (ox, oy) != (0, 0) or (dw, dh) != (tw, th):
+            self.screen.fill((0, 0, 0))
+        self.screen.blit(scaled, (ox, oy))
+        self._present_rect = (ox, oy, tw, th)
         if overlays:
-            # Transient status overlay (save/load messages) — bottom-left toast
+            # Transient status overlay (save/load messages) — bottom-left of the picture
             if getattr(self, '_status_ttl', 0) > 0 and getattr(self, '_status_msg', ''):
                 try:
-                    f = get_font(20 if self.screen.get_height() >= 400 else 14)
+                    f = get_font(20 if th >= 400 else 14)
                     s = f.render(self._status_msg, True, MENU_FG)
                     bg = pygame.Surface((s.get_width() + 16, s.get_height() + 8))
                     bg.fill(MENU_BG)
                     bg.set_alpha(210)
-                    x, y = 8, self.screen.get_height() - bg.get_height() - 8
+                    x, y = ox + 8, oy + th - bg.get_height() - 8
                     self.screen.blit(bg, (x, y))
                     pygame.draw.rect(self.screen, MENU_HI, (x, y, bg.get_width(), bg.get_height()), 1)
                     self.screen.blit(s, (x + 8, y + 4))

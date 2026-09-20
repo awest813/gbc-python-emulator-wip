@@ -124,10 +124,22 @@ def test_key_bindings(ns):
           _assign_binding_key(custom, "a", "tab") is False)
     check("assign reserved F3 is rejected",
           _assign_binding_key(custom, "b", "f3") is False)
+    check("assign reserved F11 is rejected",
+          _assign_binding_key(custom, "start", "f11") is False)
     check("reserved-key copy mentions Tab", "Tab" in ns["_RESERVED_KEY_MSG"])
+    check("reserved-key copy mentions F11", "F11" in ns["_RESERVED_KEY_MSG"])
     check("assign z to Start swaps/steals", _assign_binding_key(custom, "start", "z"))
     check("Start now includes z", "z" in custom["start"])
     check("A no longer uses z as primary", custom["a"][0] != "z")
+
+    fresh = _default_key_bindings(True)
+    turbo = ns["_sanitize_turbo_bindings"](None)
+    check("default turbo A includes q", "q" in turbo["turbo_a"])
+    check("assign q to A steals from turbo",
+          _assign_binding_key(fresh, "a", "q", other_maps=[turbo]))
+    check("A primary is q", fresh["a"][0] == "q")
+    check("turbo A dropped q", "q" not in turbo["turbo_a"])
+    check("turbo A still has a fallback", bool(turbo["turbo_a"]))
 
     _rebuild_key_map(_default_key_bindings(True), True)
     check("rebuild restores Z as A", ns["KEY_TO_JOYPAD_BIT"].get(pygame.K_z) == 4)
@@ -292,19 +304,30 @@ def test_turbo_and_reset(ns):
 def test_controls_rows(ns):
     keys = ns["JOYPAD_BUTTON_KEYS"]
     wasd = ns["CONTROLS_WASD_ROW"]
-    turbo = ns["CONTROLS_TURBO_ROW"]
+    turbo_a = ns["CONTROLS_TURBO_A_ROW"]
+    turbo_b = ns["CONTROLS_TURBO_B_ROW"]
     reset = ns["CONTROLS_RESET_ROW"]
+    gamepad = ns["CONTROLS_GAMEPAD_ROW"]
     advance = ns["_advance_controls_cursor"]
     check("controls WASD row index", wasd == len(keys))
-    check("controls turbo row index", turbo == wasd + 1)
-    check("controls reset row index", reset == wasd + 2)
+    check("controls turbo A follows WASD", turbo_a == wasd + 1)
+    check("controls turbo B follows turbo A", turbo_b == turbo_a + 1)
+    check("controls reset follows turbo", reset == turbo_b + 1)
+    check("controls gamepad is last", gamepad == reset + 1)
+    if ns["pygame"] is None:
+        print("  skip: pygame not available for EmulatorMenu")
+        return
     menu = ns["EmulatorMenu"]()
     items = menu._controls_items()
-    check("turbo row is informational", items[turbo].startswith("Turbo"))
-    check("reset is last controls row", items[reset] == "Reset to Default")
+    check("turbo A row is remappable", items[turbo_a].startswith("Turbo A:"))
+    check("turbo B row is remappable", items[turbo_b].startswith("Turbo B:"))
+    check("reset row label", items[reset] == "Reset to Default")
+    check("gamepad row is informational", items[gamepad].startswith("Gamepad:"))
     n = len(items)
-    check("down from WASD skips turbo", advance(wasd, 1, n) == reset)
-    check("up from reset skips turbo", advance(reset, -1, n) == wasd)
+    check("down from WASD goes to turbo A", advance(wasd, 1, n) == turbo_a)
+    check("down from turbo B goes to reset", advance(turbo_b, 1, n) == reset)
+    check("down from reset skips gamepad", advance(reset, 1, n) == 0)
+    check("up from Right skips gamepad", advance(0, -1, n) == reset)
 
 
 def test_ui_layout(ns):
@@ -320,6 +343,10 @@ def test_ui_layout(ns):
           _decorate_cyclic_setting("Window Scale: 4x", False) == "Window Scale: 4x")
     check("Controls row is not decorated",
           _decorate_cyclic_setting("Controls...", True) == "Controls...")
+    check("submenu row shows a prefix when selected",
+          ns["_decorate_submenu_row"]("Controls...", True) == "> Controls...")
+    check("submenu row unchanged when not selected",
+          ns["_decorate_submenu_row"]("Controls...", False) == "Controls...")
     scroll, cap = _sync_list_scroll(9, 0, 4, 11)
     check("list scroll follows cursor down", scroll == 6 and cap == 4)
     scroll, cap = _sync_list_scroll(2, 6, 4, 11)
@@ -341,6 +368,7 @@ def test_ui_layout(ns):
         os.unlink(dmg_path)
     cases = (
         (320, 288, 10, True),
+        (320, 288, 9, True),
         (320, 288, 5, True),
         (320, 288, 2, True),
         (480, 432, 8, True),
@@ -474,6 +502,81 @@ def test_unsupported_cart_header(ns):
         os.unlink(path)
 
 
+def test_stick_nav_and_helpers(ns):
+    StickNav = ns["_StickNav"]
+    nav = StickNav(delay=200, repeat=50)
+    check("neutral stick emits nothing", nav.update(0, 0, 0) is None)
+    check("up edge fires immediately", nav.update(0, -1, 10) == "up")
+    check("held up does not spam before delay", nav.update(0, -1, 50) is None)
+    check("held up repeats after delay", nav.update(0, -1, 220) == "up")
+    check("release then right is an edge", nav.update(1, 0, 400) == "right")
+    check("new down edge beats a held right repeat", nav.update(1, 1, 401) == "down")
+
+    check("page down moves by page size",
+          ns["_move_list_cursor"](0, 30, "pagedown", 10) == 10)
+    check("page up clamps at 0", ns["_move_list_cursor"](3, 30, "pageup", 10) == 0)
+    check("home jumps to start", ns["_move_list_cursor"](12, 30, "home", 10) == 0)
+    check("end jumps to last", ns["_move_list_cursor"](0, 30, "end", 10) == 29)
+    check("up does not wrap", ns["_move_list_cursor"](0, 30, "up", 10) == 0)
+
+    mapped = ns["_map_mouse_to_canvas"]((20, 20), 2, 10, 10, 160, 144)
+    check("mouse maps into letterboxed canvas", mapped == (5, 5))
+    check("mouse outside canvas is ignored",
+          ns["_map_mouse_to_canvas"]((0, 0), 2, 10, 10, 160, 144) is None)
+    hits = [(10, 10, 100, 20, 0), (10, 40, 100, 20, 1)]
+    check("hit test finds second row", ns["_hit_list_index"](hits, (15, 45)) == 1)
+    check("hit test misses gutter", ns["_hit_list_index"](hits, (15, 35)) is None)
+
+    empty = ns["_slot_status_suffix"]("/no/such/save.ss0")
+    check("missing save slot is empty", empty == "empty")
+    with tempfile.NamedTemporaryFile(suffix=".ss0", delete=False) as tf:
+        tf.write(b"x")
+        path = tf.name
+    try:
+        stamp = ns["_slot_status_suffix"](path)
+        check("occupied save slot is timestamped", stamp != "empty" and ":" in stamp)
+    finally:
+        os.unlink(path)
+
+    ga = ns["_gamepad_menu_action"]
+    pygame = ns["pygame"]
+    if pygame is None:
+        print("  skip: pygame not available for analog menu action")
+        return
+    pygame.init()
+    Axis = type("E", (), {})()
+    Axis.type = pygame.JOYAXISMOTION
+    Axis.axis = 1
+    Axis.value = -1.0
+    check("analog stick is not a one-shot menu event", ga(Axis) is None)
+
+
+def test_continue_and_settings_ids(ns):
+    check("display setting is in the settings row list",
+          "display" in ns["SETTINGS_ROW_IDS"])
+    check("controls remains the last settings row",
+          ns["SETTINGS_ROW_IDS"][-1] == "controls")
+    if ns["pygame"] is None:
+        print("  skip: pygame not available for EmulatorMenu")
+        return
+    menu = ns["EmulatorMenu"]()
+    menu.last_rom = None
+    items = menu._main_items()
+    check("main menu without last ROM has no Continue", "Continue" not in items)
+    with tempfile.NamedTemporaryFile(suffix=".gb", delete=False) as tf:
+        tf.write(b"\x00" * 0x200)
+        path = tf.name
+    try:
+        menu.last_rom = path
+        items = menu._main_items()
+        check("main menu shows Continue when last ROM exists", items[0] == "Continue")
+        check("Load ROM still present", "Load ROM" in items)
+    finally:
+        os.unlink(path)
+    check("settings include Display",
+          any(text.startswith("Display:") for text in menu.settings_items))
+
+
 def main():
     ns = load_module()
     print("wram/hram fast path:");     test_wram_hram_fast_path(ns)
@@ -481,6 +584,8 @@ def main():
     print("socd cleaning:");           test_socd(ns)
     print("key bindings:");            test_key_bindings(ns)
     print("controls rows:");           test_controls_rows(ns)
+    print("stick nav / helpers:");     test_stick_nav_and_helpers(ns)
+    print("continue / settings ids:"); test_continue_and_settings_ids(ns)
     print("config merge:");            test_config_merge(ns)
     print("gamepad start combo:");     test_gamepad_start_does_not_auto_pause(ns)
     print("inc preserves carry:");     test_inc_preserves_carry(ns)
