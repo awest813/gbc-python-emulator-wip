@@ -5668,8 +5668,8 @@ class EmulatorMenu:
         if items and items[self.selected] == "Continue" and self.last_rom:
             secondary = os.path.basename(self.last_rom)
         self._draw_chrome(
-            "Up/Down or click: Move   Enter: Select   F11: Fullscreen   Esc: Quit",
-            secondary=secondary)
+            "Enter: Select   F11: Fullscreen   Esc: Quit",
+            secondary=secondary or "Up/Down or click to move")
 
     def _render_load_rom(self):
         self._centre_text("Select ROM", 22, MENU_HI, 32, shadow=True)
@@ -5752,7 +5752,7 @@ class EmulatorMenu:
         self._draw_chrome(footer)
 
     def _render_controls(self):
-        self._centre_text("Controls", 18, MENU_HI, 32, shadow=True)
+        self._centre_text("Controls", 16, MENU_HI, 30, shadow=True)
         items = self._controls_items()
         if self.controls_capture is not None:
             items = list(items)
@@ -5764,20 +5764,20 @@ class EmulatorMenu:
             elif self.controls_capture == 'turbo_b':
                 items[CONTROLS_TURBO_B_ROW] = "Turbo B: press a key..."
         self.controls_scroll = self._draw_menu(
-            items, self.controls_cursor, 58, 30, size=20,
+            items, self.controls_cursor, 70, 28, size=18,
             scroll=self.controls_scroll, max_visible=8)
         hint = "Press a new key   Esc: Cancel" if self.controls_capture else \
             "Enter: Remap / Toggle   Left/Right: WASD   Esc: Back"
         self._draw_chrome(
             hint,
             secondary=None if self.controls_capture else
-            "In-game: Tab fast-forward, F3 FPS, F4 input, F11 fullscreen, Ctrl+R reset")
+            "In-game: Tab FF, F3 FPS, F4 input, F11, Ctrl+R")
 
     def _render_confirm_exit(self):
         self._centre_text("Exit Emulator?", 120, MENU_HI, 36, shadow=True)
         self._centre_text("Quit to the operating system?", 178, MENU_DIM, 22)
         self._draw_menu(["Keep Playing", "Exit to OS"], self.exit_cursor, 250, 50, size=28)
-        self._draw_chrome("Left/Right or click: Choose   Enter: Confirm   Esc: Cancel")
+        self._draw_chrome("Left/Right: Choose   Enter: Confirm   Esc: Cancel")
 
 
 class GameBoy:

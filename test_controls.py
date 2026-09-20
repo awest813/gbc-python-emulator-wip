@@ -575,6 +575,14 @@ def test_continue_and_settings_ids(ns):
         os.unlink(path)
     check("settings include Display",
           any(text.startswith("Display:") for text in menu.settings_items))
+    menu.selected = 0
+    check("hover moves main cursor to Settings",
+          menu._hover_select("main", menu._main_items().index("Settings")) is True)
+    check("hover Settings index", menu._main_items()[menu.selected] == "Settings")
+    page = menu._dispatch("main", "select")
+    check("select opens Settings page", page == "settings")
+    page = menu._dispatch("settings", "down")
+    check("down from scale lands on Display", menu._settings_id() == "display")
 
 
 def main():
