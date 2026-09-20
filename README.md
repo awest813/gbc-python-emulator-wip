@@ -129,10 +129,11 @@ optional DMG (256 B) or CGB (~2304 B) boot ROM before the cartridge starts.
 | Enter          | Start         |
 | Escape         | Pause menu (in game) / Back |
 | Tab            | Fast-forward (hold) |
-| Q / `,`        | Turbo A |
-| E / `.`        | Turbo B |
+| Q / `,`        | Turbo A (remappable) |
+| E / `.`        | Turbo B (remappable) |
 | F3             | Toggle FPS overlay |
 | F4             | Toggle input overlay |
+| F11            | Toggle fullscreen |
 | Ctrl+R         | Soft reset |
 | F5 (in menu)   | Refresh ROMs  |
 | F6 / F8        | Save state (slot 0 / 1) |
@@ -143,7 +144,9 @@ When a link cable is connected, a **LINK** badge appears in the HUD
 
 Keys are customisable: **Settings → Controls...** (also available from the
 in-game pause menu). Press Enter on a button to capture a new key. Esc, Tab,
-and F2–F9 are reserved. Bindings are stored in `gbc_config.json`.
+F2–F9, and F11 are reserved. Bindings (including turbo A/B) are stored in
+`gbc_config.json`. Click a row or use the analog stick (with a repeat delay)
+to move; mouse wheel scrolls lists.
 
 ### Gamepad / Controller
 Gamepads are auto-detected and use Xbox/PlayStation layout by default:
@@ -159,10 +162,13 @@ Gamepads are auto-detected and use Xbox/PlayStation layout by default:
 | R3 (stick click)| Fast-forward |
 | Select + Start | Pause menu    |
 | Escape         | Pause menu    |
+| F11            | Fullscreen    |
 
 D-pad, analog stick, and keyboard are tracked as separate sources so releasing
 the stick cannot un-press a still-held D-pad or key. Opposite directions on the
 same axis use last-wins cleaning (hardware cannot press Left+Right together).
+A held analog stick in menus moves once, then repeats after a short delay
+instead of scrolling every SDL axis event. Hot-plugging a pad shows a toast.
 
 ## Link Cable (Local Multiplayer)
 
@@ -178,24 +184,27 @@ python gbc_emulator.py rom.gbc --link-connect 127.0.0.1:12345
 
 ## Settings Persistence
 
-All menu settings (scale, volume, palette, shader, audio toggle, frame rate,
-key bindings) are saved to `gbc_config.json` and reloaded on next launch.  The
+All menu settings (scale, fullscreen, volume, palette, shader, audio toggle, frame rate,
+key bindings, last ROM) are saved to `gbc_config.json` and reloaded on next launch.  The
 file is created automatically in the emulator directory.
 
 ## Menu
 
+- **Continue** — Shown when a ROM was loaded previously; boots that file immediately.
 - **Load ROM** — Browse and select a `.gb` or `.gbc` file. Each entry
   shows a **DMG** or **CGB** badge from the ROM header. Press **F5**
-  to refresh the list.
-- **Settings** — Tweak the following options (press **Enter** to cycle each):
-  - *Window Scale* — 2× … 5×
+  to refresh the list, **PgUp/PgDn/Home/End** to jump, or click a row
+  (mouse wheel scrolls).
+- **Settings** — Tweak the following options (press **Enter** or **Left/Right** to cycle):
+  - *Window Scale* — 2× … 5× (windowed mode)
+  - *Display* — Window / Fullscreen (F11 also toggles; integer-scaled and letterboxed)
   - *Frame Rate* — 59.7 fps / 60 fps / Unlimited
   - *Audio* — On / Off
   - *Volume* — Mute / Low / Medium / High / Max
   - *Palette* — DMG Green / Grayscale / Amber / Blue / Brown / Pastel
   - *Filter* — Nearest (pixel-sharp) / Smooth (bilinear)
   - *Shader* — Off / LCD Ghost / CRT Scanlines / Gamma Warm / Pixel Bloom / Pocket Green
-  - *Controls...* — Remap keyboard keys, toggle WASD D-pad, reset to defaults
+  - *Controls...* — Remap keyboard keys (including turbo A/B), toggle WASD D-pad, reset to defaults
 - **Exit to OS** — Quit the emulator (with a confirmation prompt).
 
 ## Pause menu
@@ -207,7 +216,8 @@ pause overlay is open:
 
 - **Resume** — Return to the game (Escape also resumes).
 - **Save States...** — Sub-menu with save/load for slots 0 and 1
-  (same as F6–F9). Status toasts appear in a dedicated strip above
+  (same as F6–F9). Occupied slots show a timestamp; empty slots say
+  **empty**. Status toasts appear in a dedicated strip above
   the navigation hint.
 - **Settings** — The same options as the main settings page, applied
   **live** to the running game (palette, shader, filter, volume, audio,
