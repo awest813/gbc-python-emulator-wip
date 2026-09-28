@@ -2,7 +2,6 @@
 Usage: python test_dw3.py [path-to-rom]   (defaults to roms/Dragon Warrior III (USA).gbc)"""
 import os
 import sys
-import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)

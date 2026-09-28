@@ -230,16 +230,15 @@ def _parse_rom_header(rom_path):
     """Parse ROM header bytes and return a short info string, or None on error."""
     try:
         with open(rom_path, 'rb') as f:
-            f.seek(0x0143)
-            cgb = f.read(1)[0]
-            f.seek(0x0147)
-            cart_type = f.read(1)[0]
-            f.seek(0x0148)
-            rom_size = f.read(1)[0]
-            f.seek(0x0149)
-            ram_size = f.read(1)[0]
+            header = f.read(0x150)
     except OSError:
         return None
+    if len(header) < 0x150:
+        return None
+    cgb = header[0x0143]
+    cart_type = header[0x0147]
+    rom_size = header[0x0148]
+    ram_size = header[0x0149]
     _MBC_NAMES = {
         0x00: "ROM ONLY", 0x01: "MBC1", 0x02: "MBC1+RAM", 0x03: "MBC1+RAM+BATT",
         0x05: "MBC2", 0x06: "MBC2+BATT",
@@ -897,13 +896,35 @@ except NameError:
     _THIS_DIR = os.getcwd()
 _CONFIG_PATH = os.path.join(_THIS_DIR, "gbc_config.json")
 
+def _atomic_write(path, chunks):
+    """Write the bytes-like ``chunks`` to ``path`` via a temp file and rename.
+
+    A crash, full disk, or power loss mid-write leaves the previous file
+    intact instead of a truncated battery save, save state, or config.
+    """
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, 'wb') as f:
+            for chunk in chunks:
+                f.write(chunk)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def _load_config():
     """Load user settings from the JSON config file. Returns {} on any error."""
     try:
-        with open(_CONFIG_PATH, 'r') as f:
+        with open(_CONFIG_PATH, 'r', encoding='utf-8') as f:
             data = json.load(f)
         return data if isinstance(data, dict) else {}
-    except (OSError, ValueError, json.JSONDecodeError):
+    except (OSError, ValueError):
         return {}
 
 def _save_config(cfg):
@@ -911,8 +932,7 @@ def _save_config(cfg):
     current = _load_config()
     current.update(cfg)
     try:
-        with open(_CONFIG_PATH, 'w') as f:
-            json.dump(current, f, indent=2)
+        _atomic_write(_CONFIG_PATH, [json.dumps(current, indent=2).encode('utf-8')])
         return True
     except OSError:
         return False
@@ -1045,7 +1065,7 @@ class CPU:
 
     def dump_branch_trace(self):
         print("=== Last 64 branches ===")
-        for e in self.branch_trace[-64:]:
+        for e in list(self.branch_trace)[-64:]:
             print(f"  {e['kind']:12s} 0x{e['from']:04X}->0x{e['to']:04X} op=0x{e['opcode']:02X} bank={e['rom_bank']:02X} SP=0x{e['sp']:04X} AF=0x{e['af']:04X} BC=0x{e['bc']:04X} DE=0x{e['de']:04X} HL=0x{e['hl']:04X} IME={e['ime']} IE=0x{e['ie']:02X} IF=0x{e['if']:02X}")
 
     def _get_r8(self, idx):
@@ -1243,6 +1263,9 @@ class CPU:
         if pending == 0:
             return 0
         self.interrupts_master_enabled = False
+        # HALT with IME=1 and an interrupt already pending exits immediately;
+        # the ISR must run now rather than after the *next* interrupt.
+        self.halted = False
         for bit in range(5):
             if pending & (1 << bit):
                 self.mem[0xFF0F] &= ~(1 << bit)
@@ -1951,6 +1974,7 @@ class MMU:
         self.dma_cycle_acc = 0
         self.dma_buffer = bytearray()  # leftover for older save-state paths
         self.gdma_stall = 0
+        self._rom_bank0 = 0    # ROM bank currently mirrored at 0000-3FFF
         # MBC3 RTC (real-time clock, battery-backed)
         self.has_rtc = False
         self.rtc_s = 0
@@ -2027,6 +2051,35 @@ class MMU:
             return
         self.bootrom = bytearray(bootrom_data)
         self.bootrom_enabled = True
+        self._sync_bootrom_overlay()
+
+    def _bootrom_covers(self, address):
+        """True if ``address`` is shadowed by the loaded boot ROM when mapped.
+
+        DMG boot ROMs cover 0x0000-0x00FF. CGB boot ROMs also cover
+        0x0200-0x08FF; 0x0100-0x01FF always shows the cartridge header,
+        which the boot ROM reads to verify the logo."""
+        if address < 0x100:
+            return address < len(self.bootrom)
+        return 0x200 <= address < 0x900 and address < len(self.bootrom)
+
+    def _sync_bootrom_overlay(self):
+        """Mirror the boot ROM mapping into ``memory``.
+
+        The CPU fetches opcodes straight from ``memory``, so the boot ROM has
+        to be copied over the cartridge bytes while mapped and the cartridge
+        bytes put back once 0xFF50 unmaps it.
+        """
+        if self.bootrom_enabled and not self.bootrom:
+            self.bootrom_enabled = False
+        mem = self.memory
+        for start, end in ((0x0000, 0x0100), (0x0200, 0x0900)):
+            if self.bootrom_enabled:
+                end = min(end, len(self.bootrom))
+                if end > start:
+                    mem[start:end] = self.bootrom[start:end]
+            elif self.rom_data:
+                mem[start:end] = bytes(self._read_rom(a) for a in range(start, end))
 
     def load_rom(self, rom_data):
         self.rom_data = bytearray(rom_data)
@@ -2067,6 +2120,9 @@ class MMU:
             self.ram_data = bytearray(self.num_ram_banks * 0x2000)
 
         self.memory[0:0x8000] = self.rom_data[0:min(0x8000, len(self.rom_data))]
+        self._rom_bank0 = 0
+        if self.bootrom_enabled:
+            self._sync_bootrom_overlay()
         mbc_name = {0x00:"ROM ONLY", 0x01:"MBC1", 0x02:"MBC1+RAM", 0x03:"MBC1+RAM+BATT",
                     0x05:"MBC2", 0x06:"MBC2+BATT", 0x0F:"MBC3+TIMER+BATT",
                     0x10:"MBC3+TIMER+RAM+BATT", 0x11:"MBC3", 0x12:"MBC3+RAM",
@@ -2085,7 +2141,7 @@ class MMU:
         if self.dma_remaining > 0 and address < 0xFF80:
             return 0xFF
         # Boot ROM shadows cartridge ROM at 0x0000-N while enabled
-        if self.bootrom_enabled and address < len(self.bootrom):
+        if self.bootrom_enabled and self._bootrom_covers(address):
             return self.bootrom[address]
         # Fast path: WRAM (C000-DFFF) and HRAM/IE (FF80-FFFF) dominate game traffic
         if 0xC000 <= address < 0xE000:
@@ -2170,7 +2226,7 @@ class MMU:
                 if self.ram_bank <= 0x03:
                     if self.has_ram and len(self.ram_data) > 0:
                         offset = self.ram_bank * 0x2000 + (address - 0xA000)
-                        return self.ram_data[offset] if offset < len(self.ram_data) else 0xFF
+                        return self.ram_data[offset % len(self.ram_data)]
                     return 0xFF
                 if 0x08 <= self.ram_bank <= 0x0C:
                     return self._rtc_read(self.ram_bank)
@@ -2180,10 +2236,10 @@ class MMU:
                     return 0xFF
                 effective_bank = 0 if not self.mbc1_mode else self.ram_bank
                 offset = effective_bank * 0x2000 + (address - 0xA000)
-                return self.ram_data[offset] if offset < len(self.ram_data) else 0xFF
+                return self.ram_data[offset % len(self.ram_data)]
             if self.has_ram and self.ram_enabled and len(self.ram_data) > 0:
                 offset = self.ram_bank * 0x2000 + (address - 0xA000)
-                return self.ram_data[offset] if offset < len(self.ram_data) else 0xFF
+                return self.ram_data[offset % len(self.ram_data)]
             return 0xFF
         # ROM (0x0000-0x7FFF)
         if address < 0x8000:
@@ -2293,8 +2349,7 @@ class MMU:
                 if self.ram_bank <= 0x03:
                     if self.has_ram and len(self.ram_data) > 0:
                         offset = self.ram_bank * 0x2000 + (address - 0xA000)
-                        if offset < len(self.ram_data):
-                            self.ram_data[offset] = value
+                        self.ram_data[offset % len(self.ram_data)] = value
                 elif 0x08 <= self.ram_bank <= 0x0C:
                     self._rtc_write(self.ram_bank, value)
             elif self.mbc_type in (0x01, 0x02, 0x03):
@@ -2302,12 +2357,10 @@ class MMU:
                     return
                 effective_bank = 0 if not self.mbc1_mode else self.ram_bank
                 offset = effective_bank * 0x2000 + (address - 0xA000)
-                if offset < len(self.ram_data):
-                    self.ram_data[offset] = value
+                self.ram_data[offset % len(self.ram_data)] = value
             elif self.has_ram and self.ram_enabled and len(self.ram_data) > 0:
                 offset = self.ram_bank * 0x2000 + (address - 0xA000)
-                if offset < len(self.ram_data):
-                    self.ram_data[offset] = value
+                self.ram_data[offset % len(self.ram_data)] = value
         elif 0xE000 <= address <= 0xFDFF:
             self.memory[0xC000 + (address - 0xE000)] = value
         elif address == 0xFF00:
@@ -2344,8 +2397,10 @@ class MMU:
         elif address == 0xFF44:
             self.memory[0xFF44] = 0
         elif address == 0xFF50:
-            # Boot ROM unmap: any write disables the boot ROM
-            self.bootrom_enabled = False
+            # Boot ROM unmap: any write disables the boot ROM (one-way latch)
+            if self.bootrom_enabled:
+                self.bootrom_enabled = False
+                self._sync_bootrom_overlay()
         elif address == 0xFF4D:
             self.key1 = (self.key1 & 0x80) | (value & 0x01)
         elif address == 0xFF56:
@@ -2355,24 +2410,24 @@ class MMU:
                 self.ppu.write_cgb_register(address, value)
             self.memory[address] = value
         elif address == 0xFF55:
-            if value & 0x80:
-                # H-Blank DMA request
-                if self.hdma_active:
-                    # Cancel active HDMA
-                    self.hdma_active = False
-                    remaining_blocks = (self.hdma_remaining + 15) // 16
-                    self.memory[0xFF55] = 0x80 | (remaining_blocks & 0x7F)
-                else:
-                    # Start new H-Blank DMA
-                    self.hdma_src = ((self.memory[0xFF51] << 8) | self.memory[0xFF52]) & 0xFFF0
-                    self.hdma_dst = (((self.memory[0xFF53] << 8) | self.memory[0xFF54]) & 0x1FF0) | 0x8000
-                    self.hdma_remaining = ((value & 0x7F) + 1) * 16
-                    self.hdma_active = True
-                    self.memory[0xFF55] = value & 0x7F
+            if not self.is_cgb:
+                return
+            if self.hdma_active and not (value & 0x80):
+                # Writing bit 7 = 0 during an H-Blank DMA stops it. FF55 then
+                # reads back the blocks still left (minus one) with bit 7 set.
+                self.hdma_active = False
+                remaining_blocks = (self.hdma_remaining + 15) // 16
+                self.memory[0xFF55] = 0x80 | ((remaining_blocks - 1) & 0x7F)
+            elif value & 0x80:
+                # Start (or restart with a new length) an H-Blank DMA
+                self.hdma_src = ((self.memory[0xFF51] << 8) | self.memory[0xFF52]) & 0xFFF0
+                self.hdma_dst = (((self.memory[0xFF53] << 8) | self.memory[0xFF54]) & 0x1FF0) | 0x8000
+                self.hdma_remaining = ((value & 0x7F) + 1) * 16
+                self.hdma_active = True
+                self.memory[0xFF55] = value & 0x7F
             else:
                 # General Purpose DMA (GDMA) - immediate bulk transfer
-                self._hdma_transfer()
-                self.hdma_active = False
+                self._hdma_transfer(value)
         elif address == 0xFF4F:
             self.vram_bank_select = value & 0x01
         elif address == 0xFF70 and self.is_cgb:
@@ -2438,19 +2493,20 @@ class MMU:
         """One extra T-cycle per cartridge access in CGB double-speed."""
         if not (self.key1 & 0x80):
             return
-        if self.bootrom_enabled and address < len(self.bootrom):
+        if self.bootrom_enabled and self._bootrom_covers(address):
             return
         if address < 0x8000 or 0xA000 <= address <= 0xBFFF:
             self.cart_wait_cycles += 1
 
-    def _hdma_transfer(self):
+    def _hdma_transfer(self, value):
+        """General-purpose DMA: copy ``((value & 0x7F) + 1) * 16`` bytes now."""
         src = ((self.memory[0xFF51] << 8) | self.memory[0xFF52]) & 0xFFF0
         dst = (((self.memory[0xFF53] << 8) | self.memory[0xFF54]) & 0x1FF0) | 0x8000
-        blocks = (self.memory[0xFF55] & 0x7F) + 1
+        blocks = (value & 0x7F) + 1
         length = blocks * 16
         saved_wait = self.cart_wait_cycles
         for i in range(length):
-            val = self.read_byte(src + i)
+            val = self.read_byte((src + i) & 0xFFFF)
             addr = 0x8000 + ((dst + i) & 0x1FFF)
             if self.vram_bank_select:
                 self.vram_bank1[addr - 0x8000] = val
@@ -2466,7 +2522,7 @@ class MMU:
         chunk = min(16, self.hdma_remaining)
         saved_wait = self.cart_wait_cycles
         for i in range(chunk):
-            val = self.read_byte(self.hdma_src + i)
+            val = self.read_byte((self.hdma_src + i) & 0xFFFF)
             addr = 0x8000 + ((self.hdma_dst + i) & 0x1FFF)
             if self.vram_bank_select:
                 self.vram_bank1[addr - 0x8000] = val
@@ -2480,8 +2536,9 @@ class MMU:
             self.hdma_active = False
             self.memory[0xFF55] = 0xFF
         else:
+            # FF55 reads the remaining length encoded like the start value (blocks - 1).
             remaining_blocks = (self.hdma_remaining + 15) // 16
-            self.memory[0xFF55] = remaining_blocks & 0x7F
+            self.memory[0xFF55] = (remaining_blocks - 1) & 0x7F
 
     def _dma_transfer(self, value):
         """Start OAM DMA: 160 bytes from page `value`, one byte per 4 T-cycles."""
@@ -2494,7 +2551,7 @@ class MMU:
         """Bus-master read used by the OAM DMA unit (not subject to the CPU lock)."""
         address &= 0xFFFF
         if address < 0x8000:
-            if self.bootrom_enabled and address < len(self.bootrom):
+            if self.bootrom_enabled and self._bootrom_covers(address):
                 return self.bootrom[address]
             return self._read_rom(address)
         if address < 0xA000:
@@ -2567,6 +2624,31 @@ class MMU:
         if length < 0x4000:
             for i in range(length, 0x4000):
                 self.memory[0x4000 + i] = 0xFF
+        if self.mbc_type in (0x01, 0x02, 0x03):
+            self._remap_rom_bank0()
+
+    def _remap_rom_bank0(self, force=False):
+        """Refresh 0000-3FFF in ``memory`` (MBC1 mode 1 maps bank BANK2 << 5 there).
+
+        The CPU fetches opcodes straight from ``memory``, so this keeps code in
+        the low window consistent with ``_read_rom`` on large MBC1 carts.
+        """
+        if not self.rom_data:
+            return
+        bank = 0
+        if self.mbc_type in (0x01, 0x02, 0x03) and self.mbc1_mode:
+            banks = self.num_rom_banks if self.num_rom_banks else 1
+            bank = (self.mbc1_upper_bank << 5) % banks
+        if bank == self._rom_bank0 and not force:
+            return
+        self._rom_bank0 = bank
+        src = bank * 0x4000
+        chunk = self.rom_data[src:src + 0x4000]
+        self.memory[0:len(chunk)] = chunk
+        if len(chunk) < 0x4000:
+            self.memory[len(chunk):0x4000] = b'\xFF' * (0x4000 - len(chunk))
+        if self.bootrom_enabled:
+            self._sync_bootrom_overlay()
 
     def _handle_mbc_write(self, address, value):
         mbc = self.mbc_type
@@ -2577,6 +2659,10 @@ class MMU:
             self._mbc7_write_control(address, value)
             return
         if mbc in (0x05, 0x06):
+            # MBC2 registers live in 0000-3FFF; address bit 8 selects ROM bank
+            # vs RAM enable.
+            if address >= 0x4000:
+                return
             if address & 0x0100:
                 bank = value & 0x0F
                 if bank == 0:
@@ -2586,60 +2672,51 @@ class MMU:
             else:
                 self.ram_enabled = (value & 0x0F) == 0x0A
             return
-        if 0x2000 <= address <= 0x2FFF:
-            if mbc in (0x01, 0x02, 0x03):
+        if address <= 0x1FFF:
+            self.ram_enabled = (value & 0x0F) == 0x0A
+            return
+        if mbc in (0x01, 0x02, 0x03):
+            # BANK1 (5 bits) + BANK2 (2 bits) always form the 4000-7FFF bank;
+            # mode 1 additionally applies BANK2 to 0000-3FFF and cart RAM.
+            if address <= 0x3FFF:
                 bank = value & 0x1F
                 if bank == 0:
                     bank = 1
-                self.rom_bank = (self.rom_bank & 0x60) | bank
-                self._remap_rom_bank()
-            elif mbc in (0x0F, 0x10, 0x11, 0x12, 0x13):
+                self.rom_bank = (self.mbc1_upper_bank << 5) | bank
+            elif address <= 0x5FFF:
+                self.mbc1_upper_bank = value & 0x03
+                self.rom_bank = (self.mbc1_upper_bank << 5) | (self.rom_bank & 0x1F)
+            else:
+                self.mbc1_mode = value & 0x01
+            self.ram_bank = self.mbc1_upper_bank if self.mbc1_mode else 0
+            self._remap_rom_bank()
+        elif mbc in (0x0F, 0x10, 0x11, 0x12, 0x13):
+            if address <= 0x3FFF:
                 bank = value & 0x7F
                 if bank == 0:
                     bank = 1
                 self.rom_bank = bank
                 self._remap_rom_bank()
-            elif mbc in (0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E):
+            elif address <= 0x5FFF:
+                # MBC3: 0x00-0x03 -> RAM bank 0-3, 0x08-0x0C -> RTC register
+                v = value & 0x0F
+                if v <= 0x03 or (0x08 <= v <= 0x0C):
+                    self.ram_bank = v
+            else:
+                # MBC3 latch: write 0x00 then 0x01 to copy RTC -> latched registers
+                if self.rtc_latch_state == 0x00 and value == 0x01:
+                    self._rtc_latch()
+                self.rtc_latch_state = value
+        elif mbc in (0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E):
+            if address <= 0x2FFF:
                 self.rom_bank = (self.rom_bank & 0x100) | value
                 self._remap_rom_bank()
-        elif 0x3000 <= address <= 0x3FFF:
-            if mbc in (0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E):
+            elif address <= 0x3FFF:
                 self.rom_bank = (self.rom_bank & 0xFF) | ((value & 0x01) << 8)
                 self._remap_rom_bank()
-            elif mbc in (0x01, 0x02, 0x03):
-                pass
-        elif 0x4000 <= address <= 0x5FFF and mbc in (0x01, 0x02, 0x03):
-            self.mbc1_upper_bank = value & 0x03
-            if self.mbc1_mode:
-                self.ram_bank = self.mbc1_upper_bank
-            else:
-                self.rom_bank = (self.rom_bank & 0x1F) | (self.mbc1_upper_bank << 5)
-                self._remap_rom_bank()
-        elif 0x4000 <= address <= 0x5FFF and mbc in (0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E):
-            self.ram_bank = value & 0x0F
-        elif 0x4000 <= address <= 0x5FFF and mbc in (0x0F, 0x10, 0x11, 0x12, 0x13):
-            # MBC3: 0x00-0x03 -> RAM bank 0-3, 0x08-0x0C -> RTC register
-            v = value & 0x0F
-            if v <= 0x03 or (0x08 <= v <= 0x0C):
-                self.ram_bank = v
-        elif 0x6000 <= address <= 0x7FFF and mbc in (0x01, 0x02, 0x03):
-            mode = value & 0x01
-            if mode != self.mbc1_mode:
-                self.mbc1_mode = mode
-                if mode:
-                    self.ram_bank = self.mbc1_upper_bank
-                    self.rom_bank = self.rom_bank & 0x1F
-                else:
-                    self.rom_bank = (self.rom_bank & 0x1F) | (self.mbc1_upper_bank << 5)
-                    self.ram_bank = 0
-                self._remap_rom_bank()
-        elif 0x6000 <= address <= 0x7FFF and mbc in (0x0F, 0x10, 0x11, 0x12, 0x13):
-            # MBC3 latch: write 0x00 then 0x01 to copy RTC -> latched registers
-            if self.rtc_latch_state == 0x00 and value == 0x01:
-                self._rtc_latch()
-            self.rtc_latch_state = value
-        elif 0x0000 <= address <= 0x1FFF:
-            self.ram_enabled = (value & 0x0F) == 0x0A
+            elif address <= 0x5FFF:
+                # Rumble carts drive the motor with bit 3, leaving 3 RAM bank bits.
+                self.ram_bank = value & (0x07 if mbc in (0x1C, 0x1D, 0x1E) else 0x0F)
 
     # ===== MBC3 RTC =====
     def _rtc_update(self):
@@ -2652,8 +2729,12 @@ class MMU:
         now = time.time()
         delta = int(now - self.rtc_last_time)
         if delta <= 0:
+            if delta < 0:
+                self.rtc_last_time = now  # host clock went backwards
             return
-        self.rtc_last_time = now
+        # Advance by whole seconds only, carrying the fraction to the next
+        # update; resetting to ``now`` would drop up to a frame per second.
+        self.rtc_last_time += delta
         # Bulk-advance: seconds -> minutes -> hours -> days -> day-carry
         # This replaces the old per-second loop which was capped at 86400.
         self.rtc_s += delta
@@ -2990,7 +3071,6 @@ class MMU:
         count = data[3] | (data[4] << 8)
         vertical = data[5] & 1
         bits = data[6:]
-        bi = 0
         for n in range(count):
             byte = bits[n >> 2] if (n >> 2) < len(bits) else 0
             shift = 6 - ((n & 3) << 1)
@@ -3796,7 +3876,6 @@ class PPU:
     def _render_window(self, ly):
         mem = self.mmu.memory
         lcdc = mem[0xFF40]
-        wy = mem[0xFF4A]
         wx_raw = mem[0xFF4B]
         win_x_offset = wx_raw - 7
         if win_x_offset >= SCREEN_WIDTH:
@@ -4530,13 +4609,18 @@ class APU:
 
     # ── Channel triggers ─────────────────────────────────────────────
 
-    def _next_fs_clocks_length(self):
-        """Return True if the next frame-sequencer tick will clock length counters."""
+    def _next_fs_skips_length(self):
+        """True when the next frame-sequencer step will NOT clock length.
+
+        ``frame_seq_step`` is the step about to run, so an odd value means the
+        previous step just clocked length. Enabling length (or reloading it
+        from 0 on trigger) in this half of the period clocks it once extra.
+        """
         return (self.frame_seq_step + 1) & 7 in (0, 2, 4, 6)
 
     def _clock_length_on_enable(self, was_enabled, now_enabled, length, enabled_attr, triggering):
         """Extra length clock when enabling length just before a length-tick step."""
-        if now_enabled and not was_enabled and length > 0 and self._next_fs_clocks_length():
+        if now_enabled and not was_enabled and length > 0 and self._next_fs_skips_length():
             length -= 1
             if length == 0 and not triggering:
                 setattr(self, enabled_attr, False)
@@ -4547,7 +4631,7 @@ class APU:
         if self.ch1_dac:
             self.ch1_enabled = True
         if self.ch1_length == 0:
-            self.ch1_length = 63 if self._next_fs_clocks_length() else 64
+            self.ch1_length = 63 if self._next_fs_skips_length() else 64
         period = max((MAX_FREQUENCY - self.ch1_freq) * 4, 4)
         self.ch1_freq_timer = period
         self.ch1_duty_step = 0
@@ -4565,7 +4649,7 @@ class APU:
         if self.ch2_dac:
             self.ch2_enabled = True
         if self.ch2_length == 0:
-            self.ch2_length = 63 if self._next_fs_clocks_length() else 64
+            self.ch2_length = 63 if self._next_fs_skips_length() else 64
         period = max((MAX_FREQUENCY - self.ch2_freq) * 4, 4)
         self.ch2_freq_timer = period
         self.ch2_duty_step = 0
@@ -4591,7 +4675,7 @@ class APU:
         if self.ch3_dac:
             self.ch3_enabled = True
         if self.ch3_length == 0:
-            self.ch3_length = 255 if self._next_fs_clocks_length() else 256
+            self.ch3_length = 255 if self._next_fs_skips_length() else 256
         period = max((MAX_FREQUENCY - self.ch3_freq) * 2, 2)
         self.ch3_freq_timer = period
         self.ch3_wave_pos = 0
@@ -4601,7 +4685,7 @@ class APU:
         if self.ch4_dac:
             self.ch4_enabled = True
         if self.ch4_length == 0:
-            self.ch4_length = 63 if self._next_fs_clocks_length() else 64
+            self.ch4_length = 63 if self._next_fs_skips_length() else 64
         period = max(_NOISE_DIVISORS[self.ch4_divisor_code] << self.ch4_shift, 8)
         self.ch4_freq_timer = period
         self.ch4_volume = self.ch4_env_initial
@@ -5030,9 +5114,12 @@ def _read_rom_system_tag(rom_path):
     try:
         with open(rom_path, 'rb') as f:
             f.seek(0x0143)
-            return "CGB" if f.read(1)[0] & 0x80 else "DMG"
+            flag = f.read(1)
     except OSError:
         return "???"
+    if not flag:
+        return "???"
+    return "CGB" if flag[0] & 0x80 else "DMG"
 
 
 def _blit_selection_bar(surface, x, y, w, h):
@@ -5062,6 +5149,52 @@ def _set_window_icon():
         pygame.display.set_icon(pygame.transform.smoothscale(raw, (32, 32)))
     except (OSError, pygame.error):
         return
+
+
+def _require_pygame():
+    """Exit with install instructions when pygame is missing."""
+    if pygame is not None:
+        return
+    print("=" * 55)
+    print("  ERROR: pygame is required for the emulator window.")
+    print("  Install it with:  pip install pygame numpy")
+    print("=" * 55)
+    sys.exit(1)
+
+
+def _init_pygame():
+    """Initialise pygame (display, fonts, mixer, joysticks) for the menu or a game.
+
+    Falls back to the dummy audio driver when no sound device is available.
+    """
+    if not pygame.get_init():
+        pygame.mixer.pre_init(APU.SAMPLE_RATE, -16, 2, AUDIO_MIXER_SAMPLES)
+        try:
+            pygame.init()
+        except pygame.error:
+            os.environ["SDL_AUDIODRIVER"] = "dummy"
+            pygame.mixer.pre_init(APU.SAMPLE_RATE, -16, 2, AUDIO_MIXER_SAMPLES)
+            pygame.init()
+            logging.warning("Audio init failed — running silent (dummy audio driver).")
+    _init_joysticks()
+
+
+def _game_settings_from_config(cfg=None):
+    """``GameBoy`` keyword arguments for the persisted menu settings."""
+    if cfg is None:
+        cfg = _load_config()
+    return {
+        'window_scale': _clamp_choice(cfg.get('window_scale', 4), _WINDOW_SCALES, 4),
+        'fps_limit': FPS_LIMIT_OPTIONS[
+            _opt_index(FPS_LIMIT_OPTIONS, cfg.get('fps_limit', 59.73), 0)][1],
+        'audio_enabled': AUDIO_OPTIONS[
+            _opt_index(AUDIO_OPTIONS, cfg.get('audio_enabled', True), 0)][1],
+        'volume': VOLUME_OPTIONS[_opt_index(VOLUME_OPTIONS, cfg.get('volume', 1.0), 4)][1],
+        'palette': PALETTE_LIST[_clamp_index(cfg.get('palette', 0), len(PALETTE_LIST), 0)][1],
+        'smooth_scale': FILTER_OPTIONS[
+            _opt_index(FILTER_OPTIONS, cfg.get('smooth_scale', False), 0)][1],
+        'shader': SHADER_LIST[_clamp_index(cfg.get('shader', 0), len(SHADER_LIST), 0)][1],
+    }
 
 
 class EmulatorMenu:
@@ -5109,21 +5242,8 @@ class EmulatorMenu:
         self.controls_scroll = 0
         self.controls_capture = None  # button key being remapped, or None
         self._sync_settings_items()
-        if pygame is None:
-            print("=" * 55)
-            print("  ERROR: pygame is required for the emulator menu.")
-            print("  Install it with:  pip install pygame numpy")
-            print("=" * 55)
-            sys.exit(1)
-        pygame.mixer.pre_init(44100, -16, 2, AUDIO_MIXER_SAMPLES)
-        try:
-            pygame.init()
-        except pygame.error:
-            os.environ["SDL_AUDIODRIVER"] = "dummy"
-            pygame.mixer.pre_init(44100, -16, 2, AUDIO_MIXER_SAMPLES)
-            pygame.init()
-            logging.warning("Audio init failed — running silent (dummy audio driver).")
-        _init_joysticks()
+        _require_pygame()
+        _init_pygame()
         self.key_bindings, self.turbo_bindings = _rebuild_input_maps(
             self.key_bindings, self.wasd_enabled, self.turbo_bindings)
         self.screen = pygame.Surface((MENU_W, MENU_H))
@@ -5184,56 +5304,52 @@ class EmulatorMenu:
         _save_config({'last_rom': self.last_rom})
 
     def _scan_roms(self):
+        """Find .gb/.gbc files up to two folders deep under the working
+        directory, its parent, and the emulator's own directory."""
         self._rom_info_cache = {}
         self._rom_tag_cache = {}
         seen = set()
         self.roms = []
-        if not os.path.isdir("roms") and not os.path.isdir("rom"):
+        here_roms = os.path.join(_THIS_DIR, "roms")
+        if not any(os.path.isdir(d) for d in ("roms", "rom", here_roms)):
             try:
-                os.makedirs("roms", exist_ok=True)
+                os.makedirs(here_roms, exist_ok=True)
             except OSError:
                 pass
-        for base in [".", ".."]:
-            if not os.path.isdir(base):
-                continue
-            for f in sorted(os.listdir(base)):
-                fp = os.path.join(base, f)
-                if os.path.isfile(fp) and f.lower().endswith(('.gb', '.gbc')):
+
+        def listdir(path):
+            try:
+                return sorted(os.listdir(path))
+            except OSError:
+                return []
+
+        def add_roms(folder):
+            for name in listdir(folder):
+                fp = os.path.join(folder, name)
+                if name.lower().endswith(('.gb', '.gbc')) and os.path.isfile(fp):
                     rp = os.path.realpath(fp)
                     if rp not in seen:
                         seen.add(rp)
                         self.roms.append(fp)
-            for sub in sorted(os.listdir(base)):
+
+        bases = [".", ".."]
+        if os.path.realpath(_THIS_DIR) not in {os.path.realpath(b) for b in bases}:
+            bases.append(_THIS_DIR)
+        for base in bases:
+            if not os.path.isdir(base):
+                continue
+            add_roms(base)
+            for sub in listdir(base):
                 d1 = os.path.join(base, sub)
                 if not os.path.isdir(d1):
                     continue
-                try:
-                    for f in sorted(os.listdir(d1)):
-                        fp = os.path.join(d1, f)
-                        if os.path.isfile(fp) and f.lower().endswith(('.gb', '.gbc')):
-                            rp = os.path.realpath(fp)
-                            if rp not in seen:
-                                seen.add(rp)
-                                self.roms.append(fp)
-                except OSError:
-                    pass
-                try:
-                    for sub2 in sorted(os.listdir(d1)):
-                        d2 = os.path.join(d1, sub2)
-                        if not os.path.isdir(d2):
-                            continue
-                        try:
-                            for f in sorted(os.listdir(d2)):
-                                fp = os.path.join(d2, f)
-                                if os.path.isfile(fp) and f.lower().endswith(('.gb', '.gbc')):
-                                    rp = os.path.realpath(fp)
-                                    if rp not in seen:
-                                        seen.add(rp)
-                                        self.roms.append(fp)
-                        except OSError:
-                            pass
-                except OSError:
-                    pass
+                add_roms(d1)
+                for sub2 in listdir(d1):
+                    d2 = os.path.join(d1, sub2)
+                    if os.path.isdir(d2):
+                        add_roms(d2)
+        # A rescan can shrink the list; keep the cursor on a real entry.
+        self.rom_cursor = min(self.rom_cursor, max(len(self.roms) - 1, 0))
 
     def _sync_settings_items(self):
         self.settings_items = [
@@ -5488,6 +5604,12 @@ class EmulatorMenu:
             self._status(f"ROM not found: {os.path.basename(path)}")
         except (OSError, ValueError, pygame.error, RuntimeError, MemoryError) as e:
             self._status(f"Error loading ROM: {e}")
+        except Exception as e:  # emulator bug: keep the menu alive, log details
+            logging.exception("Emulation stopped by an unexpected error")
+            self._status(f"Emulator error: {type(e).__name__}")
+        if gb is not None and gb.quit_requested:
+            pygame.quit()
+            sys.exit()
         self._restore_after_game(gb)
         return "main"
 
@@ -5544,10 +5666,8 @@ class EmulatorMenu:
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 idx = _hit_list_index(self._menu_hits, self._canvas_mouse(event.pos))
                 if idx is not None:
-                    if self._hover_select(page, idx) is False:
-                        actions.append('select')
-                    else:
-                        actions.append('select')
+                    self._hover_select(page, idx)
+                    actions.append('select')
             elif event.type == getattr(pygame, 'MOUSEWHEEL', -3):
                 if getattr(event, 'y', 0) > 0:
                     actions.append('up')
@@ -6000,6 +6120,8 @@ class GameBoy:
         self._init_audio()
         self._set_volume(volume)
 
+        # Set when the window is closed (vs. "Exit to Menu") so the menu quits too.
+        self.quit_requested = False
         # In-game pause menu state. Selection indices mirror the global option
         # lists so the pause "Settings" page can cycle them and apply changes live.
         self.paused = False
@@ -6187,18 +6309,14 @@ class GameBoy:
         path = self._sav_path()
         if not path:
             return
+        chunks = [bytes(self.mmu.ram_data)]
+        if self.mmu.has_rtc:
+            chunks.append(self.mmu.pack_rtc_blob())
+        elif self.mmu.mbc_type == 0x20 and self.mmu.flash_data:
+            chunks.append(bytes(self.mmu.flash_data))
         try:
-            with open(path, 'wb') as f:
-                f.write(self.mmu.ram_data)
-                extra = 0
-                if self.mmu.has_rtc:
-                    blob = self.mmu.pack_rtc_blob()
-                    f.write(blob)
-                    extra = len(blob)
-                elif self.mmu.mbc_type == 0x20 and self.mmu.flash_data:
-                    f.write(self.mmu.flash_data)
-                    extra = len(self.mmu.flash_data)
-            logging.info(f"Saved: {os.path.basename(path)} ({len(self.mmu.ram_data) + extra} bytes)")
+            _atomic_write(path, chunks)
+            logging.info(f"Saved: {os.path.basename(path)} ({sum(len(c) for c in chunks)} bytes)")
         except OSError as e:
             logging.warning(f"Could not save: {e}")
 
@@ -6556,6 +6674,8 @@ class GameBoy:
         ppu._scanline_sprites = None
         ppu._scanline_sprite_height = None
         ppu.bg_palette_idx[:] = b'\x00' * len(ppu.bg_palette_idx)
+        self.mmu._remap_rom_bank0(force=True)
+        self.mmu._sync_bootrom_overlay()
         self._sanitize_serial_after_load()
         if ver is not None and ver < 7:
             self._reset_sgb_fsm()
@@ -6698,7 +6818,9 @@ class GameBoy:
                                      mmu.mbc_type, 1 if mmu.ram_enabled else 0,
                                      mmu.rom_bank & 0xFF, (mmu.rom_bank >> 8) & 0xFF,
                                      mmu.ram_bank & 0xFF, mmu.mbc1_mode & 0xFF,
-                                     mmu.num_rom_banks, mmu.num_ram_banks,
+                                     # u8 fields: 4 MB+ carts have 256-512 banks. The
+                                     # count is re-derived from the loaded ROM on load.
+                                     min(mmu.num_rom_banks, 0xFF), min(mmu.num_ram_banks, 0xFF),
                                      1 if mmu.has_ram else 0, 1 if mmu.has_battery else 0,
                                      1 if mmu.has_rtc else 0, 1 if mmu.is_cgb else 0,
                                      mmu.joypad_buttons, mmu.serial_data, mmu.serial_control,
@@ -6846,9 +6968,7 @@ class GameBoy:
             parts.append(bytes(mmu.sgb_packet))
             parts.append(struct.pack('<H', len(sgb_cmd)))
             parts.append(sgb_cmd)
-            with open(path, 'wb') as f:
-                for p in parts:
-                    f.write(p)
+            _atomic_write(path, parts)
             logging.info(f"Saved state to slot {slot}: {os.path.basename(path)}")
             return True
         except (OSError, struct.error, ValueError) as e:
@@ -6945,8 +7065,11 @@ class GameBoy:
             mmu.rom_bank = rom_bank_lo | ((rom_bank_hi & 1) << 8)
             mmu.ram_bank = ram_bank
             mmu.mbc1_mode = mbc1_mode
-            mmu.num_rom_banks = num_rom_banks
-            mmu.num_ram_banks = num_ram_banks
+            if not mmu.rom_data:
+                # Bank counts come from the ROM header (identity-checked above);
+                # only trust the saved u8 values when no ROM is loaded.
+                mmu.num_rom_banks = num_rom_banks
+                mmu.num_ram_banks = num_ram_banks
             mmu.has_ram = bool(has_ram)
             mmu.has_battery = bool(has_battery)
             mmu.has_rtc = bool(has_rtc)
@@ -7484,52 +7607,60 @@ class GameBoy:
         if pygame:
             pygame.key.set_repeat()  # disable key-repeat so held keys don't retrigger
 
-        while self.running:
-            cycles_this_frame = self._cycle_carry
-            self._cycle_carry = 0
-            while cycles_this_frame < CYCLES_PER_FRAME:
-                cycles_this_frame += self.step_all()
-            self._cycle_carry = cycles_this_frame - CYCLES_PER_FRAME
-            self._frame_index += 1
+        try:
+            while self.running:
+                self._run_frame()
+        finally:
+            # Flush the battery save even if emulation raised, so a crash
+            # cannot lose in-game progress made since the last clean exit.
+            self._save_sav()
+            if self.mmu.link_cable is not None:
+                self.mmu.link_cable.close()
 
-            samples_this_frame = 0
-            if pygame:
-                self.handle_events()
-                self._apply_turbo()
-                skip_blit = self._fast_forward and (self._frame_index & 3)
-                if not skip_blit:
-                    self.render()
-                if self._fast_forward:
-                    if not self._ff_audio_muted:
-                        self._drop_host_audio()
-                        self._ff_audio_muted = True
-                    self.apu.drain()
-                    samples_this_frame = 0
-                else:
-                    if self._ff_audio_muted:
-                        self._ff_audio_muted = False
-                        self._reset_av_clock()
-                    samples_this_frame = self._flush_audio()
+    def _run_frame(self):
+        """Emulate one video frame, then handle input, video, audio, and pacing."""
+        cycles_this_frame = self._cycle_carry
+        self._cycle_carry = 0
+        while cycles_this_frame < CYCLES_PER_FRAME:
+            cycles_this_frame += self.step_all()
+        self._cycle_carry = cycles_this_frame - CYCLES_PER_FRAME
+        self._frame_index += 1
 
-            if self.paused and pygame:
-                self._pause_menu_loop()
-                continue
+        samples_this_frame = 0
+        if pygame:
+            self.handle_events()
+            self._apply_turbo()
+            skip_blit = self._fast_forward and (self._frame_index & 3)
+            if not skip_blit:
+                self.render()
+            if self._fast_forward:
+                if not self._ff_audio_muted:
+                    self._drop_host_audio()
+                    self._ff_audio_muted = True
+                self.apu.drain()
+                samples_this_frame = 0
+            else:
+                if self._ff_audio_muted:
+                    self._ff_audio_muted = False
+                    self._reset_av_clock()
+                samples_this_frame = self._flush_audio()
 
-            self._tick_fps()
-            if self._status_ttl > 0:
-                self._status_ttl -= 1
-            if not self._fast_forward:
-                self._pace_frame(samples_this_frame)
+        if self.paused and pygame:
+            self._pause_menu_loop()
+            return
 
-        self._save_sav()
-        if self.mmu.link_cable is not None:
-            self.mmu.link_cable.close()
+        self._tick_fps()
+        if self._status_ttl > 0:
+            self._status_ttl -= 1
+        if not self._fast_forward:
+            self._pace_frame(samples_this_frame)
 
     def handle_events(self):
         """Process window events and Joypad / Gamepad inputs."""
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 self.running = False
+                self.quit_requested = True
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_ESCAPE:
                     self._open_pause_menu()
@@ -7635,19 +7766,15 @@ class GameBoy:
                     if y == 1:  hat &= ~0x04
                     if y == -1: hat &= ~0x08
                 naxes = js.get_numaxes()
-                def _axis_pair(idx, pos_bit, neg_bit, mask):
+                # (axis index, bit when positive, bit when negative)
+                for idx, pos_bit, neg_bit in ((0, 0, 1), (1, 3, 2), (6, 0, 1), (7, 3, 2)):
                     if idx >= naxes:
-                        return mask
+                        continue
                     val = js.get_axis(idx)
                     if val > T:
-                        return mask & ~(1 << pos_bit)
-                    if val < -T:
-                        return mask & ~(1 << neg_bit)
-                    return mask
-                axis = _axis_pair(0, 0, 1, axis)
-                axis = _axis_pair(1, 3, 2, axis)
-                axis = _axis_pair(6, 0, 1, axis)
-                axis = _axis_pair(7, 3, 2, axis)
+                        axis &= ~(1 << pos_bit)
+                    elif val < -T:
+                        axis &= ~(1 << neg_bit)
             except pygame.error:
                 continue
         self.mmu._joy_src = [kb, hat, axis, padbtn, 0xFF]
@@ -7727,6 +7854,7 @@ class GameBoy:
             cpu.reg.h = 0x01
             cpu.reg.l = 0x4D
         self.mmu.bootrom_enabled = False
+        self.mmu._sync_bootrom_overlay()
         self._apply_post_boot_io()
         ppu = self.ppu
         ppu.scanline_dot = 0
@@ -8006,6 +8134,7 @@ class GameBoy:
             if event.type == pygame.QUIT:
                 self.running = False
                 self.paused = False
+                self.quit_requested = True
                 return page, backdrop
             plug = _gamepad_hotplug_message(event)
             if event.type in (getattr(pygame, 'JOYDEVICEADDED', -1),
@@ -8520,8 +8649,11 @@ if __name__ == "__main__":
         if not os.path.isfile(args.rom):
             print(f"error: ROM not found: {args.rom}", file=sys.stderr)
             sys.exit(1)
+        _require_pygame()
+        _init_pygame()
         try:
-            emulator = GameBoy(args.rom, bootrom_path=args.bootrom, link_cable=link_cable)
+            emulator = GameBoy(args.rom, bootrom_path=args.bootrom, link_cable=link_cable,
+                               **_game_settings_from_config())
             emulator.run()
         except (OSError, ValueError) as e:
             print(f"error: {e}", file=sys.stderr)

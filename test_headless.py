@@ -29,6 +29,8 @@ def load_module():
     src = open(path, encoding="utf-8").read().split("if __name__")[0]
     ns = {}
     exec(compile(src, "gbc_emulator.py", "exec"), ns)
+    # Keep test runs from overwriting the developer's real settings.
+    ns["_CONFIG_PATH"] = os.path.join(tempfile.mkdtemp(), "gbc_config.json")
     return ns
 
 
@@ -801,7 +803,6 @@ def test_double_speed_apu_sync(ns):
 
 def test_cached_oam_sprite_height(ns):
     """Reused scanline OAM must still apply 8x16 sprite height."""
-    PPU = ns["PPU"]
     m, p, mem = _setup_cgb_ppu(ns)
     lo, hi = _tile_bytes(3)
     mem[0x8020] = lo

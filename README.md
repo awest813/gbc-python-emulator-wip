@@ -97,7 +97,8 @@ python gbc_emulator.py path/to/rom.gbc --bootrom path/to/boot.bin
 ```
 
 `--nomenu` is still accepted and means the same thing. A missing ROM path
-prints an error instead of dropping into the menu. `--bootrom` loads an
+prints an error instead of dropping into the menu. Booting directly uses the
+settings saved from the menu (palette, shader, volume, scale, …). `--bootrom` loads an
 optional DMG (256 B) or CGB (~2304 B) boot ROM before the cartridge starts.
 
 ### Chromebook (Crostini Linux)
@@ -186,7 +187,10 @@ python gbc_emulator.py rom.gbc --link-connect 127.0.0.1:12345
 
 All menu settings (scale, fullscreen, volume, palette, shader, audio toggle, frame rate,
 key bindings, last ROM) are saved to `gbc_config.json` and reloaded on next launch.  The
-file is created automatically in the emulator directory.
+file is created automatically in the emulator directory. Settings, battery saves, and
+save states are written atomically (temp file + rename), so a crash or power loss
+mid-write never leaves a truncated file, and the `.sav` is flushed even if emulation
+stops with an error.
 
 ## Menu
 
@@ -223,7 +227,8 @@ pause overlay is open:
   **live** to the running game (palette, shader, filter, volume, audio,
   frame rate, window scale, and Controls remapping all update immediately).
 - **Exit to Menu** — Return to the main menu, with a confirmation prompt.
-  Your battery save (`.sav`) is written out on the way back.
+  Your battery save (`.sav`) is written out on the way back. Closing the
+  window instead quits the emulator (the `.sav` is still written).
 
 Place ROM files in a `roms/` folder next to the emulator script, or
 anywhere in the current / parent directory — the scanner walks the
@@ -282,7 +287,11 @@ test_headless.py           Self-contained smoke test (synthetic ROM, no display)
 test_save_state.py         Save-state round-trip test (synthetic CGB ROM)
 test_controls.py           Joypad sources, SOCD, key bindings, WRAM fast-path
 test_hw_features.py        SGB packets, MBC6/7, serial bit-clock, CGB wait-states
+test_regressions.py        Boot ROM, HALT/IRQ, GDMA/HDMA, MBC registers, RTC, crash-safe saves
 ci_test.py                 Runs the portable tests (used by GitHub Actions)
+check_roms.py, test_rom.py, test_dw3.py, test_zelda.py, save_fb.py, view_fb.py,
+profile_*.py, smoke_test.py
+                           Dev scripts for real ROMs / profiling (not part of CI)
 requirements.txt           Dependency list (pygame, numpy)
 run.bat                    Windows launcher (installs deps if missing, then runs)
 run.sh                     Linux / macOS launcher (bash, installs deps if missing)
@@ -323,13 +332,22 @@ D-pad cleaning, customisable key bindings, and WRAM/HRAM write fast-paths:
 python test_controls.py
 ```
 
-All four portable tests are self-contained (no display, no local ROMs) and exit
+All portable tests are self-contained (no display, no local ROMs) and exit
 non-zero on failure, so they work as CI checks. The fourth test covers Super
 Game Boy packets, MBC6/MBC7 mappers, cycle-accurate serial bit-clocking, and
 CGB double-speed cartridge wait-states:
 
 ```bash
 python test_hw_features.py
+```
+
+A fifth portable test pins down bugs fixed in the audit pass: boot ROM
+execution, HALT with a pending interrupt, CGB GDMA/HDMA lengths, MBC bank
+register decoding, RTC drift, 4 MB+ save states, direct-boot init, and
+crash-safe battery saves:
+
+```bash
+python test_regressions.py
 ```
 
 A single wrapper script runs all tests sequentially:

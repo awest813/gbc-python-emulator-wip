@@ -24,6 +24,8 @@ src = open(os.path.join(HERE, "gbc_emulator.py"), encoding="utf-8").read()
 src = src.split("if __name__")[0]
 _ns = {}
 exec(compile(src, "gbc_emulator.py", "exec"), _ns)
+# Keep test runs from overwriting the developer's real settings.
+_ns["_CONFIG_PATH"] = os.path.join(tempfile.mkdtemp(), "gbc_config.json")
 MMU, CPU, PPU, APU, Timers = (_ns["MMU"], _ns["CPU"], _ns["PPU"], _ns["APU"], _ns["Timers"])
 GameBoy = _ns["GameBoy"]
 PALETTE_DMG = _ns["PALETTE_DMG"]

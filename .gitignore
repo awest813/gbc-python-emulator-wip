@@ -24,6 +24,7 @@ roms/
 *.ss0
 *.ss1
 gbc_config.json
+*.tmp
 
 # Screenshots / images
 *.png
