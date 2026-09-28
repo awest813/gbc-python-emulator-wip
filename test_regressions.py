@@ -276,6 +276,60 @@ def test_menu_robustness(ns):
     check("rescan clamps the ROM cursor", menu.rom_cursor < max(len(menu.roms), 1))
 
 
+def test_div_timer_phase(ns):
+    MMU, Timers = ns["MMU"], ns["Timers"]
+    m = MMU(); m.load_rom(bytes(build_rom()))
+    t = Timers(m)
+    m.div_reset_callback = t.reset_div
+    m.write_byte(0xFF07, 0x05)           # timer on, 16-cycle rate
+    m.memory[0xFF05] = 0
+    t.step(12)                           # DIV bit 3 is now high
+    m.write_byte(0xFF04, 0)              # falling edge -> one TIMA tick
+    check("DIV write with the rate bit high ticks TIMA", m.memory[0xFF05] == 1)
+    t.step(15)
+    check("TIMA phase restarts from the DIV reset", m.memory[0xFF05] == 1)
+    t.step(1)
+    check("next TIMA tick after a full period", m.memory[0xFF05] == 2)
+
+    gb = ns["GameBoy"](write_rom(build_rom()), audio_enabled=False)
+    gb.timers.div_counter = 0xFFF0
+    for _ in range(100):
+        gb.step_all()
+    check("DIV counter wraps at 16 bits", gb.timers.div_counter < 0x10000)
+    check("save state works after DIV wraps (~17 min of play)", gb.save_state(0))
+
+
+def test_dmg_length_survives_power_off(ns):
+    MMU, APU = ns["MMU"], ns["APU"]
+    for cgb, want in ((False, 20), (True, 0)):
+        m = MMU(); m.load_rom(bytes(build_rom(cgb=cgb)))
+        apu = APU(m, is_cgb=cgb)
+        apu.write_register(0xFF11, 64 - 20)
+        apu.write_register(0xFF26, 0x00)
+        label = "CGB clears" if cgb else "DMG keeps"
+        check(f"{label} length counters on APU power-off", apu.ch1_length == want)
+
+
+def test_sprite_bg_priority_masking(ns):
+    """A top sprite hidden behind BG must not reveal a lower sprite beneath it."""
+    MMU, PPU = ns["MMU"], ns["PPU"]
+    m = MMU(); m.load_rom(bytes(build_rom()))
+    p = PPU(m); m.ppu = p
+    mem = m.memory
+    mem[0x8010:0x8020] = bytes([0xFF, 0x00] * 8)   # tile 1: colour 1 everywhere
+    mem[0x8020:0x8030] = bytes([0x00, 0xFF] * 8)   # tile 2: colour 2 everywhere
+    mem[0x9800] = 1                                 # BG tile 0 is non-zero colour
+    mem[0xFF47] = 0xE4
+    mem[0xFF48] = 0xE4
+    mem[0xFF40] = 0x93                              # LCD, BG, OBJ, unsigned tiles
+    # OAM 0 (higher priority, same X): BG-priority flag set; OAM 1 lower priority.
+    mem[0xFE00:0xFE08] = bytes([16, 8, 1, 0x80, 16, 8, 2, 0x00])
+    p._render_scanline(0, mem[0xFF40])
+    bg_colour = p._dmg_bgp_rgb[0xE4][1]
+    check("BG shows where the top sprite yields to it",
+          p.framebuffer[0] == bg_colour)
+
+
 def main():
     ns = load_module()
     print("halt + pending irq:");     test_halt_with_pending_irq(ns)
@@ -287,6 +341,9 @@ def main():
     print("direct boot init:");       test_direct_boot_init(ns)
     print("atomic write / .sav:");    test_atomic_write_and_sav(ns)
     print("menu robustness:");        test_menu_robustness(ns)
+    print("div / timer phase:");      test_div_timer_phase(ns)
+    print("dmg apu power-off:");      test_dmg_length_survives_power_off(ns)
+    print("sprite bg priority:");     test_sprite_bg_priority_masking(ns)
     print("\nALL CHECKS PASSED")
 
 

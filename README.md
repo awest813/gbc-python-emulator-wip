@@ -33,7 +33,8 @@ Super Game Boy palettes, and full CGB compatibility.
   per bit, or 16 in CGB fast mode), serial interrupt after 8 bits, and a
   TCP link cable for local two-player multiplayer.
 - **Timers** — DIV, TIMA, TMA, TAC with all four programmable rates and
-  correct overflow → interrupt signalling.
+  correct overflow → interrupt signalling. TIMA is clocked from the 16-bit
+  DIV counter, so DIV writes shift the timer phase like hardware.
 - **Cartridge** — MBC1, MBC2 (4-bit RAM), MBC3 (with RTC), MBC5,
   MBC6 (dual 8 KB ROM/flash windows + SRAM) and MBC7 (EEPROM +
   accelerometer; D-pad tilts *Kirby Tilt 'n' Tumble*). Battery-backed
@@ -343,8 +344,9 @@ python test_hw_features.py
 
 A fifth portable test pins down bugs fixed in the audit pass: boot ROM
 execution, HALT with a pending interrupt, CGB GDMA/HDMA lengths, MBC bank
-register decoding, RTC drift, 4 MB+ save states, direct-boot init, and
-crash-safe battery saves:
+register decoding, RTC drift, 4 MB+ save states, direct-boot init,
+crash-safe battery saves, DIV/TIMA phase, DMG APU power-off, and sprite
+BG-priority masking:
 
 ```bash
 python test_regressions.py

@@ -3990,41 +3990,6 @@ class PPU:
                     bp[base + 6] = c6
                     bp[base + 7] = c7
 
-    def _cgb_sprite_plot(self, fb, bg_pri, idx, lcdc, bg_priority, pr, pal, c):
-        if c == 0:
-            return
-        bg_color_idx = bg_pri[idx] & 0x7F
-        if (lcdc & 0x01) and bg_color_idx != 0 and ((bg_pri[idx] & 0x80) or bg_priority):
-            return
-        fb[idx] = pr[pal * 4 + c]
-
-    def _cgb_sprite_plot8(self, fb, bg_pri, fb_row, spr_x, lcdc, bg_priority, pr, pal, colors):
-        """Unrolled CGB sprite row for sprites fully within the 160px scanline."""
-        off = pal * 4
-        cgb_pri = lcdc & 0x01
-        c0, c1, c2, c3, c4, c5, c6, c7 = colors
-        base = fb_row + spr_x
-        for sx, c in enumerate((c0, c1, c2, c3, c4, c5, c6, c7)):
-            if c == 0:
-                continue
-            idx = base + sx
-            if cgb_pri:
-                bg_color_idx = bg_pri[idx] & 0x7F
-                if bg_color_idx != 0 and ((bg_pri[idx] & 0x80) or bg_priority):
-                    continue
-            fb[idx] = pr[off + c]
-
-    def _dmg_sprite_plot8(self, fb, bg_pri, fb_row, spr_x, bg_priority, dmg_obj_rgb, colors):
-        """Unrolled DMG sprite row for sprites fully within the 160px scanline."""
-        base = fb_row + spr_x
-        for sx, c in enumerate(colors):
-            if c == 0:
-                continue
-            idx = base + sx
-            if bg_priority and bg_pri[idx] != 0:
-                continue
-            fb[idx] = dmg_obj_rgb[c]
-
     def _render_sprites(self, ly):
         mem = self.mmu.memory
         lcdc = mem[0xFF40]
@@ -4062,13 +4027,18 @@ class PPU:
             # LCDC bit 0: when 1, BG tile attributes control sprite priority.
             # When 0, sprites always draw on top of BG (OAM priority ignored).
             lcdc = mem[0xFF40]
-        for spr_x, spr_y, tile, flags in reversed(sprites):
+        # Hardware picks ONE sprite per pixel (the highest-priority opaque one)
+        # and only then applies that sprite's BG-priority flag. Draw in priority
+        # order and let the first opaque pixel claim the column, so a sprite
+        # hidden behind the BG never lets a lower-priority sprite show through.
+        claimed = bytearray(SCREEN_WIDTH)
+        cgb_master = (lcdc & 0x01) if is_cgb else 0
+        for spr_x, spr_y, tile, flags in sprites:
             sprite_pixel_y = ly - spr_y
             if flags & 0x40:
                 sprite_pixel_y = sprite_height - 1 - sprite_pixel_y
             if sprite_height == 16:
-                tile_row_offset = sprite_pixel_y >> 3
-                tile_idx_used = (tile & 0xFE) + tile_row_offset
+                tile_idx_used = (tile & 0xFE) + (sprite_pixel_y >> 3)
             else:
                 tile_idx_used = tile
             tile_addr = unsigned_addrs[tile_idx_used] + (sprite_pixel_y & 7) * 2
@@ -4079,52 +4049,31 @@ class PPU:
                 lo = mem[tile_addr]
                 hi = mem[tile_addr + 1]
             colors = tile_colors[(hi << 8) | lo]
-            x_flip = flags & 0x20
+            if flags & 0x20:
+                colors = colors[::-1]
             bg_priority = flags & 0x80
             if is_cgb:
-                pal = flags & 0x07
-                use_cgb_obj = True
+                rgb = pr
+                off = (flags & 0x07) * 4
             else:
-                use_obp1 = bool(flags & 0x10)
-                dmg_obj_rgb = obp_rgb[use_obp1]
-                use_cgb_obj = False
-            on_screen = spr_x >= 0 and spr_x + 8 <= SCREEN_WIDTH
-            if use_cgb_obj and on_screen and not x_flip:
-                self._cgb_sprite_plot8(fb, bg_pri, fb_row, spr_x, lcdc, bg_priority, pr, pal, colors)
-            elif use_cgb_obj and on_screen and x_flip:
-                flipped = (colors[7], colors[6], colors[5], colors[4],
-                             colors[3], colors[2], colors[1], colors[0])
-                self._cgb_sprite_plot8(fb, bg_pri, fb_row, spr_x, lcdc, bg_priority, pr, pal, flipped)
-            elif on_screen:
-                row = (colors[7], colors[6], colors[5], colors[4],
-                       colors[3], colors[2], colors[1], colors[0]) if x_flip else colors
-                self._dmg_sprite_plot8(fb, bg_pri, fb_row, spr_x, bg_priority, dmg_obj_rgb, row)
-            elif x_flip:
-                for sx in range(8):
-                    pixel_x = spr_x + sx
-                    if pixel_x < 0 or pixel_x >= SCREEN_WIDTH:
-                        continue
-                    c = colors[7 - sx]
-                    if use_cgb_obj:
-                        self._cgb_sprite_plot(fb, bg_pri, fb_row + pixel_x, lcdc, bg_priority, pr, pal, c)
-                    elif c != 0:
-                        idx = fb_row + pixel_x
-                        if bg_priority and bg_pri[idx] != 0:
+                rgb = obp_rgb[1 if flags & 0x10 else 0]
+                off = 0
+            x0 = spr_x if spr_x > 0 else 0
+            x1 = spr_x + 8 if spr_x + 8 < SCREEN_WIDTH else SCREEN_WIDTH
+            for x in range(x0, x1):
+                c = colors[x - spr_x]
+                if c == 0 or claimed[x]:
+                    continue
+                claimed[x] = 1
+                idx = fb_row + x
+                if is_cgb:
+                    if cgb_master:
+                        bgp = bg_pri[idx]
+                        if (bgp & 0x7F) and ((bgp & 0x80) or bg_priority):
                             continue
-                        fb[idx] = dmg_obj_rgb[c]
-            else:
-                for sx in range(8):
-                    pixel_x = spr_x + sx
-                    if pixel_x < 0 or pixel_x >= SCREEN_WIDTH:
-                        continue
-                    c = colors[sx]
-                    if use_cgb_obj:
-                        self._cgb_sprite_plot(fb, bg_pri, fb_row + pixel_x, lcdc, bg_priority, pr, pal, c)
-                    elif c != 0:
-                        idx = fb_row + pixel_x
-                        if bg_priority and bg_pri[idx] != 0:
-                            continue
-                        fb[idx] = dmg_obj_rgb[c]
+                elif bg_priority and bg_pri[idx] != 0:
+                    continue
+                fb[idx] = rgb[off + c]
 
 
 class Timers:
@@ -4139,6 +4088,14 @@ class Timers:
     def reset_div(self):
         old = self.div_counter
         self.div_counter = 0
+        # TIMA counts falling edges of a DIV bit, so clearing DIV while that
+        # bit is high ticks TIMA once (games use DIV writes to sync the timer).
+        tac = self.mmu.memory[0xFF07]
+        if tac & 0x04:
+            rate = self._TIMA_RATES[tac & 0x03]
+            if old & (rate >> 1):
+                self._tima_tick(1)
+        self.tima_accum = 0
         apu = getattr(self.mmu, 'apu', None)
         if apu is not None:
             bit = 13 if (self.mmu.key1 & 0x80) else 12
@@ -4150,23 +4107,31 @@ class Timers:
 
     def step(self, cycles):
         mem = self.mmu.memory
-        div_counter = self.div_counter + cycles
+        old_div = self.div_counter
+        div_counter = (old_div + cycles) & 0xFFFF
         self.div_counter = div_counter
-        mem[0xFF04] = (div_counter >> 8) & 0xFF
+        mem[0xFF04] = div_counter >> 8
         tac = mem[0xFF07]
         if not (tac & 0x04):
             return
-        self._tima_step(cycles, tac)
+        self._tima_step(old_div, cycles, tac)
 
-    def _tima_step(self, cycles, tac):
+    def _tima_step(self, old_div, cycles, tac):
+        """Tick TIMA once per multiple of the TAC rate crossed by the 16-bit DIV.
+
+        Deriving TIMA from DIV (instead of a free-running accumulator) keeps
+        its phase locked to DIV, as on hardware, so DIV writes shift it.
+        """
+        rate = self._TIMA_RATES[tac & 0x03]
+        shift = rate.bit_length() - 1
+        end = old_div + cycles
+        self.tima_accum = end & (rate - 1)
+        overflows = (end >> shift) - (old_div >> shift)
+        if overflows:
+            self._tima_tick(overflows)
+
+    def _tima_tick(self, overflows):
         mem = self.mmu.memory
-        step_cyc = self._TIMA_RATES[tac & 0x03]
-        tima_accum = self.tima_accum + cycles
-        if tima_accum < step_cyc:
-            self.tima_accum = tima_accum
-            return
-        overflows = tima_accum // step_cyc
-        self.tima_accum = tima_accum - overflows * step_cyc
         tima = mem[0xFF05]
         tma = mem[0xFF06]
         for _ in range(overflows):
@@ -4568,8 +4533,10 @@ class APU:
         self.ch1_duty_step = self.ch2_duty_step = 0
         self.ch1_length_enabled = self.ch2_length_enabled = False
         self.ch3_length_enabled = self.ch4_length_enabled = False
-        self.ch1_length = self.ch2_length = self.ch4_length = 0
-        self.ch3_length = 0
+        if self.is_cgb:
+            # DMG keeps its length counters across power-off; CGB clears them.
+            self.ch1_length = self.ch2_length = self.ch4_length = 0
+            self.ch3_length = 0
         self.ch1_volume = self.ch2_volume = self.ch4_volume = 0
         self.ch1_env_timer = self.ch2_env_timer = self.ch4_env_timer = 0
         self.ch1_freq_timer = self.ch2_freq_timer = self.ch3_freq_timer = self.ch4_freq_timer = 4
@@ -4893,7 +4860,7 @@ class APU:
         sn = self.sample_num
         sd = self.sample_den
         if div_old is not None:
-            cpu_cycles = div_new - div_old
+            cpu_cycles = (div_new - div_old) & 0xFFFF  # DIV is 16-bit and wraps
             self.fs_div = div_new
         else:
             cpu_cycles = cycles
@@ -7256,7 +7223,7 @@ class GameBoy:
             _need(8, "timers")
             (div_counter, tima_accum) = struct.unpack_from('<II', data, pos)
             pos += 8
-            timers.div_counter = div_counter
+            timers.div_counter = div_counter & 0xFFFF
             timers.tima_accum = tima_accum
             if ver >= 2:
                 _need(4, "ram_len")
@@ -7538,7 +7505,7 @@ class GameBoy:
         tac = mem[0xFF07]
         if tac & 0x04:
             rate = self.timers._TIMA_RATES[tac & 0x03]
-            until = rate - self.timers.tima_accum
+            until = rate - (self.timers.div_counter & (rate - 1))
             if until < 1:
                 until = 1
             remain = min(remain, until)
@@ -7576,12 +7543,12 @@ class GameBoy:
         # Timers: DIV update is inlined (always runs); TIMA only when TAC enabled
         timers = self.timers
         old_div = timers.div_counter
-        div = old_div + cpu_cycles
+        div = (old_div + cpu_cycles) & 0xFFFF
         timers.div_counter = div
-        mem[0xFF04] = (div >> 8) & 0xFF
+        mem[0xFF04] = div >> 8
         tac = mem[0xFF07]
         if tac & 0x04:
-            timers._tima_step(cpu_cycles, tac)
+            timers._tima_step(old_div, cpu_cycles, tac)
         if mmu.serial_bits_left > 0:
             mmu._serial_step(cpu_cycles)
         self.apu.step(dot_cycles, div_old=old_div, div_new=div,
